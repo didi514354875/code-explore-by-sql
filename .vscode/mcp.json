@@ -1,0 +1,17 @@
+{
+  "servers": {
+    "unreal-source-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/home/yanwei/Documents/myproj/mysql",
+        "run",
+        "unreal-source-mcp"
+      ],
+      "env": {
+        "UNREAL_SOURCE_DB": "/home/yanwei/Documents/myproj/mysql/unreal.db"
+      }
+    }
+  }
+}
