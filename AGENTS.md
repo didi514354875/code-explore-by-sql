@@ -1,45 +1,28 @@
 # AGENTS.md
 
-This repository provides a local MCP server for Unreal Engine source retrieval. The preferred behavior for Claude-style agents is **retrieval-first and token-aware**.
+This repository provides a local MCP server for Unreal Engine source retrieval using SQLite FTS5 with trigram tokenizer.
 
-## Goals
+## Architecture
 
-- Find relevant Unreal Engine source quickly.
-- Prefer function/class/macro chunks over full-file dumps.
-- Reduce unnecessary MCP round trips.
-- Save reusable query templates only when the user confirms.
+One file = one row. FTS5 `snippet()` extracts relevant code fragments, so the agent never needs to read whole files. Trigram tokenizer ensures code symbols like `GetGBuffer`, `Material.Roughness`, `UE_LOG` are searchable.
 
-## Preferred retrieval order
+## Tools (5)
 
-1. `suggest_query_templates` or `get_query_templates`
-2. `search_code_chunks`
-3. `search_then_extract_chunks`
-4. `search_unreal_source`
-5. `get_file_content` only for narrow ranges or final fallback
+1. **`search_unreal_source(query, module?, limit?)`** — FTS5 search, returns filename + code snippet.
+2. **`get_file_content(file_path, start_line?, end_line?)`** — Read specific lines when snippet context is insufficient.
+3. **`get_query_templates(query?, limit?)`** — Check cached templates for recurring intents.
+4. **`log_unreal_query(...)`** — Record query feedback for template learning.
+5. **`save_query_template(...)`** — Persist a template after user confirmation.
+
+## Recommended flow
+
+1. Call `get_query_templates` to check for cached templates matching the intent.
+2. Call `search_unreal_source` with keywords — returns snippets, not whole files.
+3. If snippet context is insufficient, call `get_file_content` with a narrow line range.
+4. Optionally save a query template if the search was useful and likely to recur.
 
 ## Guidance
 
-- Use cached chunk search before requesting full file content.
-- When chunk cache may be incomplete, use combined retrieval before falling back to whole-file reads.
-- Treat `query_templates` as semi-automatic memory: suggest them, but do not persist new ones silently.
-- Avoid returning very large file bodies unless the user explicitly asks for them.
+- Avoid returning large file bodies — use `search_unreal_source` first.
+- Save query templates only after user confirmation.
 - If the database has not been built yet, guide the user toward indexing first.
-
-## MCP server expectations
-
-- Server entry point: `unreal-source-mcp`
-- Database path comes from `UNREAL_SOURCE_DB`
-- For best latency, index with `--extract-chunks` or run `unreal-source-extract-chunks` after indexing
-
-## Good task fits
-
-- Find Unreal symbol definitions or likely implementations
-- Trace function/class/macro usage paths
-- Narrow large source trees to specific candidate chunks
-- Suggest reusable FTS query templates for recurring Unreal questions
-
-## Avoid by default
-
-- Dumping full `.cpp` / `.h` files when chunks are enough
-- Saving templates without confirmation
-- Running expensive full pre-cache operations unless the user wants it

@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .chunker import CodeChunk
-
 SOURCE_EXTENSIONS = {".h", ".hpp", ".hh", ".inl", ".cpp", ".cc", ".cxx", ".cs"}
 DEFAULT_EXCLUDE_PARTS = {
     ".git",
@@ -58,7 +56,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             module_name,
             raw_content,
             content=source_files,
-            content_rowid=id
+            content_rowid=id,
+            tokenize="trigram"
         );
 
         CREATE TRIGGER IF NOT EXISTS source_files_ai AFTER INSERT ON source_files BEGIN
@@ -78,48 +77,6 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             VALUES (new.id, new.file_path, new.module_name, new.raw_content);
         END;
 
-        CREATE TABLE IF NOT EXISTS code_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            symbol_name TEXT,
-            symbol_type TEXT,
-            signature TEXT,
-            body TEXT NOT NULL,
-            start_line INTEGER NOT NULL,
-            end_line INTEGER NOT NULL,
-            comment TEXT,
-            extraction_method TEXT DEFAULT 'heuristic',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(file_id, symbol_name, start_line, end_line),
-            FOREIGN KEY (file_id) REFERENCES source_files(id) ON DELETE CASCADE
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
-            symbol_name,
-            symbol_type,
-            signature,
-            body,
-            content=code_chunks,
-            content_rowid=id
-        );
-
-        CREATE TRIGGER IF NOT EXISTS code_chunks_ai AFTER INSERT ON code_chunks BEGIN
-            INSERT INTO code_chunks_fts(rowid, symbol_name, symbol_type, signature, body)
-            VALUES (new.id, new.symbol_name, new.symbol_type, new.signature, new.body);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
-            INSERT INTO code_chunks_fts(code_chunks_fts, rowid, symbol_name, symbol_type, signature, body)
-            VALUES ('delete', old.id, old.symbol_name, old.symbol_type, old.signature, old.body);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS code_chunks_au AFTER UPDATE ON code_chunks BEGIN
-            INSERT INTO code_chunks_fts(code_chunks_fts, rowid, symbol_name, symbol_type, signature, body)
-            VALUES ('delete', old.id, old.symbol_name, old.symbol_type, old.signature, old.body);
-            INSERT INTO code_chunks_fts(rowid, symbol_name, symbol_type, signature, body)
-            VALUES (new.id, new.symbol_name, new.symbol_type, new.signature, new.body);
-        END;
-
         CREATE TABLE IF NOT EXISTS query_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             query_text TEXT NOT NULL,
@@ -128,6 +85,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             hit_count INTEGER DEFAULT 0,
             was_useful INTEGER,
             refinement TEXT,
+            template_id INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -135,7 +93,6 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             intent_pattern TEXT NOT NULL,
             fts_template TEXT NOT NULL,
-            chunk_strategy TEXT DEFAULT 'heuristic',
             intent_keywords TEXT DEFAULT '[]',
             useful_count INTEGER DEFAULT 0,
             success_rate REAL DEFAULT 0.0,
@@ -149,7 +106,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             fts_template,
             intent_keywords,
             content=query_templates,
-            content_rowid=id
+            content_rowid=id,
+            tokenize="trigram"
         );
 
         CREATE TRIGGER IF NOT EXISTS query_templates_ai AFTER INSERT ON query_templates BEGIN
@@ -170,15 +128,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         END;
         """
     )
-    _ensure_column(conn, "query_logs", "template_id", "INTEGER")
-    _ensure_column(conn, "query_logs", "hit_chunk_ids", "TEXT DEFAULT '[]'")
     conn.commit()
-
-
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def upsert_source_file(conn: sqlite3.Connection, source: SourceFile) -> int:
@@ -202,100 +152,28 @@ def get_source_by_path(conn: sqlite3.Connection, file_path: str) -> sqlite3.Row 
     return conn.execute("SELECT * FROM source_files WHERE file_path = ?", (file_path,)).fetchone()
 
 
+def _fts5_escape(query: str) -> str:
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def search_source(
     conn: sqlite3.Connection, query: str, module: str | None = None, limit: int = 20
 ) -> list[dict[str, Any]]:
+    fts_query = _fts5_escape(query)
     sql = (
         "SELECT sf.id, sf.file_path, sf.module_name, bm25(source_files_fts) AS rank, "
         "snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet "
         "FROM source_files_fts JOIN source_files sf ON sf.id = source_files_fts.rowid "
         "WHERE source_files_fts MATCH ?"
     )
-    params: list[Any] = [query]
+    params: list[Any] = [fts_query]
     if module:
         sql += " AND sf.module_name = ?"
         params.append(module)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     return [dict(row) for row in conn.execute(sql, params)]
-
-
-def replace_chunks_for_file(conn: sqlite3.Connection, file_id: int, chunks: Iterable[CodeChunk]) -> int:
-    conn.execute("DELETE FROM code_chunks WHERE file_id = ?", (file_id,))
-    count = 0
-    for chunk in chunks:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO code_chunks(
-                file_id, symbol_name, symbol_type, signature, body, start_line, end_line, comment, extraction_method
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                file_id,
-                chunk.symbol_name,
-                chunk.symbol_type,
-                chunk.signature,
-                chunk.body,
-                chunk.start_line,
-                chunk.end_line,
-                chunk.comment,
-                chunk.extraction_method,
-            ),
-        )
-        count += 1
-    return count
-
-
-def get_cached_chunks(
-    conn: sqlite3.Connection,
-    file_id: int,
-    symbol: str | None = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM code_chunks WHERE file_id = ?"
-    params: list[Any] = [file_id]
-    if symbol:
-        sql += " AND lower(coalesce(symbol_name, '')) LIKE ?"
-        params.append(f"%{symbol.lower()}%")
-    sql += " ORDER BY start_line LIMIT ?"
-    params.append(limit)
-    return [dict(row) for row in conn.execute(sql, params)]
-
-
-def search_chunks(
-    conn: sqlite3.Connection,
-    query: str,
-    module: str | None = None,
-    symbol_type: str | None = None,
-    limit: int = 20,
-    body_chars: int = 4000,
-) -> list[dict[str, Any]]:
-    sql = (
-        "SELECT cc.id, cc.file_id, sf.file_path, sf.module_name, cc.symbol_name, cc.symbol_type, "
-        "cc.signature, cc.body, cc.start_line, cc.end_line, bm25(code_chunks_fts) AS rank, "
-        "snippet(code_chunks_fts, 3, '[', ']', ' … ', 24) AS snippet "
-        "FROM code_chunks_fts "
-        "JOIN code_chunks cc ON cc.id = code_chunks_fts.rowid "
-        "JOIN source_files sf ON sf.id = cc.file_id "
-        "WHERE code_chunks_fts MATCH ?"
-    )
-    params: list[Any] = [query]
-    if module:
-        sql += " AND sf.module_name = ?"
-        params.append(module)
-    if symbol_type:
-        sql += " AND cc.symbol_type = ?"
-        params.append(symbol_type)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
-    rows = []
-    for row in conn.execute(sql, params):
-        item = dict(row)
-        body = item.get("body") or ""
-        item["body"] = body[:body_chars]
-        item["truncated"] = len(body) > body_chars
-        rows.append(item)
-    return rows
 
 
 def log_query(
@@ -303,25 +181,22 @@ def log_query(
     query_text: str,
     fts_match: str | None,
     hit_file_ids: Iterable[int],
-    hit_chunk_ids: Iterable[int] | None = None,
     was_useful: bool | None = None,
     refinement: str | None = None,
     template_id: int | None = None,
 ) -> int:
     ids = list(hit_file_ids)
-    chunk_ids = list(hit_chunk_ids or [])
     conn.execute(
         """
         INSERT INTO query_logs(
-            query_text, fts_match, hit_file_ids, hit_chunk_ids, hit_count, was_useful, refinement, template_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            query_text, fts_match, hit_file_ids, hit_count, was_useful, refinement, template_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             query_text,
             fts_match,
             json.dumps(ids),
-            json.dumps(chunk_ids),
-            len(ids) + len(chunk_ids),
+            len(ids),
             None if was_useful is None else int(was_useful),
             refinement,
             template_id,
@@ -337,15 +212,14 @@ def save_template(
     conn: sqlite3.Connection,
     intent_pattern: str,
     fts_template: str,
-    chunk_strategy: str = "heuristic",
     intent_keywords: Iterable[str] | None = None,
 ) -> int:
     cursor = conn.execute(
         """
-        INSERT INTO query_templates(intent_pattern, fts_template, chunk_strategy, intent_keywords, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO query_templates(intent_pattern, fts_template, intent_keywords, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         """,
-        (intent_pattern, fts_template, chunk_strategy, json.dumps(list(intent_keywords or []))),
+        (intent_pattern, fts_template, json.dumps(list(intent_keywords or []))),
     )
     conn.commit()
     return int(cursor.lastrowid)

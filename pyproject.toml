@@ -1,7 +1,7 @@
 [project]
 name = "unreal-source-mcp"
 version = "0.1.0"
-description = "SQLite FTS5 + heuristic chunk extraction MCP server for Unreal Engine source code."
+description = "SQLite FTS5 (trigram) MCP server for Unreal Engine source code search."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,8 +12,6 @@ dependencies = [
 [project.scripts]
 unreal-source-mcp = "unreal_source_mcp.server:main"
 unreal-source-build-db = "unreal_source_mcp.build_db:main"
-unreal-source-extract-chunks = "unreal_source_mcp.extract_chunks:main"
-unreal-source-benchmark = "unreal_source_mcp.benchmark:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
