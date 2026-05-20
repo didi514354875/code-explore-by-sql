@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SOURCE_EXTENSIONS = {".h", ".hpp", ".hh", ".inl", ".cpp", ".cc", ".cxx", ".cs"}
+SOURCE_EXTENSIONS = {".h", ".hpp", ".hh", ".inl", ".cpp", ".cc", ".cxx", ".cs", ".usf", ".ush", ".hlsl"}
 DEFAULT_EXCLUDE_PARTS = {
     ".git",
     ".vs",
@@ -161,6 +161,24 @@ def search_source(
     conn: sqlite3.Connection, query: str, module: str | None = None, limit: int = 20
 ) -> list[dict[str, Any]]:
     fts_query = _fts5_escape(query)
+    sql = (
+        "SELECT sf.id, sf.file_path, sf.module_name, bm25(source_files_fts) AS rank, "
+        "snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet "
+        "FROM source_files_fts JOIN source_files sf ON sf.id = source_files_fts.rowid "
+        "WHERE source_files_fts MATCH ?"
+    )
+    params: list[Any] = [fts_query]
+    if module:
+        sql += " AND sf.module_name = ?"
+        params.append(module)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def search_source_raw(
+    conn: sqlite3.Connection, fts_query: str, module: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
     sql = (
         "SELECT sf.id, sf.file_path, sf.module_name, bm25(source_files_fts) AS rank, "
         "snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet "

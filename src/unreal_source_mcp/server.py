@@ -13,6 +13,7 @@ from .db import (
     log_query,
     save_template,
     search_source,
+    search_source_raw,
 )
 
 mcp = FastMCP("unreal-source-mcp")
@@ -29,11 +30,37 @@ def _conn():
 
 
 @mcp.tool()
-def search_unreal_source(query: str, module: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    """Search Unreal source files using SQLite FTS5 MATCH syntax. Returns filename + code snippet."""
+def search_unreal_source(
+    query: str | None = None,
+    raw_query: str | None = None,
+    module: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search Unreal source files. Two modes:
+
+    1. Simple mode (query): literal text match. Use for single keyword or phrase lookups.
+    2. Advanced mode (raw_query): raw FTS5 MATCH expression with AND, OR, NOT, column filters,
+       and parentheses for grouping. Trigram tokenizer requires 3+ characters per term.
+       Examples:
+         - '"GetGBuffer" AND "Emissive"'
+         - '(file_path : "BasePass") AND "roughness"'
+         - '"Material" NOT "hlsl"'
+         - '"Lumen" OR "RayTracing"'
+    If both query and raw_query are given, raw_query takes precedence.
+    Returns filename + code snippet.
+    """
+    if raw_query is None and query is None:
+        return [{"error": "Provide either query or raw_query"}]
     with _conn() as conn:
-        rows = search_source(conn, query=query, module=module, limit=max(1, min(limit, 100)))
-        log_query(conn, query_text=query, fts_match=query, hit_file_ids=[row["id"] for row in rows])
+        if raw_query is not None:
+            try:
+                rows = search_source_raw(conn, fts_query=raw_query, module=module, limit=max(1, min(limit, 100)))
+            except Exception as exc:
+                return [{"error": f"FTS5 query error: {exc}", "query": raw_query}]
+            log_query(conn, query_text=raw_query, fts_match=raw_query, hit_file_ids=[row["id"] for row in rows])
+        else:
+            rows = search_source(conn, query=query, module=module, limit=max(1, min(limit, 100)))
+            log_query(conn, query_text=query, fts_match=query, hit_file_ids=[row["id"] for row in rows])
         return rows
 
 

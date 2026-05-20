@@ -8,11 +8,31 @@ One file = one row. FTS5 `snippet()` extracts relevant code fragments, so the ag
 
 ## Tools (5)
 
-1. **`search_unreal_source(query, module?, limit?)`** — FTS5 search, returns filename + code snippet.
+1. **`search_unreal_source(query?, raw_query?, module?, limit?)`** — FTS5 search, returns filename + code snippet.
+   - `query`: simple literal match (single keyword or phrase)
+   - `raw_query`: advanced FTS5 expression with AND/OR/NOT and column filters
 2. **`get_file_content(file_path, start_line?, end_line?)`** — Read specific lines when snippet context is insufficient.
 3. **`get_query_templates(query?, limit?)`** — Check cached templates for recurring intents.
 4. **`log_unreal_query(...)`** — Record query feedback for template learning.
 5. **`save_query_template(...)`** — Persist a template after user confirmation.
+
+## FTS5 Query Syntax (for raw_query)
+
+| Operator | Syntax | Example |
+|----------|--------|---------|
+| AND | `"A" AND "B"` | `'"GetGBuffer" AND "Emissive"'` |
+| OR | `"A" OR "B"` | `'"Lumen" OR "RayTracing"'` |
+| NOT | `"A" NOT "B"` | `'"Material" NOT "hlsl"'` |
+| Grouping | `("A" OR "B") AND "C"` | `'("alpha" OR "beta") AND "gamma"'` |
+| Column filter | `column : "term"` | `'file_path : "BasePass"'` |
+
+Columns: `file_path`, `module_name`, `raw_content`
+
+**Rules:**
+- All terms must be 3+ characters (trigram tokenizer requirement)
+- Phrase queries use `"double quotes"`
+- NEAR and prefix (`*`) operators do NOT work with trigram tokenizer
+- Use `query` for simple lookups, `raw_query` when you need boolean logic or column-scoped search
 
 ## Recommended flow
 

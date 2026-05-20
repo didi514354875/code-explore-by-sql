@@ -1,4 +1,5 @@
 from unreal_source_mcp.db import (
+    SOURCE_EXTENSIONS,
     SourceFile,
     connect,
     get_templates,
@@ -6,6 +7,7 @@ from unreal_source_mcp.db import (
     log_query,
     save_template,
     search_source,
+    search_source_raw,
     upsert_source_file,
 )
 
@@ -111,3 +113,88 @@ def test_snippet_extraction(tmp_path):
     rows = search_source(conn, "TargetFunction", limit=10)
     assert rows
     assert "TargetFunction" in rows[0]["snippet"]
+
+
+def test_shader_extensions():
+    for ext in (".usf", ".ush", ".hlsl"):
+        assert ext in SOURCE_EXTENSIONS
+
+
+def _seed_two_files(conn):
+    upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/A/FileA.cpp",
+            module_name="A",
+            raw_content="void FThing::Run() { /* alpha */ }",
+        ),
+    )
+    upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/B/FileB.cpp",
+            module_name="B",
+            raw_content="void FOther::Go() { /* alpha beta */ }",
+        ),
+    )
+    conn.commit()
+
+
+def test_raw_query_and(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    _seed_two_files(conn)
+
+    rows = search_source_raw(conn, '"FThing" AND "alpha"')
+    assert len(rows) == 1
+    assert "FileA" in rows[0]["file_path"]
+
+    rows = search_source_raw(conn, '"FThing" AND "beta"')
+    assert len(rows) == 0
+
+
+def test_raw_query_or(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    _seed_two_files(conn)
+
+    rows = search_source_raw(conn, '"FThing" OR "FOther"')
+    assert len(rows) == 2
+
+
+def test_raw_query_not(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    _seed_two_files(conn)
+
+    rows = search_source_raw(conn, '"alpha" NOT "beta"')
+    assert len(rows) == 1
+    assert "FileA" in rows[0]["file_path"]
+
+
+def test_raw_query_column_filter(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    _seed_two_files(conn)
+
+    rows = search_source_raw(conn, 'file_path : "FileA"')
+    assert len(rows) == 1
+    assert "FileA" in rows[0]["file_path"]
+
+
+def test_raw_query_invalid_syntax(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+
+    try:
+        search_source_raw(conn, "!!! invalid !!!")
+        assert False, "Should have raised"
+    except sqlite3.OperationalError:
+        pass
