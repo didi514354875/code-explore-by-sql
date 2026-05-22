@@ -1,0 +1,374 @@
+  1. FRHICommandListExecutor::FSubmitState::Submit 是否触发了绘制命令提交?
+
+  是的。 这是 RHI 层把"已经翻译完的平台命令包"递给底层 dynamic RHI 的最后一道关卡。
+
+  Source\Runtime\RHI\Private\RHICommandList.cpp:1197:
+
+  void FRHICommandListExecutor::FSubmitState::Submit(const FSubmitArgs& Args)
+  {
+      // 把每个 TranslateJob 中、每条 pipeline 上 FinalizedCmdList 收成一个数组
+      TArray<IRHIPlatformCommandList*> FinalizedCmdLists;
+      for (TUniquePtr<FTranslateState> const& Job : TranslateJobs) { ... }
+
+      if (GDynamicRHI)
+          GDynamicRHI->RHISubmitCommandLists({ MoveTemp(FinalizedCmdLists) });   // ← 真正下发
+
+      // 清理 RHI 资源、可选 RHIProcessDeleteQueue / RHIEndFrame
+      CompletionEvent->DispatchSubsequents();   // 解锁 render thread 上等待此 CompletionEvent 的任务
+      delete this;
+  }
+
+  它本身不负责把绘制命令"翻译"成平台命令——翻译动作在 FTranslateState::Translate 里早就并行做完了。Submit 只做最后的 提交
+  (RHISubmitCommandLists)、资源 GC、EndFrame、唤醒后续任务这四件事。
+
+  ---
+  2. 上层 RenderGraph 是怎么走到这里的？
+
+  完整链路 (RHICommandList.cpp:1302 是入口):
+
+  FRDGBuilder::Execute()                              // RenderGraph 录制完毕，开始 replay pass
+    → 在 immediate command list 上写一堆 RHI 命令
+    → ... 最终调用 FRHICommandListImmediate::ImmediateFlush(...)
+         (RHICommandList.cpp:1570, 设置 SubmitToGPU / FlushRHIThread / DeleteResources flags)
+         → GRHICommandList.Submit({}, SubmitFlags)
+              ↓
+  FRHICommandListExecutor::Submit(...)                // RHICommandList.cpp:1302
+    ├─ 把 immediate cmd list 移走、新建一份，递归展开 attached cmd lists
+    ├─ 懒分配 SubmitState = new FSubmitState();
+    │     CompletionEvent = FGraphEvent::CreateGraphEvent();
+    │     SubmitState->CompletionEvent = CompletionEvent;
+    ├─ 对每个 CmdList 在 DispatchPipe 上 EnqueueDispatchTask:
+    │     [State, CmdList]{ State->Dispatch(CmdList); }     // 切分并并行投递 Translate 任务
+    └─ 若 SubmitToGPU 标志在: 再投一个 dispatch 任务
+          State->FinalizeCurrent();           // 关闭最后一个 translate batch
+          EnqueueSubmitTask(TranslateEvents,  // 等所有 translate 任务完成
+              [State, Args]{ State->Submit(Args); });   // ★ 这里调到上面那个 Submit
+
+  要点:
+  - Dispatch (RHICommandList.cpp:890) 负责把 cmd list 拆/合成 FTranslateState，并把 Translate 任务投到任务图。
+  - 所有 Translate 完毕后，EnqueueSubmitTask 把 lambda 放到 RHIThreadPipe (单线程 pipe)，保证 FSubmitState::Submit 在 RHI
+   线程 串行执行。
+  - CompletionEvent 是 FGraphEvent::CreateGraphEvent() 出来的纯事件，用来让 render thread 的 WaitUntilTaskCompletes
+  能感知到"整个 submit 链结束"。
+
+  ---
+  3. 下层 ProcessSubmissionQueue 怎么工作？
+
+  GDynamicRHI->RHISubmitCommandLists(...) (D3D12 路径) 最终把每个 context 上的 FD3D12Payload* 数组喂给
+  FD3D12DynamicRHI::SubmitPayloads:
+
+  Source\Runtime\D3D12RHI\Private\D3D12Submission.cpp:330:
+
+  void FD3D12DynamicRHI::SubmitPayloads(TArray<FD3D12Payload*>&& Payloads)
+  {
+      if (Payloads.Num())
+          PendingPayloadsForSubmission.Enqueue(new TArray<FD3D12Payload*>(MoveTemp(Payloads)));
+
+      if (SubmissionThread)
+          SubmissionThread->Kick();          // SetEvent 唤醒 submission 线程
+      else
+          // 单线程退化路径: 当前线程直接跑
+          while (EnumHasAnyFlags(ProcessSubmissionQueue().Status, EQueueStatus::Processed)) {}
+
+      ProcessInterruptQueueUntil(nullptr);    // 顺便 pump 中断队列
+  }
+
+  submission 线程的循环 (D3D12Submission.cpp:121) 等 Event，每次醒来反复跑 ProcessSubmissionQueue 直到没活，再睡:
+
+  do { Result = (RHI->*QueueFunc)(); }
+  while (EnumHasAllFlags(Result.Status, EQueueStatus::Processed));
+  WaitForSingleObject(Event, Result.WaitTimeout);
+
+  ProcessSubmissionQueue (D3D12Submission.cpp:372) 的核心循环:
+
+  do {
+      bProgress = false;
+
+      // 1. 把 lock-free 队列里的全部 payload 拆到 per-queue 的有序队列
+      while (PendingPayloadsForSubmission.Dequeue(Array)) {
+          for (auto* P : *Array) P->Queue.PendingSubmission.Enqueue(P);
+          delete Array;
+      }
+
+      // 2. 遍历所有 queue (跨 device / pipe)
+      ForEachQueue([&](FD3D12Queue& Q) {
+          while (auto* P = Q.PendingSubmission.Peek()) {
+              // 等待解析: 把每个 SyncPointsToWait 转换成 D3D12 fence wait
+              for (...; ...; ++P->SyncPointsToWait.Index) {
+                  if (!SyncPoint->ResolvedFence.IsSet())
+                      return;                 // 该 SyncPoint 还没被任何 Signal payload 走过
+                                              // submission thread —— 等下一轮再试
+                  P->AddQueueFenceWait(SyncPoint->ResolvedFence->Fence,
+                                       SyncPoint->ResolvedFence->Value);
+              }
+              Q.PendingSubmission.Dequeue();
+              Q.PayloadToSubmit = P;
+              // 累积 occlusion / pipeline-stats / timestamp queries 等
+              AccumulateQueries(...);
+          }
+
+          Q.FinalizePayload(false, PayloadsToHandDown);   // ExecuteCommandLists + Signal
+                                                         // 并写入 SyncPoint->ResolvedFence
+      });
+  } while (bProgress);
+
+  FlushPayloads();
+  if (InterruptThread && bKickInterruptThread) InterruptThread->Kick();
+
+  FinalizePayload 是真正调 ID3D12CommandQueue::ExecuteCommandLists + Signal(fence, value) 的地方，并把
+  SyncPoint->ResolvedFence = { Fence, Value } 填上，这样后面所有依赖该 SyncPoint 的 payload 就能解析为具体的 fence wait。
+
+  双线程模型:
+  - Submission 线程——只跟 D3D12 队列打交道 (ExecuteCommandLists / Signal / 跨队列 Wait)。
+  - Interrupt 线程——ProcessInterruptQueue 轮询 Fence->GetCompletedValue()，对完成的 payload:
+  for (FD3D12SyncPointRef& SyncPoint : Payload->SyncPointsToSignal)
+      if (SyncPoint->GraphEvent)
+          SyncPoint->GraphEvent->DispatchSubsequents();   // 解锁 CPU 等待方
+
+  ---
+  4. FD3D12Payload 的设计目的
+
+  Source\Runtime\D3D12RHI\Private\D3D12Submission.h:187 (FD3D12PayloadBase):
+
+  它是 某一个 GPU queue 上的一个最小可提交单元 ——
+  把"等谁、做什么、给谁发信号、收尾要释放什么"这套一次提交的全部状态打成一个值类型对象。字段分组很说明问题:
+
+  ┌───────────┬─────────────────────────────────────────────────────────────────────────────────┐
+  │   阶段    │                                      字段                                       │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 绑定      │ FD3D12Queue& Queue (哪个 device + queue type)                                   │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Wait      │ SyncPointsToWait (跨队列同步)、QueueFencesToWait、ManualFencesToWait            │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 预执行    │ PreExecuteCallback、ReservedResourcesToCommit                                   │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Execute   │ CommandListsToExecute (一组 FD3D12CommandList*)                                 │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Signal    │ SyncPointsToSignal、ManualFencesToSignal、CompletionFenceValue、SubmissionEvent │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Profiling │ Timing、BreadcrumbRange、BreadcrumbAllocators、EventStream                      │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Cleanup   │ AllocatorsToRelease、BatchedObjects                                             │
+  ├───────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 标志      │ bAlwaysSignal、bSubmitted                                                       │
+  └───────────┴─────────────────────────────────────────────────────────────────────────────────┘
+
+  设计上的几个关键点:
+  1. 单 queue、单方向——一个 payload 不跨队列。跨队列同步通过 SyncPoint 表达。
+  2. 流水化——它的字段顺序就是 submission 线程处理时的 阶段 顺序 (Wait → PreExecute → UpdateReservedResources → Execute →
+  Signal → Cleanup)。HasXxxWork() 帮 submission 线程跳过空阶段。
+  3. 生产 / 消费解耦——producer (render/RHI 线程) 只填字段，consumer (submission 线程) 只读。中间隔一个 lock-free 队列 +
+  一个唤醒事件。
+  4. 延迟资源回收——AllocatorsToRelease 放进 payload 里跟随 fence completion 一起在 interrupt 线程 释放，避免 GPU
+  还在用就被回收。
+  5. 平台多态——FD3D12PayloadBase 是基类，WindowsD3D12Submission.h 里的 FD3D12Payload final : FD3D12PayloadBase 只为标
+  final (避免虚函数间接调用代价，纯实现细节)。
+
+  ---
+  5. FD3D12SyncPoint 怎么处理同步
+
+  D3D12Submission.h:66:
+
+  class FD3D12SyncPoint final : public FThreadSafeRefCountedObject {
+      TOptional<FD3D12ResolvedFence> ResolvedFence;   // submission 线程填
+      FGraphEventRef                 GraphEvent;      // interrupt 线程 dispatch
+      ...
+  };
+
+  两种类型 (枚举 ED3D12SyncPointType):
+  - GPUOnly——只用来在 GPU 队列之间表达依赖。不分配 GraphEvent。
+  - GPUAndCPU——除了 GPU 同步还允许 CPU Wait()。构造时分配 GraphEvent = FGraphEvent::CreateGraphEvent()。
+
+  3 个角色协作:
+
+  ┌─────────────┬────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+  │    角色     │            时机            │                                 动作                                 │
+  ├─────────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Producer    │ 录制时                     │ FD3D12SyncPoint::Create()，挂到一个 payload 的                       │
+  │ (RHI 线程)  │                            │ SyncPointsToSignal、挂到另一个 payload 的 SyncPointsToWait           │
+  ├─────────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │             │                            │ 选定 queue 上单调递增的 fence value，写入                            │
+  │ Submission  │ FinalizePayload 内         │ SyncPoint->ResolvedFence，调 Signal(fence, value)。等待方 payload 在 │
+  │ 线程        │                            │  ProcessSubmissionQueue 里读到这个 ResolvedFence 才能转换成          │
+  │             │                            │ ID3D12CommandQueue::Wait(fence, value)                               │
+  ├─────────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Interrupt   │ 轮询                       │ 一旦完成，对每个 SyncPointsToSignal 调                               │
+  │ 线程        │ fence->GetCompletedValue() │ GraphEvent->DispatchSubsequents()，CPU 等待方被解锁                  │
+  └─────────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
+  CPU Wait (D3D12Submission.cpp:975):
+  void FD3D12SyncPoint::Wait() const {
+      if (!GraphEvent->IsComplete())
+          FD3D12DynamicRHI::GetD3DRHI()->ProcessInterruptQueueUntil(GraphEvent);  // 一边等一边帮 pump
+      check(GraphEvent->IsComplete());
+  }
+  注意它不是裸 WaitForSingleObject——而是让等待线程自己代跑 ProcessInterruptQueue，直到 本 GraphEvent
+  完成。这是个典型的"等待时不闲着，反正得有人 pump 中断队列"的设计。
+
+  重要: SyncPoint 是 一次性 的 (one-shot)，引用计数管理生命周期 (TRefCountPtr<FD3D12SyncPoint> =
+  FD3D12SyncPointRef)。还有个 lock-free MemoryPool 池化 SyncPoint 的内存，热路径上避免 malloc。
+
+  ---
+  6. 怎么利用 FGraphEvent
+
+  FD3D12SyncPoint 直接持有一个 FGraphEventRef，作用是把 GPU 完成事件转化为可被任务图等待的对象:
+
+  - CPU 阻塞等待——SyncPoint->Wait() → GraphEvent->IsComplete() / Wait()。
+  - 任务依赖等待——上层 (例如 RDG) 可以把 SyncPoint->GetGraphEvent() 喂给 FGraphEventArray Prerequisites，让某个任务在 GPU
+   完成后自动启动。
+  - 发信号——只在 interrupt 线程上的 ProcessInterruptQueue 中调 GraphEvent->DispatchSubsequents()，把所有挂着的
+  subsequents 解锁。
+
+  FlushCommands 这种调用还会额外 new 一个 SubmissionEvent = FGraphEvent::CreateGraphEvent()，挂在 payload 的
+  SubmissionEvent 字段上——submission 线程在 FinalizePayload 里调 DispatchSubsequents()。这个事件表示**"已经送到 D3D12
+  队列"**(注意不是"GPU 已经做完")，跟 SyncPoint 的 GraphEvent (代表"GPU 已经完成") 是两种不同语义的事件:
+
+  // D3D12CommandContext.cpp:619 FlushCommands
+  SyncPoint = Create(GPUAndCPU, ...);   SignalSyncPoint(SyncPoint);    // GPU 完成事件
+  SubmissionEvent = CreateGraphEvent(); GetPayload(Signal)->SubmissionEvent = ...; // submission 完成事件
+  SubmitPayloads(...);
+  if (SyncPoint)         SyncPoint->Wait();           // 用 SyncPoint 的 GraphEvent
+  if (SubmissionEvent)   SubmissionEvent->Wait();     // 用裸 GraphEvent
+
+  ---
+  7. FGraphEvent 实现原理 (UE 5.x 新实现)
+
+  重大变化: 在新版引擎里 FGraphEvent 已经不是独立类了。Source\Runtime\Core\Public\Async\TaskGraphFwd.h:
+
+  class FBaseGraphTask;
+  using FGraphEvent    = FBaseGraphTask;
+  using FGraphEventRef = TRefCountPtr<FBaseGraphTask>;
+
+  FBaseGraphTask (TaskGraphInterfaces.h:466) 又只是 UE::Tasks::Private::FTaskBase
+  (Source\Runtime\Core\Public\Tasks\TaskPrivate.h) 的一层薄壳。所谓 DispatchSubsequents / DontCompleteUntil / Wait
+  全部是兼容旧 API 的 inline shim:
+
+  void DispatchSubsequents(...) { Unlock(...); }         // = TryLaunch(0)
+  void DontCompleteUntil(FGraphEventRef Nested) {
+      if (IsTaskEvent()) AddPrerequisites(*Nested);      // 事件无法嵌套，降级为前驱
+      else               AddNested(*Nested);
+  }
+  bool IsComplete() const { return IsCompleted(); }
+
+  CreateGraphEvent() 实际 new 出来的是 FGraphEventImpl，它把 ExtendedPriority 设成 TaskEvent，没有任务体 (ExecuteTask 是
+  checkNoEntry)，从 TLockFreeFixedSizeAllocator_TLSCache 池子里拿内存。
+
+  核心数据结构 (FTaskBase，TaskPrivate.h)
+
+  std::atomic<uint32> RefCount;                               // 自管引用计数，配 TRefCountPtr
+  std::atomic<uint32> NumLocks { 1 };                         // 见下文双重含义
+  static constexpr uint32 ExecutionFlag = 0x80000000;         // 状态位
+
+  FPrerequisites<TInlineAllocator<1>> Prerequisites;          // 我依赖谁
+  FSubsequents<TInlineAllocator<1>>  Subsequents;             // 谁依赖我
+  LowLevelTasks::FTask LowLevelTask;
+  FEventCount StateChangeEvent;
+
+  FSubsequents (TaskPrivate.h:770) 已经不是 TLockFreePointerList，改成 UE::FMutex 保护的 TArray<FTaskBase*,
+  TInlineAllocator<1>> + std::atomic<bool> bIsClosed:
+
+  bool PushIfNotClosed(FTaskBase* NewItem) {
+      if (bIsClosed.load(std::memory_order_acquire)) return false;    // 快路径无锁
+      UE::TUniqueLock Lock(Mutex);
+      if (bIsClosed) return false;
+      Subsequents.Emplace(NewItem);
+      return true;
+  }
+  TArray<FTaskBase*, ...> Close() {
+      UE::TUniqueLock Lock(Mutex);
+      bIsClosed = true;
+      return MoveTemp(Subsequents);
+  }
+  - TInlineAllocator<1>——绝大多数任务只有 1 个 subsequent，零堆分配。
+  - 已 close 的快路径只做一个 acquire load，没有锁竞争。
+
+  NumLocks 的双重身份 (这是这套实现最巧妙的地方)
+
+  - 执行前: 计 未完成前驱数。AddPrerequisites 增、前驱完成后 TryUnlock 减。减到 0 时调 Schedule。
+  - 一旦 TrySetExecutionFlag 把高位 ExecutionFlag 置上 (代表"开始执行了")，同一个原子计数器立刻改成数 未完成嵌套任务
+  (AddNested 增、嵌套完成后 TryUnlock 减)。减回 ExecutionFlag (即真正剩 0 个嵌套) 时调 Close()。
+
+  bool TryUnlock(bool& bWakeUpWorker) {
+      uint32 Prev = NumLocks.fetch_sub(1, std::memory_order_acq_rel);
+      if (Prev < ExecutionFlag) {        // 还在等前驱阶段
+          if (Prev - 1 == 0) Schedule(bWakeUpWorker);   // 或 Inline 直接 TryExecuteTask，或 TaskEvent 直接 Close
+      } else {                            // 已在执行，等嵌套
+          if (Prev - 1 == ExecutionFlag) { Close(); Release(); }
+      }
+  }
+
+  "解锁后继" 的核心 (Close，TaskPrivate.h:545)
+
+  void Close() {
+      bool bWakeUpWorker = (ExtendedPriority == TaskEvent);   // 普通任务首个后继可塞本地队列
+      for (FTaskBase* S : Subsequents.Close())
+          S->TryUnlock(bWakeUpWorker);                        // 引用按值传递更新 → 之后的塞全局队列
+      if (GetPipe()) ClearPipe();
+      ReleasePrerequisites();
+      StateChangeEvent.NotifyWeak();      // 唤醒 Wait() 等任务回缩 (retraction)
+  }
+  首个 subsequent 走 本地队列 (避免全局队列 + 一次 worker 唤醒)，其余统一进全局队列并唤醒一个 worker——典型的
+  work-stealing 调度优化。
+
+  DispatchSubsequents() 完整生命周期
+
+  1. 外部调 event->DispatchSubsequents() ≡ Unlock()。
+  2. Unlock 对 TaskEvent 类型先 AddRef() 保活，再 TryLaunch(0)。
+  3. TryLaunch 内部最终走到 TryUnlock。NumLocks 减到 0 且是 TaskEvent → TrySetExecutionFlag (CAS 把 ExecutionFlag 置位)
+  成功 → 直接 Close()。
+  4. Close() 把 Subsequents 队列原子地"关门 + 取出"，对每个后继调 TryUnlock。某个后继如果 NumLocks 减到 0，就要么直接执行
+   (Inline) 要么 Schedule 入低层任务系统。
+
+  引用计数
+
+  - 不再继承 FRefCountedObject，而是 FTaskBase 自己的 std::atomic<uint32> RefCount + 自管 AddRef/Release + delete this。
+  - 一对 AddRef: AddPrerequisites 给前驱加 ref (跨依赖边保活)、Unlock 给 TaskEvent 加 ref (触发后才被系统持有)。
+  - 对应 Release 在 Close()/ReleaseInternalReference() 里成对释放。
+  - TRefCountPtr<FBaseGraphTask> (= FGraphEventRef) 调的就是上面那对。
+
+  与 UE::Tasks::FTaskEvent 的关系
+
+  FTaskEvent (Tasks/Task.h) 是新公开 API，包装 FTaskEventBase (派生 FTaskBase，ExtendedPriority = TaskEvent)。和
+  FGraphEvent/FGraphEventImpl 几乎一一对应，只是它的 Trigger() 用 std::atomic<bool> TaskTriggered.exchange(true)
+  保证可重复触发也只生效一次:
+
+  bool Trigger(uint64) {
+      if (TaskTriggered.exchange(true, std::memory_order_relaxed)) return false;
+      AddRef();
+      return TryLaunch(...);
+  }
+  旧的 DispatchSubsequents 没有这个幂等性保护——一个 FGraphEvent 只允许 dispatch 一次。
+
+  ---
+  整体视图 (从 RDG 到 GPU)
+
+  [RenderThread]
+  RDG.Execute → cmds on Immediate CmdList → ImmediateFlush
+     → FRHICommandListExecutor::Submit
+          └── 任务图: Dispatch → 多个 Translate (并行) → FinalizeCurrent → Submit (RHI thread)
+                └── FSubmitState::Submit  ── GDynamicRHI->RHISubmitCommandLists
+                           │                       │
+                           │                       ▼
+                           │             [D3D12 RHI thread]
+                           │             SubmitPayloads → PendingPayloadsForSubmission(lock-free Q) → Kick
+                           │
+                           ▼
+          CompletionEvent->DispatchSubsequents()  ←──┐
+                                                     │
+  [Submission Thread]                                │
+  ProcessSubmissionQueue                             │
+     - SyncPointsToWait 解析为 fence wait            │
+     - ExecuteCommandLists + Signal                  │
+     - 写 SyncPoint->ResolvedFence                   │
+     - Kick interrupt thread                         │
+                                                     │
+  [Interrupt Thread]                                 │
+  ProcessInterruptQueue                              │
+     - fence->GetCompletedValue 完成 →              │
+       SyncPoint->GraphEvent->DispatchSubsequents()  │
+     - Free allocators / pump profiler events      ──┘
+                                                     ↓
+                                              上层 Wait() 解除阻塞
+
+  每一层都使用 lock-free 队列 + 事件唤醒 + FGraphEvent 解锁后继 的同一套模式; FGraphEvent (即新版的 FTaskBase)
+  提供的"原子关闭一组后继并逐个 TryUnlock"是把这些异步阶段串起来的统一抽象。
