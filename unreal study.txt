@@ -372,3 +372,216 @@
 
   每一层都使用 lock-free 队列 + 事件唤醒 + FGraphEvent 解锁后继 的同一套模式; FGraphEvent (即新版的 FTaskBase)
   提供的"原子关闭一组后继并逐个 TryUnlock"是把这些异步阶段串起来的统一抽象。
+
+
+
+● 以下是完整的 Interrupt Thread 工作流程分析。
+
+  ---
+  1. 创建与入口
+
+  D3D12Submission.cpp:172，在 InitializeSubmissionPipe 里创建：
+
+  InterruptThread = new FD3D12Thread(
+      TEXT("RHIInterruptThread"), TPri_Highest,
+      this, &FD3D12DynamicRHI::ProcessInterruptQueue
+  );
+
+  Submission Thread 和 Interrupt Thread 共用同一个 FD3D12Thread
+  类（D3D12Submission.cpp:103），只是绑定的成员函数不同。线程主循环：
+
+  while (!bExit)
+  {
+      FProcessResult Result;
+      do { Result = (RHI->*QueueFunc)(); }   // 对 Interrupt Thread 就是 ProcessInterruptQueue()
+      while (EnumHasAllFlags(Result.Status, EQueueStatus::Processed));
+
+      WaitForSingleObject(Event, Result.WaitTimeout);
+  }
+
+  反复调用处理函数直到没进度，然后睡在 Win32 Event 上。
+
+  ---
+  2. 怎么获取任务？
+
+  数据结构：FD3D12Queue::PendingInterrupt — 一个 TSpscQueue<FD3D12Payload*>（单生产者单消费者队列）。
+
+  生产者是 Submission Thread 的 FlushBatchedPayloads（D3D12Submission.cpp:890）：
+
+  for (FD3D12Payload* Payload : PayloadsToSubmit)
+  {
+      Payload->Queue.PendingInterrupt.Enqueue(Payload);   // 入队
+      // ... Wait / PreExecute / ExecuteCommandLists / Signal ...
+  }
+  // 全部处理完后
+  for (FD3D12Payload* Payload : PayloadsToSubmit)
+      Payload->bSubmitted = true;   // 所有权移交给 Interrupt Thread
+
+  入队完成后 ProcessSubmissionQueue 末尾调 InterruptThread->Kick()（即 SetEvent(Event)）唤醒 Interrupt Thread。
+
+  ---
+  3. 怎么执行？ — ProcessInterruptQueue 完整流程
+
+  D3D12Submission.cpp:1101，核心结构：
+
+  ProcessInterruptQueue()
+  ├── ForEachQueue(&)                          // 遍历所有 device 的所有 queue
+  │   └── while (PendingInterrupt.Peek())      // 逐个处理该 queue 上的 payload
+  │       ├── 检查 bSubmitted 标志
+  │       ├── GetCompletedValue() 问 GPU fence
+  │       ├── 未完成 → SetEventOnCompletion + GPU hang 检测 → break
+  │       └── 已完成 → 解析 query / signal SyncPoint / delete payload
+  └── 全局 GPU crash 检测
+
+  3.1 检查 payload 是否可以处理
+
+  if (!Payload->bSubmitted)
+      break;   // Submission Thread 还在操作这个 payload，不能碰
+
+  bSubmitted 是 std::atomic<bool>，是一个无锁的所有权移交：Submission Thread 先入队，完成所有 D3D12 操作后设为
+  true；Interrupt Thread 只在 true 时才处理。
+
+  3.2 Fence Polling — 判断 GPU 是否完成
+
+  uint64 CompletedFenceValue = CurrentQueue.Fence.D3DFence->GetCompletedValue();
+
+  直接问 D3D12 驱动 "这个 queue 上的 fence 走到哪个值了？" 然后与 payload 的 CompletionFenceValue 比较。
+
+  3.3 GPU 未完成时的处理
+
+  if (CompletedFenceValue < Payload->CompletionFenceValue)
+  {
+      // 注册 D3D12 驱动回调：GPU 走到 CompletionFenceValue 时自动 SetEvent
+      if (InterruptThread && !CurrentQueue.Fence.bInterruptAwaited)
+      {
+          CurrentQueue.Fence.D3DFence->SetEventOnCompletion(
+              Payload->CompletionFenceValue,
+              InterruptThread->Event     // 复用线程的 Win32 Event！
+          );
+          CurrentQueue.Fence.bInterruptAwaited = true;
+      }
+
+      // GPU hang 超时检测（默认 5 秒）
+      // ...
+
+      break;  // 跳出这个 queue 的循环，去检查其他 queue
+  }
+
+  关键点：SetEventOnCompletion 复用了 Interrupt Thread 的 Event。所以 Interrupt Thread 不需要 busy-wait，而是：
+
+  1. 第一轮发现 GPU 没完成 → 注册驱动回调
+  2. 回到 FD3D12Thread::Run 的 WaitForSingleObject(Event, WaitTimeout) 睡下
+  3. GPU 完成 → D3D12 驱动自动 SetEvent → 线程醒来
+  4. 下一轮 GetCompletedValue() >= CompletionFenceValue → 进入完成处理
+
+  GPU hang 检测也在这个分支里：如果超时（默认 5 秒）GPU 还没完成，调用 HandleGpuTimeout。
+
+  3.4 GPU 完成后的处理
+
+  CurrentQueue.Fence.bInterruptAwaited = false;
+  CurrentQueue.PendingInterrupt.Dequeue();
+
+  // 1. 解析 Query 结果 (Occlusion / PipelineStats / Timestamps)
+  //    把 GPU 写入的 query buffer 数据拷贝到上层 Target 指针
+
+  // 2. GPU Profiler event stream 收集
+
+  // 3. 切换 Timing struct (per-frame 分界)
+
+  // 4. ★ Signal 所有 SyncPoint 的 GraphEvent ★
+  for (FD3D12SyncPointRef& SyncPoint : Payload->SyncPointsToSignal)
+  {
+      if (SyncPoint->GraphEvent)
+          SyncPoint->GraphEvent->DispatchSubsequents();
+      // 这会解锁所有在该 SyncPoint 上 Wait() 的 CPU 线程
+  }
+
+  // 5. delete Payload（析构函数回收 CommandAllocator 等）
+  delete Payload;
+
+  ---
+  4. Interrupt Thread 的三种唤醒源
+
+  ┌────────────────────────────────────┬──────────────────────────────────────────────────────┐
+  │               唤醒源               │                       触发时机                       │
+  ├────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ InterruptThread->Kick()            │ Submission Thread 处理完新 payload 后主动唤醒        │
+  ├────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ SetEventOnCompletion(fence, Event) │ GPU 完成指定 fence value 时，D3D12 驱动自动 SetEvent │
+  ├────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ WaitForSingleObject 超时           │ GPU hang 检测的剩余毫秒数，确保在超时前自动醒来      │
+  └────────────────────────────────────┴──────────────────────────────────────────────────────┘
+
+  ---
+  5. 无 Interrupt Thread 的退化路径
+
+  当 D3D12_USE_INTERRUPT_THREAD = 0 时，由调用 SyncPoint::Wait() 的线程自己代劳：
+
+  void FD3D12DynamicRHI::ProcessInterruptQueueUntil(FGraphEvent* GraphEvent)
+  {
+      if (InterruptThread)
+      {
+          // 有专用线程 → 直接等
+          if (GraphEvent && !GraphEvent->IsComplete())
+              GraphEvent->Wait();
+      }
+      else
+      {
+          // 没有专用线程 → 当前线程自己 pump 中断队列
+      Retry:
+          if (InterruptCS.TryLock())
+          {
+              FProcessResult Result;
+              do { Result = ProcessInterruptQueue(); }
+              while (GraphEvent
+                  ? !GraphEvent->IsComplete()           // 等指定事件完成
+                  : EnumHasAllFlags(...));              // 或 pump 到没活
+              InterruptCS.Unlock();
+          }
+          else if (GraphEvent && !GraphEvent->IsComplete())
+          {
+              FPlatformProcess::SleepNoStats(0);  // 让出时间片，重试
+              goto Retry;
+          }
+      }
+  }
+
+  SyncPoint::Wait() 直接调的就是这个函数——没有专用 Interrupt Thread 时，等待线程一边 polling fence
+  一边帮着处理中断队列，不做无用等待。
+
+  ---
+  6. 完整时序图
+
+                      Submission Thread                         Interrupt Thread
+                           │                                          │
+    RHI Thread             │                                          │
+    SubmitPayloads()       │                                          │
+      │                    │                                          │
+      ├─ Enqueue ────────► │ PendingPayloadsForSubmission             │
+      ├─ Kick ───────────► │ (SetEvent)                               │
+      │                    │                                          │
+      │                    │ ProcessSubmissionQueue()                  │
+      │                    │   ├─ 解析 SyncPoint → fence wait          │
+      │                    │   └─ FlushBatchedPayloads()               │
+      │                    │       ├─ Wait(cross-queue fences)         │
+      │                    │       ├─ ExecuteCommandLists()            │
+      │                    │       ├─ Signal(queue fence, value)       │
+      │                    │       ├─ PendingInterrupt.Enqueue() ──────┼──►
+      │                    │       ├─ SubmissionEvent->Dispatch...     │
+      │                    │       └─ bSubmitted = true                │
+      │                    │   Kick InterruptThread ───────────────────────► SetEvent
+      │                    │                                          │
+      │                    │                                          │ 线程醒来
+      │                    │                                          │ ProcessInterruptQueue()
+      │                    │                                          │   ├─ GetCompletedValue()
+      │                    │                                          │   ├─ 未完成?
+      │                    │                                          │   │   SetEventOnCompletion() → 睡
+      │                    │                                          │   │   GPU 完成 → 驱动 SetEvent → 醒来
+      │                    │                                          │   └─ 已完成?
+      │                    │                                          │     ├─ 解析 Queries
+      │                    │                                          │     ├─ GraphEvent->DispatchSubsequents()
+      │   ◄── SyncPoint::Wait() 解除阻塞 ─────────────────────────────┤
+      │                    │                                          │     └─ delete Payload
+      │                    │                                          │
+      │                    │                                          │ WaitForSingleObject(Event, timeout)
+
