@@ -585,3 +585,294 @@
       │                    │                                          │
       │                    │                                          │ WaitForSingleObject(Event, timeout)
 
+
+FRDGPass 功能定义
+
+  FRDGPass 是所有 Render Graph Pass 的基类，定义了以下核心能力：
+
+  1. Pass 元数据
+
+  成员: Name
+  类型: FRDGEventName
+  作用: GPU 调试/性能分析用的 Pass 名称
+  ────────────────────────────────────────
+  成员: ParameterStruct
+  类型: FRDGParameterStruct
+  作用: 绑定的 shader 参数结构体
+  ────────────────────────────────────────
+  成员: Flags
+  类型: ERDGPassFlags
+  作用: 标记 GPU 工作类型（Raster/Compute/AsyncCompute/Copy 等）
+  ────────────────────────────────────────
+  成员: TaskMode
+  类型: ERDGPassTaskMode
+  作用: 执行模式（Inline/Await/Async）
+  ────────────────────────────────────────
+  成员: Pipeline
+  类型: ERHIPipeline
+  作用: 所属管线（Graphics / AsyncCompute）
+
+  2. 三种执行路径 (ERDGPassTaskMode)
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                    ERDGPassTaskMode 执行路径                         │
+  ├──────────┬───────────────────────────────────────────────────────────┤
+  │  Inline  │ 必须在渲染线程上内联执行。lambda 接收 FRHICommandListImmediate │
+  │  Await   │ 可以在并行 task 中执行，在 FRDGBuilder::Execute() 结尾 await   │
+  │  Async   │ 可以在并行 task 中执行，不自动 await，需手动同步               │
+  └──────────┴───────────────────────────────────────────────────────────┘
+
+  TaskMode 的自动推导规则（在 TRDGLambdaPass::ExecuteLambdaTraits 中）：
+  - Lambda 参数是 FRHICommandListImmediate& → Inline
+  - Lambda 参数是 FRHICommandList& 且无 FRDGAsyncTask 标记 → Await
+  - Lambda 参数带 FRDGAsyncTask 前缀 → Async
+
+  3. Pass 状态位（控制编译/执行行为）
+
+  bSkipRenderPassBegin / bSkipRenderPassEnd   ← Render Pass 合并控制
+  bAsyncComputeBegin / bAsyncComputeEnd       ← Async Compute 区间首尾标记
+  bGraphicsFork / bGraphicsJoin              ← Graphics 与 AsyncCompute 同步点
+  bRenderPassOnlyWrites                       ← 仅在 Render Pass 内写
+  bSentinel                                   ← 哨兵 Pass（Prologue/Epilogue）
+  bDispatchPass                               ← 是否为 Dispatch Pass
+  bDispatchAfterExecute                       ← 执行后刷新到 RHI 线程
+  bCulled                                     ← 被剔除
+  bParallelExecuteBegin / bParallelExecuteEnd ← 并行执行区间标记
+  bParallelExecute                            ← 当前正在并行执行
+
+  4. Pass 子类体系
+
+  FRDGPass (基类)
+  ├── TRDGLambdaPass<Param, Lambda>     ← 最常用：lambda 执行体
+  │   └── TRDGEmptyLambdaPass<Lambda>   ← 无参数版本
+  ├── FRDGDispatchPass                  ← 并行 CommandList 派发
+  │   └── TRDGDispatchPass<Param, Lambda>
+  └── FRDGSentinelPass                  ← Prologue/Epilogue 哨兵
+
+  5. 屏障（Barrier）管理
+
+  每个 Pass 管理一组 split barrier batch：
+
+  Prologue:  PrologueBarriersToBegin → PrologueBarriersToEnd
+  Epilogue:  EpilogueBarriersToBeginForGraphics
+             EpilogueBarriersToBeginForAsyncCompute
+             EpilogueBarriersToBeginForAll
+             → EpilogueBarriersToEnd
+
+  ---
+  FRDGBuilder 的关键控制变量
+
+  FRDGBuilder 通过以下变量决定执行逻辑：
+
+  核心决策变量
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                    FRDGBuilder 执行决策变量树                            │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │                                                                         │
+  │  ParallelExecute.TaskMode ──┬── Inline  → 全部串行执行                   │
+  │  (由 ERDGBuilderFlags 决定) ├── Await   → 并行执行，Execute() 结尾等待    │
+  │                             └── Async   → 并行执行，不自动等待            │
+  │                                                                         │
+  │  bSupportsAsyncCompute ─────── 是否启用 AsyncCompute 管线               │
+  │  bSupportsRenderPassMerge ──── 是否允许 RenderPass 合并                  │
+  │  bInitialAsyncComputeFence ─── 是否插入初始 AsyncCompute fence           │
+  │  bCompiling ────────────────── 是否处于编译阶段                          │
+  │  bParallelCompileEnabled ───── 编译阶段是否并行                          │
+  │                                                                         │
+  │  ParallelSetup.bEnabled ────── Setup Task 是否并行执行                    │
+  │  AsyncSetupQueue.bEnabled ──── 异步 Setup 队列是否启用                   │
+  │                                                                         │
+  │  ProloguePass / EpiloguePass ─ 哨兵 Pass（简化屏障逻辑）                  │
+  │  Passes (FRDGPassRegistry) ─── 所有注册的 Pass                          │
+  │  DispatchPasses ────────────── 需要启动并行任务的 Dispatch Pass           │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Execute() 的完整执行流程
+
+  FRDGBuilder::Execute()
+  │
+  ├── 1. FlushSetupQueue()          ← 刷新异步 Setup 队列
+  │
+  ├── 2. Compile()                  ← 编译阶段
+  │   ├── SetupPassResources()      ← 为每个 Pass 建立资源跟踪
+  │   ├── Culling                   ← 从 EpiloguePass 反向遍历，剔除无用 Pass
+  │   ├── CompilePassBarriers()     ← 编译所有 Pass 的 Barrier
+  │   └── CollectPassBarriers()     ← 收集并创建 RHI Transition
+  │
+  ├── 3. Resource Allocation
+  │   ├── CollectAllocations/Deallocations  ← 按生命周期分配/回收资源
+  │   ├── AllocatePooledBuffers/Textures    ← 分配池化资源
+  │   ├── AllocateTransientResources        ← 分配瞬态资源
+  │   ├── CreateViews                       ← 创建 SRV/UAV
+  │   ├── CreateUniformBuffers              ← 创建 Uniform Buffer
+  │   └── SubmitBufferUploads               ← 提交 Buffer 上传
+  │
+  ├── 4. ExecutePasses              ← 执行阶段（核心循环）
+  │   │
+  │   ├── if (bInitialAsyncComputeFence)
+  │   │   └── Insert AsyncCompute→Graphics fence
+  │   │
+  │   ├── for each Pass in [Prologue .. Epilogue]:
+  │   │   │
+  │   │   ├── if (bCulled) → skip
+  │   │   │
+  │   │   ├── if (bParallelExecute) ──── 并行路径
+  │   │   │   ├── if (bDispatchPass)
+  │   │   │   │   └── Wait CommandLists → QueueAsyncCommandListSubmit
+  │   │   │   └── else if (bParallelExecuteBegin)
+  │   │   │       └── Queue parallel pass set command list
+  │   │   │
+  │   │   └── else ───────────────────── 串行路径
+  │   │       └── ExecuteSerialPass(RHICmdList, Pass)
+  │   │           ├── ExecutePassPrologue()  ← 提交 Barrier、Begin RenderPass
+  │   │           ├── ExecutePass()          ← 执行 lambda
+  │   │           └── ExecutePassEpilogue()  ← End RenderPass、提交 Barrier
+  │   │
+  │   └── FlushParallel()            ← 刷新所有排队的并行 CommandList
+  │
+  ├── 5. Wait ParallelExecute.TasksAwait  ← 等待 Await 模式的并行任务
+  │
+  ├── 6. Resource Extraction         ← 提取输出资源到外部
+  │
+  └── 7. PostExecuteCallbacks        ← 执行后回调
+
+  ---
+  整体架构图
+
+  ╔═══════════════════════════════════════════════════════════════════════════╗
+  ║                    Unreal Engine RDG (Render Dependency Graph)          ║
+  ║                         完整架构图                                       ║
+  ╠═══════════════════════════════════════════════════════════════════════════╣
+  ║                                                                         ║
+  ║  ┌─────────────────────── Setup Phase ───────────────────────┐          ║
+  ║  │                                                           │          ║
+  ║  │  用户代码:                                                │          ║
+  ║  │    GraphBuilder.CreateTexture() / CreateBuffer()          │          ║
+  ║  │    GraphBuilder.CreateSRV() / CreateUAV()                 │          ║
+  ║  │    GraphBuilder.AddPass(Name, Params, Flags, Lambda)      │          ║
+  ║  │       │                    │              │         │      │          ║
+  ║  │       │                    │              │         │      │          ║
+  ║  │       ▼                    ▼              ▼         ▼      │          ║
+  ║  │  ┌─────────┐  ┌──────────────┐  ┌────────┐  ┌─────────┐  │          ║
+  ║  │  │Textures │  │Buffers/Views │  │Passes  │  │Dispatch │  │          ║
+  ║  │  │Registry │  │Registry      │  │Registry│  │Passes   │  │          ║
+  ║  │  └─────────┘  └──────────────┘  └────────┘  └─────────┘  │          ║
+  ║  │                                                           │          ║
+  ║  │  AsyncSetupQueue ──► Push(SetupPassResources)             │          ║
+  ║  │  ParallelSetup  ──► AddSetupTask() → 并行准备             │          ║
+  ║  └───────────────────────────────────────────────────────────┘          ║
+  ║                                    │                                    ║
+  ║                                    ▼                                    ║
+  ║  ┌─────────────────────── Compile Phase ─────────────────────┐          ║
+  ║  │                                                           │          ║
+  ║  │  ┌─────────────────────────────────────────────────────┐  │          ║
+  ║  │  │  FRDGBuilder::Compile()                             │  │          ║
+  ║  │  │                                                     │  │          ║
+  ║  │  │  1. FinalizeDescs()   ← 回调获取 Buffer 大小        │  │          ║
+  ║  │  │  2. SetupPassInternals                               │  │          ║
+  ║  │  │     ├── SetupPassResources() ← 提取 _RDG 参数依赖   │  │          ║
+  ║  │  │     ├── SetupPassDependencies() ← 建立生产者关系     │  │          ║
+  ║  │  │  3. Culling (从 EpiloguePass 反向遍历)               │  │          ║
+  ║  │  │     └── Pass.bCulled = true  ← 剔除无输出消费者的 Pass│  │          ║
+  ║  │  │  4. CompilePassBarriers() ← 计算资源转换             │  │          ║
+  ║  │  │     ├── 确定每个 Pass 的 PrologueBarrierPass         │  │          ║
+  ║  │  │     ├── 确定每个 Pass 的 EpilogueBarrierPass         │  │          ║
+  ║  │  │     ├── 标记 bGraphicsFork / bGraphicsJoin           │  │          ║
+  ║  │  │     └── 标记 bAsyncComputeBegin / bAsyncComputeEnd   │  │          ║
+  ║  │  │  5. RenderPass Merge (合并相邻 Raster Pass)          │  │          ║
+  ║  │  │     └── bSkipRenderPassBegin / bSkipRenderPassEnd    │  │          ║
+  ║  │  │  6. CollectPassBarriers() → CreatePassBarriers()     │  │          ║
+  ║  │  └─────────────────────────────────────────────────────┘  │          ║
+  ║  └───────────────────────────────────────────────────────────┘          ║
+  ║                                    │                                    ║
+  ║                                    ▼                                    ║
+  ║  ┌──────────────── Allocate & Execute ───────────────────────┐          ║
+  ║  │                                                           │          ║
+  ║  │  Resource Allocation:                                     │          ║
+  ║  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │          ║
+  ║  │  │PooledTextures│  │PooledBuffers │  │TransientAlloc  │  │          ║
+  ║  │  │(RenderTarget │  │(RDGBuffer    │  │(RHI Transient  │  │          ║
+  ║  │  │ Pool)        │  │ Pool)        │  │ Allocator)     │  │          ║
+  ║  │  └──────────────┘  └──────────────┘  └────────────────┘  │          ║
+  ║  │         │                  │                   │          │          ║
+  ║  │         └──────────────────┼───────────────────┘          │          ║
+  ║  │                            ▼                              │          ║
+  ║  │  Pass Execution Loop:                                     │          ║
+  ║  │  ┌───────────────────────────────────────────────────────┐│          ║
+  ║  │  │                                                       ││          ║
+  ║  │  │  ProloguePass ──► [Pass0] ──► [Pass1] ──► ... ──► EpiloguePass  │
+  ║  │  │                    │          │                        ││          ║
+  ║  │  │                    │          ├─ bCulled? → skip       ││          ║
+  ║  │  │                    │          │                        ││          ║
+  ║  │  │                    ▼          ▼                        ││          ║
+  ║  │  │          ┌─── ParallelExecute.TaskMode ───┐            ││          ║
+  ║  │  │          │                                │            ││          ║
+  ║  │  │    ┌─────┴─────┐    ┌──────────┐   ┌─────┴─────┐     ││          ║
+  ║  │  │    │  Inline    │    │  Await   │   │  Async    │     ││          ║
+  ║  │  │    │            │    │          │   │           │     ││          ║
+  ║  │  │    │ 渲染线程    │    │ 并行Task │   │ 并行Task  │     ││          ║
+  ║  │  │    │ 内联执行    │    │ Execute  │   │ 不等待     │     ││          ║
+  ║  │  │    │            │    │ 结尾等待  │   │           │     ││          ║
+  ║  │  │    └─────┬─────┘    └────┬─────┘   └─────┬─────┘     ││          ║
+  ║  │  │          │               │                │           ││          ║
+  ║  │  │          ▼               ▼                ▼           ││          ║
+  ║  │  │   ExecuteSerialPass  QueueAsyncCL    QueueAsyncCL     ││          ║
+  ║  │  │   ┌───────────────┐  (并行CommandList) (不等待)       ││          ║
+  ║  │  │   │ Prologue      │                                    ││          ║
+  ║  │  │   │  ├─Barriers   │  另外: FRDGDispatchPass            ││          ║
+  ║  │  │   │  ├─RenderPass │  ├─ LaunchDispatchPassTasks()      ││          ║
+  ║  │  │   │ Execute       │  ├─ 多个 SubCommandList            ││          ║
+  ║  │  │   │ Epilogue      │  └─ QueueAsyncCommandListSubmit    ││          ║
+  ║  │  │   │  ├─RenderPass │                                    ││          ║
+  ║  │  │   │  └─Barriers   │                                    ││          ║
+  ║  │  │   └───────────────┘                                    ││          ║
+  ║  │  └───────────────────────────────────────────────────────┘│          ║
+  ║  │                                                           │          ║
+  ║  │  Pipeline Layout:                                         │          ║
+  ║  │  ┌─────────────────────────────────────────────────────┐  │          ║
+  ║  │  │  Graphics Pipeline:                                  │  │          ║
+  ║  │  │  [Fork]──► { AsyncCompute Interval } ──►[Join]       │  │          ║
+  ║  │  │    ▲                                      │          │  │          ║
+  ║  │  │    │    bGraphicsFork     bGraphicsJoin   │          │  │          ║
+  ║  │  │    │    bAsyncComputeBegin  bAsyncComputeEnd         │  │          ║
+  ║  │  │    └──────────── Cross Pipeline Sync ────────────────┘  │          ║
+  ║  │  └─────────────────────────────────────────────────────┘  │          ║
+  ║  └───────────────────────────────────────────────────────────┘          ║
+  ║                                    │                                    ║
+  ║                                    ▼                                    ║
+  ║  ┌──────────────────── Post-Execute ─────────────────────────┐          ║
+  ║  │  ├── Wait ParallelExecute.TasksAwait (Await 模式)          │          ║
+  ║  │  ├── Resource Extraction (输出 Texture/Buffer)             │          ║
+  ║  │  ├── SetTrackedAccess (更新 RHI 访问状态)                   │          ║
+  ║  │  ├── PostExecuteCallbacks                                  │          ║
+  ║  │  └── AsyncDeleter (延迟释放 RDG 内存)                      │          ║
+  ║  └───────────────────────────────────────────────────────────┘          ║
+  ╚═══════════════════════════════════════════════════════════════════════════╝
+
+  关键决策链路总结
+
+  ERDGBuilderFlags::ParallelExecute
+      │
+      ▼
+  ParallelExecute.TaskMode = Inline/Await/Async
+      │
+      ├── 决定 Pass 是否可并行 (bParallelExecute)
+      │   ├── TRDGLambdaPass 根据 lambda 签名自动推导
+      │   └── FRDGDispatchPass 固定 Async
+      │
+      ├── 控制 Execute() 循环走串行还是并行分支
+      │
+      └── 控制 Execute() 结尾是否等待并行任务
+
+  bSupportsAsyncCompute (由 PassFlags::AsyncCompute 触发)
+      │
+      ├── 启用双管线调度 (Graphics + AsyncCompute)
+      ├── 标记 bAsyncComputeBegin/End
+      └── 标记 bGraphicsFork/Join 跨管线同步
+
+  bSupportsRenderPassMerge (由相邻 Raster Pass 触发)
+      │
+      ├── 设置 bSkipRenderPassBegin/End
+      └── 共享 PrologueBarrierPass / EpilogueBarrierPass
