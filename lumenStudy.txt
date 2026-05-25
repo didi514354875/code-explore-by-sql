@@ -255,3 +255,340 @@ Lumen 源码学习路径
   C++ 中的 AddPass 调用，理解输入输出，再跳到对应 .usf 看算法。
   3. 善用 cvar 调试：每个模块都有对应的 r.Lumen.*
   cvar，可以通过关闭/开启特定模块来观察效果变化，加深理解。
+
+❯ lumen 的数据结构和功能架构给我建立一个心智模型，告诉我功能逻辑的入口点                
+
+● 让我深入读取 Lumen 的核心数据结构和入口函数。
+
+● 现在让我看看关键入口点。
+
+● 现在我对 Lumen 的完整数据架构有了全面了解。下面给出系统性的心智模型。
+
+  ---
+  Lumen 心智模型
+
+  一句话概括
+
+  Lumen = Surface Cache（场景离屏光照缓存）+ Screen Probe Gather（屏幕空间采样）+
+  Radiance Cache（远处辐射缓存）+
+  Reflections（反射），这四条管线共享同一套场景代理数据（MeshCards +
+  SDF），通过不同的追踪方式（软件SDF / 硬件RT）从 Surface Cache 中查询光照。
+
+  ---
+  核心数据结构关系图
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │                        FScene (全局场景)                       │
+  │  ┌─────────────────────────────────────────────────────────┐ │
+  │  │  FLumenSceneData  (驻留整个场景生命周期)                    │ │
+  │  │                                                          │ │
+  │  │  PrimitiveGroups ──1:N──> MeshCards ──1:N──> Cards       │ │
+  │  │  (物体组)               (网格卡片集)        (单张卡片)      │ │
+  │  │                                                          │ │
+  │  │  PageTable ──映射──> PhysicalAtlas                       │ │
+  │  │  (虚拟→物理)           (Albedo/Normal/Depth/Emissive)    │ │
+  │  │                        (DirectLighting/IndirectLighting) │ │
+  │  │                        (FinalLighting)                   │ │
+  │  │                                                          │ │
+  │  │  SurfaceCacheAllocator  (物理页面分配器)                    │ │
+  │  │  SurfaceCacheFeedback   (GPU→CPU反馈)                     │ │
+  │  │  Heightfields           (高度场)                          │ │
+  │  └─────────────────────────────────────────────────────────┘ │
+  │                                                              │
+  │  ┌────────────────────────────┐                               │
+  │  │ FLumenViewState (per View) │  ← 挂在 FSceneViewState 上   │
+  │  │                            │                               │
+  │  │ ScreenProbeGatherState     │  GI 帧间历史                  │
+  │  │ ReSTIRGatherState          │  ReSTIR 帧间历史              │
+  │  │ ReflectionState            │  反射帧间历史                  │
+  │  │ RadianceCacheState         │  辐射缓存 Clipmap             │
+  │  │ TranslucencyVolume*        │  半透明光照体积                │
+  │  └────────────────────────────┘                               │
+  └──────────────────────────────────────────────────────────────┘
+
+  ---
+  数据结构分层解读
+
+  第1层：场景表示（怎么描述几何）
+
+  数据结构: FLumenPrimitiveGroup
+  角色: 一组同一LOD的Primitive，是Card分配的最小单位
+  比喻: "物体分组"
+  ────────────────────────────────────────
+  数据结构: FLumenMeshCards
+  角色: 一个物体在6个轴对齐方向上的Card集合
+  比喻: "一栋房子的6个面+角落"
+  ────────────────────────────────────────
+  数据结构: FLumenCard
+  角色: 一个方向上的一块矩形表面，有OBB包围盒和分辨率等级
+  比喻: "一面墙上的一块瓷砖"
+  ────────────────────────────────────────
+  数据结构: FLumenHeightfield
+  角色: 地形/水面的高度场表示
+  比喻: "地面"
+  ────────────────────────────────────────
+  数据结构: FLumenPrimitiveGroupCullingInfo
+  角色: GPU可见性剔除用的紧凑数据
+  比喻: "物体是否可见的标记"
+
+  Card 是 Lumen 中最核心的抽象。整个场景被分解成成千上万张 Card，每张 Card
+  记录一个局部区域的几何和材质。
+
+  第2层：Surface Cache（怎么缓存光照）
+
+  Virtual Pages (按需)         Physical Atlas (有限池)
+  ┌──┬──┬──┐                  ┌──────────────────────────┐
+  │P0│P1│P2│   PageTable      │  Card A Albedo  │Card B  │
+  │  │  │  │  ──映射──────>   │  (物理texels)    │Albedo  │
+  │P3│P4│P5│                  │                 │        │
+  └──┴──┴──┘                  ├─────────────────┤        │
+   Card 的 Mip 链               │  Card C ...     │        │
+                                └──────────────────────────┘
+                                128x128 像素为一个物理页面
+
+  数据结构: FLumenSurfaceMipMap
+  角色: Card 的一个 Mip 级别，记录虚拟页面布局
+  ────────────────────────────────────────
+  数据结构: FLumenPageTableEntry
+  角色: 虚拟页面→物理Atlas坐标的映射，包含采样回退信息
+  ────────────────────────────────────────
+  数据结构: FLumenSurfaceCacheAllocator
+  角色: 物理页面分配器，Bin-based sub-allocation（8x8~128x128）
+  ────────────────────────────────────────
+  数据结构: FLumenSurfaceCacheFeedback
+  角色: GPU端记录"哪些页面被采样了"，回读驱动CPU端更新
+
+  Atlas 纹理（都存储在 FLumenSceneData 中）：
+  - AlbedoAtlas / OpacityAtlas / NormalAtlas / DepthAtlas / EmissiveAtlas —
+  从三角形场景捕获
+  - DirectLightingAtlas — 直接光照注入结果
+  - IndirectLightingAtlas — 间接光照（Radiosity注入）
+  - FinalLightingAtlas — 最终光照 = Direct + Indirect
+
+  第3层：帧间临时数据
+
+  数据结构: FLumenSceneFrameTemporaries
+  生命周期: 单帧
+  角色: 该帧所有RDG资源的引用：Atlas SRV/UAV、Buffer、SharedRT
+  ────────────────────────────────────────
+  数据结构: FLumenViewOrigin
+  生命周期: 单帧
+  角色: 观察原点，决定Card的更新优先级和距离
+  ────────────────────────────────────────
+  数据结构: FScreenProbeGatherTemporalState
+  生命周期: 跨帧
+  角色: Probe历史、Temporal复用
+  ────────────────────────────────────────
+  数据结构: FReflectionTemporalState
+  生命周期: 跨帧
+  角色: 反射历史
+  ────────────────────────────────────────
+  数据结构: FRadianceCacheState
+  生命周期: 跨帧
+  角色: 3D Clipmap结构的辐射缓存，包含Probe Atlas和索引
+
+  ---
+  功能管线与入口点
+
+  从 DeferredShadingSceneRenderer::Render 中，Lumen 有 6 个入口调用，对应 6 个功能阶段：
+
+  帧渲染时间线
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ① BeginUpdateLumenSceneTasks()     ← 非常早，和Visibility并行
+     │
+     ├─ 更新SkyAtmosphere光源颜色
+     ├─ 初始化VSM
+     ├─ 开始Lumen Scene更新任务
+     └─ BeginGatherLumenLights()     ← 光源采集（异步Task）
+
+  ② UpdateLumenScene()               ← BasePass之前
+     │
+     ├─ 处理Pending Add/Remove/Update
+     ├─ Surface Cache反馈处理
+     ├─ Card页面分配/释放
+     ├─ Card Capture（渲染几何到Atlas）
+     ├─ Card属性的GPU Buffer上传
+     └─ Radiosity初始化
+
+  ③ RenderLumenSceneLighting()       ← BasePass之前，和BasePass可并行
+     │
+     ├─ 直接光照注入到Surface Cache Atlas
+     │   ├─ Shadow Map采样
+     │   ├─ 或 HWRT直接光照
+     │   └─ Temporal降噪
+     ├─ Radiosity多bounce传播
+     └─ FinalLighting合成
+
+  ④ RenderDiffuseIndirectAndAmbientOcclusion()  ← 延迟光照阶段（两次调用）
+     │
+     ├─ 第1次(bCompositeRegularLumenOnly=false):
+     │   └─ 计算AO和粗糙镜面
+     │
+     └─ 第2次(bCompositeRegularLumenOnly=true):
+         ├─ Screen Probe Gather（核心GI采集）
+         │   ├─ Tile分类
+         │   ├─ Probe追踪（SDF或HWRT）
+         │   ├─ Radiance Cache插值（远处）
+         │   ├─ Temporal复用
+         │   └─ 空间滤波
+         ├─ ReSTIR Gather（可选）
+         └─ 合成到SceneColor
+
+  ⑤ RenderDeferredReflectionsAndSkyLighting()  ← 延迟光照阶段
+     │
+     ├─ Lumen Reflections
+     │   ├─ 反射光线追踪（SDF/HWRT）
+     │   ├─ Hit点查询Surface Cache
+     │   ├─ Temporal累积
+     │   └─ 合成
+     └─ SkyLight合成
+
+  ⑥ RenderLumenFrontLayerTranslucencyReflections()  ← 半透明阶段
+     └─ 半透明物体的Lumen反射
+
+  ---
+  数据流向（从场景到像素）
+
+  场景三角形几何
+       │
+       ▼
+  ┌─────────────────┐
+  │  Card Capture    │  LumenSceneCardCapture.cpp
+  │  (渲染到Atlas)   │  每帧选几百张Card重绘
+  └────────┬────────┘
+           │  写入 Albedo/Normal/Depth/Emissive Atlas
+           ▼
+  ┌─────────────────┐
+  │  Direct Lighting │  LumenSceneLighting.cpp
+  │  (光照注入)      │  每个光源向Card投影阴影
+  └────────┬────────┘
+           │  写入 DirectLightingAtlas
+           ▼
+  ┌─────────────────┐
+  │  Radiosity       │  LumenRadiosity.cpp
+  │  (多Bounce)      │  Card间传播间接光照
+  └────────┬────────┘
+           │  写入 IndirectLightingAtlas
+           ▼
+  ┌─────────────────┐
+  │  Final Lighting  │
+  │  = Direct+Indirect│  每张Card最终光照
+  └────────┬────────┘
+           │  读入 FinalLightingAtlas
+           ▼
+      ┌────┴────┐
+      ▼         ▼
+  ┌────────┐ ┌──────────────┐
+  │GI采样  │ │ 反射采样      │
+  │(Probe  │ │ (反射光线Hit  │
+  │ 追踪)  │ │  点查询Atlas) │
+  └───┬────┘ └──────┬───────┘
+      │              │
+      │   ┌──────────┘
+      ▼   ▼
+  ┌──────────┐
+  │ Temporal │  帧间累积、降噪
+  │ Filter   │
+  └────┬─────┘
+       ▼
+    SceneColor → PostProcess → 最终像素
+
+  ---
+  追踪方式的心智模型
+
+  Lumen 有两种追踪方式，它们在相同的入口点中选择：
+
+  追踪方式: Software Tracing
+  实现: Global SDF → Mesh SDF → Card sampling
+  使用场景: 默认路径，全平台
+  ────────────────────────────────────────
+  追踪方式: Hardware RT
+  实现: DXR/Vulkan RT → Hit Shader → Surface Cache 或三角形求值
+  使用场景: 有RT硬件时
+
+  选择逻辑在 Lumen::UseHardwareRayTracing() 中，由 r.Lumen.HardwareRayTracing cvar
+  和平台能力决定。
+
+  ---
+  关键入口点速查表
+
+  要看什么: Surface Cache 整帧更新
+  打开哪个文件: LumenSceneRendering.cpp
+  搜什么函数: UpdateLumenScene
+  ────────────────────────────────────────
+  要看什么: Card Capture
+  打开哪个文件: LumenSceneCardCapture.cpp
+  搜什么函数: RenderCardCapture
+  ────────────────────────────────────────
+  要看什么: 直接光照注入
+  打开哪个文件: LumenSceneLighting.cpp
+  搜什么函数: RenderDirectLightingForLumenScene
+  ────────────────────────────────────────
+  要看什么: Radiosity
+  打开哪个文件: LumenRadiosity.cpp
+  选择逻辑在 Lumen::UseHardwareRayTracing() 中，由 r.Lumen.HardwareRayTracing cvar
+  和平台能力决定。
+
+  ---
+  关键入口点速查表
+
+  要看什么: Surface Cache 整帧更新
+  打开哪个文件: LumenSceneRendering.cpp
+  搜什么函数: UpdateLumenScene
+  ────────────────────────────────────────
+  要看什么: Card Capture
+  打开哪个文件: LumenSceneCardCapture.cpp
+  搜什么函数: RenderCardCapture
+  ────────────────────────────────────────
+  要看什么: 直接光照注入
+  打开哪个文件: LumenSceneLighting.cpp
+  搜什么函数: RenderDirectLightingForLumenScene
+  ────────────────────────────────────────
+  要看什么: Radiosity
+  打开哪个文件: LumenRadiosity.cpp
+  搜什么函数: InitFrameTemporaries
+  ────────────────────────────────────────
+  要看什么: GI 采集
+  打开哪个文件: LumenScreenProbeGather.cpp
+  搜什么函数: RenderScreenProbeGather
+  ────────────────────────────────────────
+  要看什么: Probe 追踪(软件)
+  打开哪个文件: LumenScreenProbeTracing.cpp
+  搜什么函数: 追踪算法shader的C++调度
+  ────────────────────────────────────────
+  要看什么: Probe 追踪(HWRT)
+  打开哪个文件: LumenScreenProbeHardwareRayTracing.cpp
+  搜什么函数: HWRT Gather
+  ────────────────────────────────────────
+  要看什么: Radiance Cache 更新
+  打开哪个文件: LumenRadianceCache.cpp
+  搜什么函数: UpdateRadianceCache
+  ────────────────────────────────────────
+  要看什么: 反射
+  打开哪个文件: LumenReflections.cpp
+  搜什么函数: RenderLumenReflections
+  ────────────────────────────────────────
+  要看什么: 反射追踪
+  打开哪个文件: LumenReflectionTracing.cpp
+  搜什么函数: 追踪调度
+  ────────────────────────────────────────
+  要看什么: HWRT反射
+  打开哪个文件: LumenReflectionHardwareRayTracing.cpp
+  搜什么函数: RT反射Hit
+  ────────────────────────────────────────
+  要看什么: GI 合成到SceneColor
+  打开哪个文件: LumenDiffuseIndirect.cpp
+  搜什么函数: RenderDiffuseIndirectAndAmbientOcclusion
+  ────────────────────────────────────────
+  要看什么: Card/MeshCards 管理
+  打开哪个文件: LumenScene.cpp + LumenSceneData.h
+  搜什么函数: AddMeshCards / RemoveMeshCards
+  ────────────────────────────────────────
+  要看什么: 功能开关
+  打开哪个文件: Lumen.h + Lumen.cpp
+  搜什么函数: Lumen::* 命名空间的查询函数
+  ────────────────────────────────────────
+  要看什么: ViewState 持久化
+  打开哪个文件: LumenViewState.h
+  搜什么函数: FLumenViewState
