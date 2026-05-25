@@ -876,3 +876,251 @@ FRDGPass 功能定义
       │
       ├── 设置 bSkipRenderPassBegin/End
       └── 共享 PrologueBarrierPass / EpilogueBarrierPass
+
+
+● 通读源码后，给你一张完整的 Nanite 心智地图。
+
+  ---
+  一、Nanite 整体架构
+
+  Nanite 不是"自动 LOD 系统"，而是"离线预构建出一棵 DAG，运行时每帧在 GPU 上对 DAG 做 cut"。各子系统的职责：
+
+  ┌────────────────────────────┬────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────┐
+  │           子系统           │                            职责                            │                           位置                           │
+  ├────────────────────────────┼────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Builder (CPU, 离线)        │ 从原始 mesh 构建 cluster + group + DAG，量化编码成 page    │ Source/Developer/NaniteBuilder/                          │
+  ├────────────────────────────┼────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Resources (CPU/GPU)        │ 持久化的数据（page、hierarchy、cluster blob）              │ Source/Runtime/Engine/Public/Rendering/NaniteResources.h │
+  ├────────────────────────────┼────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Streaming (GPU-driven)     │ page 按需 streaming 进显存，根 page 常驻                   │ Shaders/Private/Nanite/NaniteStreaming.ush               │
+  ├────────────────────────────┼────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Culling / LOD Select (GPU) │ 每帧每个 view 在 hierarchy 上做 DAG cut + frustum/HZB cull │ NaniteClusterCulling.usf + NaniteCullingCommon.ush       │
+  ├────────────────────────────┼────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ SW/HW Rasterizer (GPU)     │ 小三角形软件光栅，大三角形硬件光栅                         │ NaniteRasterizer.usf                                     │
+  └────────────────────────────┴────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+  Builder 这一侧的核心数据结构（来自 ClusterDAG.h）：
+
+  class FCluster {           // DAG 节点 = ~128 三角形
+      FVertexArray Verts;
+      TArray<uint32> Indexes;
+      FSphere3f LODBounds;       // 用来投影到屏幕计算 cut
+      float LODError;            // 这一级的最大几何偏差（世界空间）
+      int32 MipLevel;            // 在 DAG 中的层级
+      uint32 GroupIndex;         // 我属于哪个 group（这个 group 锁住了我的边界）
+      uint32 GeneratingGroupIndex; // 我被哪个 group 简化产生（我的 parent 锁住的边界来自这里）
+  };
+
+  struct FClusterGroup {     // 8–32 个 cluster 的绑定单元
+      FSphere3f LODBounds;
+      float ParentLODError;      // 简化后产生的误差
+      TArray<FClusterRef> Children;
+  };
+
+  class FClusterDAG {
+      TArray<FCluster> Clusters;
+      TArray<FClusterGroup> Groups;
+  };
+
+  ---
+  二、预处理流水线拆解
+
+  入口 FBuilderModule::Build (NaniteBuilder.cpp:574)，调用链：
+
+  Build
+   └─ BuildIntermediateResources       // 阶段 ①–④
+       ├─ PreprocessMesh               // 可选：displacement 自适应细分
+       ├─ ClusterDAG.AddMesh           // 阶段 ①② 三角形→叶子 cluster
+       └─ ClusterDAG.ReduceMesh        // 阶段 ③ DAG 层级构建（核心）
+   ├─ BuildFallbackMesh                // 老GPU回退网格
+   └─ Encode                           // 阶段 ④ 量化 + 切 page
+
+  阶段 ①：构邻接图（AddMesh, ClusterDAG.cpp:21）
+
+  - 用 FEdgeHash 并行哈希所有有向边（按位置哈希），找到反向匹配 → FAdjacency。
+  - 大于 2 个三角形共享一条边的退化情况单独排序后处理，保证决定性（同样输入产出同样 DAG）。
+  - FDisjointSet 把三角形按连通性合并，partition 时同一连通块倾向于聚到一起。
+
+  阶段 ②：把三角形切成 ~128 三角形的叶子 Cluster
+
+  FGraphPartitioner Partitioner(NumTriangles, FCluster::ClusterSize - 4, FCluster::ClusterSize);
+  //                                          124, 128
+  Partitioner.BuildLocalityLinks(...);
+  Partitioner.PartitionStrict(Graph, !bSingleThreaded);   // 调用 METIS
+
+  - FGraphPartitioner 实质是 METIS 多级递归二分。
+  - 邻接图的"权重"鼓励：① 共享边的三角形聚到一起（连通性）② locality link（空间局部性）。
+  - 输出 Partitioner.Ranges，每个 range 是一个 cluster 的三角形索引区间。
+  - 叶子 cluster 标记：Cluster.EdgeLength *= -1（负数 = 叶）。
+
+  阶段 ③：DAG 层级构建（ReduceMesh，灵魂）
+
+  这是 Nanite 的灵魂循环。ClusterDAG.cpp:430 起：
+
+  while (LevelClusters.Num() > 1):
+     // ③.a 找跨 cluster 的"外部边"，建 cluster 之间的邻接图
+     FindAdjacentClusters(...)
+
+     // ③.b 把 cluster 分组（8 ≤ size ≤ 32），三角形组 + voxel组分开
+     GroupTriangleClusters(TriClusters, NumExternalEdges)   // 又一次 METIS
+     GroupVoxelClusters(VoxelClusters)                       // Morton 排序 + 贪心配对合并
+
+     // ③.c 每个 group 独立并行简化
+     ParallelFor each group:
+         ReduceGroup(...):
+             Merged   = FCluster(DAG, Group.Children)        // 合并 group 内所有 cluster
+             SimplifyError = Merged.Simplify(targetNumTris)  // QEM-based 边折叠，targetNumTris ≈ NumParents * 126
+             SplitCluster<FGraphPartitioner>(Merged, ...)    // 把简化后的 mesh 重新切回 ~128 三角形的 parent clusters
+             对每个 parent cluster 写入:
+                 LODBounds         = Group.LODBounds         // 同组共用！
+                 LODError          = Group.ParentLODError    // 同组共用！
+                 GeneratingGroupIndex = GroupIndex
+
+     LevelClusters = 这一层产生的所有 parent clusters
+
+  这里有三个至关重要的不变性（决定为什么 Nanite 能做连续 LOD）：
+
+  不变性 1：Group 内的所有 cluster 在 LOD 决策上"同生共死"
+  同一 group 的所有 children → 一起被选中作为高细节，或者一起被它们生成的 parent 替换。这是因为简化只在 group 内部进行，group 与 group 之间共享的边永远不会被折叠。
+
+  不变性 2：Group 边界 = 不能折叠的边
+  看 GroupTriangleClusters 的权重计算（ClusterDAG.cpp:312）：
+  bool bSiblings = Cluster.GeneratingGroupIndex == OtherCluster.GeneratingGroupIndex;
+  Partitioner.AddAdjacency(Graph, OtherClusterRefIndex,
+                           NumSharedEdges * (bSiblings ? 12 : 16) + 4);
+  sibling 比非 sibling 权重小（12 vs 16）→ METIS 倾向于把 sibling 切到不同 group。
+  为什么？这样上一轮的 group 边界（被锁住的边）这一轮就能落进新 group 内部被折叠掉。否则越往上层 锁死的边越多，简化会停滞。
+
+  不变性 3：Parent.LODError ≥ max(Children.LODError)，单调递增
+  在 ReduceGroup 末尾：Group.ParentLODError = max(child errors, SimplifyError)，并把这个值写回每个 parent cluster。这样 GPU 端做 cut 时只需做单调比较，不需要全局搜索。
+
+  构建终止条件
+
+  循环到 LevelClusters.Num() == 1 退出，最后一个 cluster 是 root；额外塞一个 RootClusterGroup，ParentLODError = 1e10f（永远不可能被替换为更粗的版本）。
+
+  阶段 ④：量化与编码（Encode/ 目录）
+
+  按顺序的 pass：
+
+  NaniteEncode.cpp           主驱动
+  ├─ NaniteEncodeConstrain   位置/属性量化范围约束
+  ├─ NaniteEncodeVertReuseBatch  顶点复用批次
+  ├─ NaniteEncodeMaterial    material range 编码
+  ├─ NaniteEncodeTriStrip    三角形 strip 化（GPU 软光栅友好）
+  ├─ NaniteEncodeHierarchy   构建 BVH4 hierarchy node（GPU traversal 用的，不是 cluster DAG 本身）
+  ├─ NaniteEncodePageAssignment   把 cluster 装进 128KB page
+  └─ NaniteEncodeFixup       page 间引用 fixup
+
+  关键点：
+  - 位置量化：每 cluster 单独的 QuantizedPosStart/Precision/Bits，按 cluster 局部 bound 自适应。
+  - Hierarchy ≠ DAG：编码阶段会重新构建一个 4-ary BVH（FHierarchyNodeSlice，每个 node 含 4 个 child）用于 GPU 遍历；DAG 的拓扑信息被烘焙到 node 的 MaxParentLODError 字段里。
+  - Page 装箱：以 DAG 的 group 为最小不可分单位塞进 page，相关 cluster 会进同一 page（streaming 时连贯）。
+
+  ---
+  三、LOD 选择机制（运行时）
+
+  GPU 上每帧、每个 view 独立做 DAG cut。核心循环在 NaniteClusterCulling.usf 的 hierarchy traversal（参考 NaniteStreamOut.usf:447 的简化版，逻辑相同）：
+
+  // 自顶向下遍历 BVH4 hierarchy
+  bool ShouldVisitChild(FHierarchyNodeSlice node, bool bVisible) {
+      return bVisible && (CutError < node.MaxParentLODError);
+      //                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      //  如果允许的最大像素 error 都比这一层的 ParentError 还小，
+      //  说明这一层还不够细 → 继续向下
+  }
+
+  // 到达 cluster 叶子
+  void ProcessCluster(...) {
+      bool bSmallEnoughToDraw = CutError > Cluster.LODError;
+      //   到这一层已经足够细了 → 画这个 cluster
+  }
+
+  CutError 是怎么算的？
+
+  CutError 不是常数，是用 LODBounds (世界空间球) 投影到屏幕、得到允许的世界空间 deviation：
+  - NaniteCullingCommon.ush 里把 sphere bound 经 LOD transform 变换、按视图距离/焦距计算屏幕投影半径。
+  - 通常对应"屏幕上 1 像素 ≈ 多少世界空间长度"。
+
+  为什么能连续 LOD 而不出现裂缝？
+
+  回到三个不变性：
+  - 同组共生共死 → 一个 cluster 被选中作为 child，那它整个 group 的兄弟也一定被选中（因为它们 LODError 完全相同），它们之间共享的边永远是同一份顶点数据。
+  - 跨组边界锁死 → 不同 group 共享的边在简化时没有被折叠过，无论这两个 group 各自被选到 child 还是 parent 级，相邻边的顶点位置都一致。
+  - 单调误差 → 父级的 ParentLODError ≥ Group.ParentLODError ≥ children 任意 LODError，cut 沿 DAG 自上而下是良定义的：只要某个 view 在某 cluster 上 "够小了"，它在所有 ancestor 上一定 "更够小"。
+
+  可视化心智模型：
+
+                            [Root Cluster]                LODError = ∞
+                                  |
+                         ┌────────┴────────┐
+                         │   Group L_top   │
+                         │ ┌──┐ ┌──┐  ┌──┐│              ParentLODError 大
+                         │ │P1│ │P2│  │Pn││  ← parents
+                         │ └──┘ └──┘  └──┘│
+                         └─┬─────┬─────┬──┘
+                           │     │     │
+                ┌──────────┴─────┴─────┴──────────┐
+                │       Groups L_mid (8-32 cluster each)
+                │   每组内部 cluster 边界被折叠
+                │   组间边界保持不变
+                └────────────...─────────────...──
+                                │
+                           leaf clusters (128 tri)         LODError 小
+
+  每帧 GPU 在这张 DAG 上画一条水平线（cut）：相机近处 cut 落在底部（叶子），远处落在顶部（root）。同一物体不同部位的 cut 高度可以不同 → "每个 pixel 自适应 LOD" 的来源。
+
+  ---
+  四、关键源码清单
+
+  Build（CPU 离线）
+
+  ┌──────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+  │                                     文件                                     │                                  内容                                  │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Public/NaniteBuilder.h                        │ IBuilderModule 接口、Input/Output 数据结构                             │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/NaniteBuilder.cpp                     │ 驱动：Build, BuildIntermediateResources, BuildFallbackMesh             │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/Cluster.h / Cluster.cpp               │ FCluster，Simplify, Split, Voxelize, Bound                             │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/ClusterDAG.h / ClusterDAG.cpp         │ 核心：AddMesh, ReduceMesh, GroupTriangleClusters, ReduceGroup, FindCut │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/GraphPartitioner.*                    │ METIS 包装，cluster + group 都用它分区                                 │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/NaniteIntermediateResources.h         │ DAG 与 page 之间的中间产物                                             │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/Encode/NaniteEncode.cpp               │ 编码主驱动                                                             │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodeHierarchy.cpp      │ 构 BVH4 hierarchy（GPU traversal 用）                                  │
+  ├──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+  │ Source/Developer/NaniteBuilder/Private/Encode/NaniteEncodePageAssignment.cpp │ cluster → page 装箱                                                    │
+  └──────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+
+  Runtime（GPU）
+
+  ┌──────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │                                 文件                                 │                                内容                                │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Shaders/Private/Nanite/NaniteClusterCulling.usf                      │ 主 culling/LOD select compute（persistent threads 遍历 hierarchy） │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Shaders/Private/Nanite/NaniteCullingCommon.ush                       │ bound 变换、CutError 计算                                          │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Shaders/Private/Nanite/NaniteHierarchyTraversal.ush                  │ 通用 hierarchy 遍历模板                                            │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Shaders/Private/Nanite/NaniteStreaming.ush                           │ streaming request 发起                                             │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Shaders/Private/Nanite/NaniteRasterizer.usf / NaniteHWRasterizer.usf │ SW/HW 双路光栅                                                     │
+  ├──────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.cpp          │ CPU 侧的 culling+raster pass 编排                                  │
+  └──────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘
+
+  ---
+  建议的学习路径
+
+  1. 先读 NaniteBuilder.cpp::Build 看流水线骨架。
+  2. 盯死 ClusterDAG.cpp::ReduceMesh 这个 while 循环，把每次迭代的 cluster/group 状态在纸上画出来。
+  3. 理解 GroupTriangleClusters 里的 sibling 反向加权（不变性 2 的实现）。
+  4. 看 ReduceGroup 末尾把 LODBounds/LODError 写回 parent 那一段（不变性 3 的实现）。
+  5. 跳到 GPU 端，对照 ShouldVisitChild + bSmallEnoughToDraw 两行验证 cut 算法。
+
+  是否需要我帮你把要保存为可复用搜索模板（比如「Nanite DAG 构建相关」「Nanite cluster 简化」等查询）写到 MCP 模板库？
