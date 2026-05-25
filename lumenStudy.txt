@@ -1,0 +1,257 @@
+Lumen 源码学习路径
+
+  源码根目录：Engine/Source/Runtime/Renderer/Private/Lumen/（C++）
+  Shader目录：Engine/Shaders/Private/Lumen/（HLSL）
+
+  ---
+  第一阶段：理解 Lumen 的全局架构
+
+  先建立宏观认知，理解 Lumen 做了什么、各模块之间的关系。
+
+  顺序: 1
+  文件: Lumen.h + Lumen.cpp
+  为什么先读它: 入口点。定义了 Lumen
+    命名空间下的所有功能查询函数（是否启用HWRT、是否用AsyncCompute、追踪方式选择等）。这
+  是理解
+     Lumen 功能开关的钥匙。
+  ────────────────────────────────────────
+  顺序: 2
+  文件: LumenSceneData.h
+  为什么先读它: 数据核心。定义了
+    FLumenCardId、FLumenCardScene（Shader参数）、FLumenSceneData。理解
+    Card/MeshCards/PhysicalAtlas 等核心数据结构。
+  ────────────────────────────────────────
+  顺序: 3
+  文件: LumenViewState.h
+  为什么先读它: 帧间状态。定义 FLumenViewState，理解 Lumen 如何跨帧保持 Temporal 数据。
+
+  关键概念：
+  - Mesh Cards：场景几何的代理表示，用于软件光线追踪
+  - Surface Cache：基于 Card 的表面缓存（Albedo/Normal/Emissive/Depth Atlas）
+  - Physical Atlas：分页式虚拟纹理池，存储 Card 渲染结果
+  - Global SDF：全局有符号距离场，用于快速追踪
+
+  ---
+  第二阶段：Surface Cache（表面缓存）—— Lumen 的数据基础
+
+  Lumen GI 的所有光照计算都基于 Surface Cache 中的数据。
+
+  顺序: 4
+  文件: LumenMeshCards.h/.cpp
+  内容: Mesh Cards 生成。理解 Card 如何从静态网格体构建，方向、分辨率、分配策略。
+  ────────────────────────────────────────
+  顺序: 5
+  文件: LumenSceneCardCapture.h/.cpp
+  内容: Card 捕获。理解如何将场景几何渲染到 Card 对应的 Atlas
+    区域（Albedo、Normal、Depth、Emissive）。
+  ────────────────────────────────────────
+  顺序: 6
+  文件: LumenSurfaceCache.cpp
+  内容: 表面缓存更新。页面分配、反馈机制（哪些页面需要更新）、Virtual Atlas 管理。
+  ────────────────────────────────────────
+  顺序: 7
+  文件: LumenSurfaceCacheFeedback.h/.cpp
+  内容: 反馈系统。理解 GPU 反馈如何驱动 CPU 侧的页面更新决策。
+
+  对应 Shader：
+  - Engine/Shaders/Private/Lumen/SurfaceCache/ 目录下的 .ush 文件
+
+  ---
+  第三阶段：Lumen Scene 更新与光照
+
+  理解每帧 Lumen Scene 如何更新，以及直接光照如何注入到 Surface Cache。
+
+  顺序: 8
+  文件: LumenScene.cpp
+  内容: 场景管理。Card 注册/注销、Primitive 更新、距离场更新调度。
+  ────────────────────────────────────────
+  顺序: 9
+  文件: LumenSceneRendering.cpp
+  内容: 场景渲染调度。UpdateLumenScene() 的具体实现，组织 Card
+    Capture、光照更新等任务的时序。
+  ────────────────────────────────────────
+  顺序: 10
+  文件: LumenSceneGPUDrivenUpdate.h/.cpp
+  内容: GPU 驱动更新。理解 GPU 侧的 Card 可见性判断和更新决策。
+  ────────────────────────────────────────
+  顺序: 11
+  文件: LumenSceneLighting.h/.cpp
+  内容: 直接光照。RenderLumenSceneLighting()，将光源直接光照注入到 Surface Cache Atlas
+    中。
+  ────────────────────────────────────────
+  顺序: 12
+  文件: LumenSceneDirectLightingHardwareRayTracing.cpp
+  内容: HWRT 直接光照。用硬件光追计算 Surface Cache 直接光照。
+
+  ---
+  第四阶段：GI 核心算法 —— Screen Probe Gather
+
+  这是 Lumen GI 的核心采样算法。
+
+  顺序: 13
+  文件: LumenScreenProbeGather.h/.cpp
+  内容: Screen Probe Gather 入口。RenderScreenProbeGather() — 在屏幕空间放置 Probe，从
+    Surface Cache 采集光照。这是理解 Lumen GI 质量的关键。
+  ────────────────────────────────────────
+  顺序: 14
+  文件: LumenScreenProbeTracing.cpp
+  内容: 软件追踪。使用 Global SDF / Mesh SDF 进行软件光线追踪来采样 Surface Cache。
+  ────────────────────────────────────────
+  顺序: 15
+  文件: LumenScreenProbeHardwareRayTracing.cpp
+  内容: 硬件追踪 Gather。用 HWRT 替代软件追踪进行 Probe 采样。
+  ────────────────────────────────────────
+  顺序: 16
+  文件: LumenScreenProbeFiltering.cpp
+  内容: Probe 空间/时间滤波。降噪核心，理解 Temporal 复用和空间滤波。
+  ────────────────────────────────────────
+  顺序: 17
+  文件: LumenScreenProbeImportanceSampling.cpp
+  内容: 重要性采样。自适应 Probe 密度和光线分配策略。
+
+  对应 Shader：
+  - LumenScreenProbeGather.usf — 核心 Gather Shader
+  - LumenScreenProbeGatherTemporal.usf — 时间复用
+
+  ---
+  第五阶段：Radiance Cache（辐射缓存）
+
+  理解 Lumen 如何加速远处光照和多 bounce。
+
+  顺序: 18
+  文件: LumenRadianceCache.h
+  内容: 数据结构。定义 Radiance Cache Probe、插值参数等。
+  ────────────────────────────────────────
+  顺序: 19
+  文件: LumenRadianceCache.cpp
+  内容: 缓存更新。Probe 注入、传播、过滤。
+  ────────────────────────────────────────
+  顺序: 20
+  文件: LumenRadianceCacheHardwareRayTracing.cpp
+  内容: HWRT 版本。用 HWRT 更新 Radiance Cache。
+  ────────────────────────────────────────
+  顺序: 21
+  文件: LumenRadianceCacheInternal.h
+  内容: 内部实现。八面体映射、Probe 数据布局等细节。
+
+  ---
+  第六阶段：Radiosity（间接光照传播）
+
+  顺序: 22
+  文件: LumenRadiosity.h/.cpp
+  内容: 多 Bounce。通过 Surface Cache 之间的光照传播实现多 bounce
+    GI。理解注入→传播→采样流程。
+
+  对应 Shader：Engine/Shaders/Private/Lumen/Radiosity/ 目录
+
+  ---
+  第七阶段：Reflections（反射）
+
+  顺序: 23
+  文件: LumenReflections.h/.cpp
+  内容: 反射入口。RenderLumenReflections() — 屏幕空间+世界空间混合反射。
+  ────────────────────────────────────────
+  顺序: 24
+  文件: LumenReflectionTracing.cpp
+  内容: 反射光线追踪。软件追踪（SDF）和 HWRT 追踪的反射光线。
+  ────────────────────────────────────────
+  顺序: 25
+  文件: LumenReflectionHardwareRayTracing.cpp
+  内容: HWRT 反射。硬件光追反射的 Hit Shader 和材质求值。
+
+  ---
+  第八阶段：辅助模块
+
+  顺序: 26
+  文件: LumenDiffuseIndirect.cpp
+  内容: Diffuse Indirect 合成。将 Screen Probe Gather / Radiance Cache
+    的结果合成到最终场景颜色。
+  ────────────────────────────────────────
+  顺序: 27
+  文件: LumenTracingUtils.h
+  内容: 追踪工具集。SDF 追踪、Card 追踪、光线 march 的通用工具。
+  ────────────────────────────────────────
+  顺序: 28
+  文件: LumenScreenSpaceBentNormal.cpp
+  内容: Bent Normal。屏幕空间短程 AO 和 Bent Normal 计算。
+  ────────────────────────────────────────
+  顺序: 29
+  文件: LumenShortRangeAOHardwareRayTracing.cpp
+  内容: 短程 AO（HWRT）。
+  ────────────────────────────────────────
+  顺序: 30
+  文件: LumenHeightfields.h/.cpp
+  内容: 高度场。地形/水面在 Lumen 中的特殊追踪。
+  ────────────────────────────────────────
+  顺序: 31
+  文件: LumenIrradianceFieldGather.cpp
+  内容: 辐照度场。为移动端/低端平台提供的替代 GI 方案。
+  ────────────────────────────────────────
+  顺序: 32
+  文件: LumenReSTIRGather.cpp
+  内容: ReSTIR 采集。基于 ReSTIR 的光线复用采样策略。
+  ────────────────────────────────────────
+  顺序: 33
+  文件: LumenFrontLayerTranslucency.h/.cpp
+  内容: 半透明前层。半透明物体对 Lumen GI 的影响。
+  ────────────────────────────────────────
+  顺序: 30
+  文件: LumenHeightfields.h/.cpp
+  内容: 高度场。地形/水面在 Lumen 中的特殊追踪。
+  ────────────────────────────────────────
+  顺序: 31
+  文件: LumenIrradianceFieldGather.cpp
+  内容: 辐照度场。为移动端/低端平台提供的替代 GI 方案。
+  ────────────────────────────────────────
+  顺序: 32
+  文件: LumenReSTIRGather.cpp
+  内容: ReSTIR 采集。基于 ReSTIR 的光线复用采样策略。
+  ────────────────────────────────────────
+  顺序: 33
+  文件: LumenFrontLayerTranslucency.h/.cpp
+  内容: 半透明前层。半透明物体对 Lumen GI 的影响。
+  ────────────────────────────────────────
+  顺序: 34
+  文件: LumenTranslucencyVolume*
+  内容: 半透明体积光照。多文件，HWRT/非 HWRT 路径。
+
+  ---
+  第九阶段：硬件光追基础设施
+
+  顺序: 35
+  文件: LumenHardwareRayTracingCommon.h/.cpp
+  内容: HWRT 通用。Hit Data Buffer、Ray Gen Shader 管理、SBT 绑定。
+  ────────────────────────────────────────
+  顺序: 36
+  文件: LumenHardwareRayTracingMaterials.cpp
+  内容: 材质求值。在 Hit 点评估材质（计算 Albedo、Normal、Emissive 等），是 HWRT 路径与
+    Surface Cache 最大的区别。
+
+  ---
+  第十阶段：可视化与调试
+
+  顺序: 37
+  文件: LumenVisualize.cpp
+  内容: 可视化。r.Lumen.Visualize.* 系列命令对应的渲染。
+  ────────────────────────────────────────
+  顺序: 38
+  文件: LumenVisualizeHardwareRayTracing.cpp
+  内容: HWRT 调试可视化。
+  ────────────────────────────────────────
+  顺序: 39
+  文件: LumenVisualizeRadianceCache.cpp
+  内容: Radiance Cache 可视化。
+
+  ---
+  推荐的阅读方法
+
+  1. 先看 C++ 入口函数，顺着 DeferredShadingRenderer::Render 中的调用链进入 Lumen：
+    - BeginUpdateLumenSceneTasks → 场景更新
+    - UpdateLumenScene → 场景同步
+    - RenderLumenSceneLighting → 直接光照
+    - RenderDiffuseIndirectAndAmbientOcclusion → GI 采集与合成
+    - RenderDeferredReflectionsAndSkyLighting → 反射
+  2. 每个模块按 C++ → Shader 配对读：C++ 负责调度和资源管理，Shader 负责实际计算。先看
+  C++ 中的 AddPass 调用，理解输入输出，再跳到对应 .usf 看算法。
+  3. 善用 cvar 调试：每个模块都有对应的 r.Lumen.*
+  cvar，可以通过关闭/开启特定模块来观察效果变化，加深理解。
