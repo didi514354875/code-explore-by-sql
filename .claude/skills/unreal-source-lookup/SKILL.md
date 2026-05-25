@@ -46,6 +46,37 @@ C/C++ (`.h`, `.cpp`, `.cs`) and shader files (`.usf`, `.ush`, `.hlsl`).
 
 Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ characters. NEAR and prefix (`*`) do not work with trigram tokenizer.
 
+## Query template writing best practices
+
+When crafting or updating `fts_template` for `save_query_template` / `update_query_template`:
+
+1. **Always scope with `file_path` column filter**
+   - FTS5 trigram index covers all 84K+ source files; unscoped queries scan the entire corpus.
+   - Prefix every domain-specific template with `(file_path : "Keyword") AND` to narrow candidates to a subset.
+   - Example: `(file_path : "Nanite") AND "FBuilderModule"` instead of bare `"FBuilderModule"`.
+
+2. **Validate every OR branch before saving**
+   - Use `search_unreal_source(raw_query='"SymbolName"')` to confirm each symbol exists in the index.
+   - Remove branches that return 0 hits — they add scanning overhead with no recall benefit.
+   - Re-run validation after UE version upgrades, as symbols may be renamed or removed.
+
+3. **Avoid short or generic terms in OR branches**
+   - Trigram tokenizer matches any 3+ char substring, so short words like `Split` match unrelated symbols (`BSplitter`, `SplitMesh`, etc.).
+   - Prefer the most specific symbol available: `"FClusterGroup"` over `"Split"`.
+   - If a generic term is unavoidable, rely on the `file_path` scope + AND constraint to keep the result set small.
+
+4. **Structure: scope → anchor → variants**
+   ```
+   (file_path : "Domain") AND "AnchorSymbol" AND ("Variant1" OR "Variant2")
+   ```
+   - `file_path` scope first (cheap column filter, reduces candidate set 100×).
+   - `AND "AnchorSymbol"` second (high-precision anchor that must appear).
+   - `OR` variants last (expand recall within the already-narrowed set).
+
+5. **Update existing templates rather than creating duplicates**
+   - Use `update_query_template(template_id=..., fts_template=...)` to refine an existing template.
+   - This preserves accumulated `success_rate` and `example_queries` feedback history.
+
 ## Output expectations
 
 - Candidate file paths and module names

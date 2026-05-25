@@ -243,6 +243,33 @@ def save_template(
     return int(cursor.lastrowid)
 
 
+def update_template(
+    conn: sqlite3.Connection,
+    template_id: int,
+    *,
+    fts_template: str | None = None,
+    intent_pattern: str | None = None,
+    intent_keywords: Iterable[str] | None = None,
+) -> None:
+    fields: list[str] = []
+    params: list[Any] = []
+    if fts_template is not None:
+        fields.append("fts_template = ?")
+        params.append(fts_template)
+    if intent_pattern is not None:
+        fields.append("intent_pattern = ?")
+        params.append(intent_pattern)
+    if intent_keywords is not None:
+        fields.append("intent_keywords = ?")
+        params.append(json.dumps(list(intent_keywords)))
+    if not fields:
+        return
+    fields.append("updated_at = CURRENT_TIMESTAMP")
+    params.append(template_id)
+    conn.execute(f"UPDATE query_templates SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+
+
 def get_templates(conn: sqlite3.Connection, query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     if query:
         rows = conn.execute(

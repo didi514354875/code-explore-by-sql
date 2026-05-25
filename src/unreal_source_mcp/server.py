@@ -14,6 +14,7 @@ from .db import (
     save_template,
     search_source,
     search_source_raw,
+    update_template,
 )
 
 mcp = FastMCP("unreal-source-mcp")
@@ -117,6 +118,25 @@ def save_query_template(
     with _conn() as conn:
         template_id = save_template(conn, intent_pattern, fts_template, intent_keywords)
         return {"id": template_id}
+
+
+@mcp.tool()
+def update_query_template(
+    template_id: int,
+    fts_template: str | None = None,
+    intent_pattern: str | None = None,
+    intent_keywords: list[str] | None = None,
+) -> dict[str, int]:
+    """Update an existing query template's FTS expression or metadata."""
+    with _conn() as conn:
+        update_template(
+            conn,
+            template_id,
+            fts_template=fts_template,
+            intent_pattern=intent_pattern,
+            intent_keywords=intent_keywords,
+        )
+    return {"updated": template_id}
 
 
 @mcp.tool()
