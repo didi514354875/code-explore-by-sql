@@ -152,6 +152,37 @@ def get_source_by_path(conn: sqlite3.Connection, file_path: str) -> sqlite3.Row 
     return conn.execute("SELECT * FROM source_files WHERE file_path = ?", (file_path,)).fetchone()
 
 
+def get_source_anchored(
+    conn: sqlite3.Connection,
+    file_path: str,
+    anchor: str,
+    context_chars: int = 500,
+) -> dict[str, Any] | None:
+    margin = context_chars // 2
+    row = conn.execute(
+        """
+        SELECT
+            file_path,
+            module_name,
+            instr(raw_content, ?) AS anchor_pos,
+            length(raw_content) AS total_chars,
+            CASE
+                WHEN instr(raw_content, ?) > 0 THEN
+                    substr(raw_content,
+                           max(1, instr(raw_content, ?) - ?),
+                           ?)
+                ELSE NULL
+            END AS content
+        FROM source_files
+        WHERE file_path = ?
+        """,
+        (anchor, anchor, anchor, margin, context_chars, file_path),
+    ).fetchone()
+    if row is None or row["anchor_pos"] == 0:
+        return None
+    return dict(row)
+
+
 def _fts5_escape(query: str) -> str:
     escaped = query.replace('"', '""')
     return f'"{escaped}"'

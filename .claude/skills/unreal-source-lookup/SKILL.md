@@ -27,8 +27,11 @@ C/C++ (`.h`, `.cpp`, `.cs`) and shader files (`.usf`, `.ush`, `.hlsl`).
    - FTS5 returns filename + code snippet (not whole files).
    - Trigram tokenizer handles code symbols like `GetGBuffer`, `Material.Roughness`.
 
-3. **Read specific lines if needed**
-   - Call `get_file_content` with `start_line` and `end_line` only when snippet context is insufficient.
+3. **Extract context around a known symbol**
+   - Prefer anchor mode over full-file reads: `get_file_content(file_path="...", anchor="void FMyClass::MyMethod")`
+   - Anchor mode uses SQL `instr()` + `substr()` to return only a ~500-char window centered on the match — avoids loading a 27KB file for one function.
+   - `context_chars` defaults to 500 (~12-15 lines); increase for wider context: `context_chars=1500`.
+   - Fall back to `start_line`/`end_line` only when you know exact line numbers (e.g., from prior output).
 
 4. **Optionally save template**
    - If the search was useful and likely to recur, suggest saving a template.

@@ -7,6 +7,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import (
     connect,
+    get_source_anchored,
     get_source_by_path,
     get_templates,
     initialize_schema,
@@ -66,9 +67,37 @@ def search_unreal_source(
 
 
 @mcp.tool()
-def get_file_content(file_path: str, start_line: int | None = None, end_line: int | None = None) -> dict[str, Any]:
-    """Return full or line-ranged source file content from the indexed database."""
+def get_file_content(
+    file_path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    anchor: str | None = None,
+    context_chars: int = 500,
+) -> dict[str, Any]:
+    """Return full or line-ranged source file content from the indexed database.
+
+    Two extraction modes:
+    1. Line range (start_line / end_line): returns lines between the given bounds.
+    2. Anchor (anchor): finds the anchor string via instr() and extracts a
+       context_chars-sized window centered on it. Avoids reading the entire file.
+       context_chars defaults to 500, roughly 12-15 lines of code.
+    """
     with _conn() as conn:
+        if anchor is not None:
+            result = get_source_anchored(conn, file_path, anchor, context_chars)
+            if result is None:
+                row = get_source_by_path(conn, file_path)
+                if row is None:
+                    return {"found": False, "file_path": file_path}
+                return {"found": False, "file_path": file_path, "anchor_found": False}
+            return {
+                "found": True,
+                "file_path": result["file_path"],
+                "module_name": result["module_name"],
+                "anchor_pos": result["anchor_pos"],
+                "total_chars": result["total_chars"],
+                "content": result["content"],
+            }
         row = get_source_by_path(conn, file_path)
         if row is None:
             return {"found": False, "file_path": file_path}
