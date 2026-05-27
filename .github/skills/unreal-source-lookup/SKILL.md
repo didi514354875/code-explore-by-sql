@@ -14,25 +14,22 @@ Use this skill when the task is about **finding Unreal Engine source efficiently
 
 C/C++ (`.h`, `.cpp`, `.cs`) and shader files (`.usf`, `.ush`, `.hlsl`).
 
+## Tools (3)
+
+1. **`search_unreal_source(query?, raw_query?, module?, limit?)`** — Search with automatic history acceleration.
+2. **`get_file_content(file_path, start_line?, end_line?, anchor?)`** — Read file content (auto-feedback).
+3. **`log_unreal_query(query_text, was_useful?, refinement?)`** — Explicit feedback (optional).
+
 ## Retrieval procedure
 
-1. **Check for cached templates**
-   - Call `get_query_templates` with the user's intent.
-   - Reuse a matching template if one fits.
+1. **Search** — Call `search_unreal_source` with keywords.
+   - Simple: `search_unreal_source(query="GetGBuffer")`
+   - Advanced: `search_unreal_source(raw_query='"GetGBuffer" AND "Emissive"')`
+   - Results include `source`: `"history_refined"` or `"fts"`.
 
-2. **Search with snippet extraction**
-   - Simple search: `search_unreal_source(query="GetGBuffer")`
-   - Advanced search with boolean operators: `search_unreal_source(raw_query='"GetGBuffer" AND "Emissive"')`
-   - Column-scoped search: `search_unreal_source(raw_query='file_path : "BasePass"')`
-   - FTS5 returns filename + code snippet (not whole files).
-   - Trigram tokenizer handles code symbols like `GetGBuffer`, `Material.Roughness`.
+2. **Read results** — Call `get_file_content` for promising files. Feedback is automatic.
 
-3. **Read specific lines if needed**
-   - Call `get_file_content` with `start_line` and `end_line` only when snippet context is insufficient.
-
-4. **Optionally save template**
-   - If the search was useful and likely to recur, suggest saving a template.
-   - Ask the user before calling `save_query_template`.
+3. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
 
 ## FTS5 raw_query syntax
 
@@ -44,11 +41,10 @@ C/C++ (`.h`, `.cpp`, `.cs`) and shader files (`.usf`, `.ush`, `.hlsl`).
 | Grouping | `'("A" OR "B") AND "C"'` |
 | Column filter | `'file_path : "BasePass"'` |
 
-Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ characters. NEAR and prefix (`*`) do not work with trigram tokenizer.
+Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ characters.
 
 ## Output expectations
 
 - Candidate file paths and module names
 - Code snippets from FTS5
 - Line ranges for further reading
-- Note when DB indexing is needed

@@ -89,45 +89,94 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS query_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            intent_pattern TEXT NOT NULL,
-            fts_template TEXT NOT NULL,
-            intent_keywords TEXT DEFAULT '[]',
-            useful_count INTEGER DEFAULT 0,
-            success_rate REAL DEFAULT 0.0,
-            example_queries TEXT DEFAULT '[]',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS query_templates_fts USING fts5(
-            intent_pattern,
-            fts_template,
-            intent_keywords,
-            content=query_templates,
+        CREATE VIRTUAL TABLE IF NOT EXISTS query_logs_fts USING fts5(
+            query_text,
+            fts_match,
+            content=query_logs,
             content_rowid=id,
             tokenize="trigram"
         );
 
-        CREATE TRIGGER IF NOT EXISTS query_templates_ai AFTER INSERT ON query_templates BEGIN
-            INSERT INTO query_templates_fts(rowid, intent_pattern, fts_template, intent_keywords)
-            VALUES (new.id, new.intent_pattern, new.fts_template, new.intent_keywords);
+        CREATE TRIGGER IF NOT EXISTS query_logs_ai AFTER INSERT ON query_logs BEGIN
+            INSERT INTO query_logs_fts(rowid, query_text, fts_match)
+            VALUES (new.id, new.query_text, new.fts_match);
         END;
 
-        CREATE TRIGGER IF NOT EXISTS query_templates_ad AFTER DELETE ON query_templates BEGIN
-            INSERT INTO query_templates_fts(query_templates_fts, rowid, intent_pattern, fts_template, intent_keywords)
-            VALUES ('delete', old.id, old.intent_pattern, old.fts_template, old.intent_keywords);
+        CREATE TRIGGER IF NOT EXISTS query_logs_ad AFTER DELETE ON query_logs BEGIN
+            INSERT INTO query_logs_fts(query_logs_fts, rowid, query_text, fts_match)
+            VALUES ('delete', old.id, old.query_text, old.fts_match);
         END;
 
-        CREATE TRIGGER IF NOT EXISTS query_templates_au AFTER UPDATE ON query_templates BEGIN
-            INSERT INTO query_templates_fts(query_templates_fts, rowid, intent_pattern, fts_template, intent_keywords)
-            VALUES ('delete', old.id, old.intent_pattern, old.fts_template, old.intent_keywords);
-            INSERT INTO query_templates_fts(rowid, intent_pattern, fts_template, intent_keywords)
-            VALUES (new.id, new.intent_pattern, new.fts_template, new.intent_keywords);
-        END;
+        CREATE TABLE IF NOT EXISTS query_note (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_log_id INTEGER NOT NULL REFERENCES query_logs(id) ON DELETE CASCADE,
+            adopted_file_id INTEGER REFERENCES source_files(id),
+            was_useful INTEGER,
+            refinement TEXT,
+            note TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_note_log ON query_note(query_log_id);
         """
     )
+    conn.commit()
+
+    _migrate_legacy(conn)
+    _migrate_add_adopted_file_id(conn)
+    _ensure_view(conn)
+
+
+def _migrate_legacy(conn: sqlite3.Connection) -> None:
+    """One-time migration: drop query_templates if it exists from older schema."""
+    try:
+        conn.execute("DROP TABLE IF EXISTS query_templates")
+        conn.execute("DROP TABLE IF EXISTS query_templates_fts")
+        conn.execute("DROP TRIGGER IF EXISTS query_templates_ai")
+        conn.execute("DROP TRIGGER IF EXISTS query_templates_ad")
+        conn.execute("DROP TRIGGER IF EXISTS query_templates_au")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _migrate_add_adopted_file_id(conn: sqlite3.Connection) -> None:
+    """Add adopted_file_id column to query_note if missing."""
+    try:
+        conn.execute("ALTER TABLE query_note ADD COLUMN adopted_file_id INTEGER REFERENCES source_files(id)")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_adopted ON query_note(adopted_file_id)")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _ensure_view(conn: sqlite3.Connection) -> None:
+    """Create or recreate query_log_view (must run after adopted_file_id migration)."""
+    conn.execute("DROP VIEW IF EXISTS query_log_view")
+    conn.execute("""
+        CREATE VIEW query_log_view AS
+        SELECT
+            ql.id AS log_id,
+            ql.query_text,
+            ql.fts_match,
+            ql.hit_file_ids,
+            ql.hit_count,
+            ql.created_at AS query_time,
+            qn.id AS note_id,
+            qn.adopted_file_id,
+            qn.was_useful,
+            qn.refinement,
+            qn.note,
+            qn.created_at AS feedback_time,
+            sf.file_path AS adopted_file_path
+        FROM query_logs ql
+        LEFT JOIN query_note qn ON qn.query_log_id = ql.id
+        LEFT JOIN source_files sf ON qn.adopted_file_id = sf.id
+    """)
     conn.commit()
 
 
@@ -188,26 +237,18 @@ def _fts5_escape(query: str) -> str:
     return f'"{escaped}"'
 
 
-def search_source(
-    conn: sqlite3.Connection, query: str, module: str | None = None, limit: int = 20
-) -> list[dict[str, Any]]:
-    fts_query = _fts5_escape(query)
-    sql = (
-        "SELECT sf.id, sf.file_path, sf.module_name, bm25(source_files_fts) AS rank, "
-        "snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet "
-        "FROM source_files_fts JOIN source_files sf ON sf.id = source_files_fts.rowid "
-        "WHERE source_files_fts MATCH ?"
-    )
-    params: list[Any] = [fts_query]
-    if module:
-        sql += " AND sf.module_name = ?"
-        params.append(module)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
-    return [dict(row) for row in conn.execute(sql, params)]
+def _extract_search_terms(query: str) -> list[str]:
+    """Extract meaningful terms from a query for log matching."""
+    import re
+    terms = re.findall(r'"([^"]{3,})"', query)
+    if not terms:
+        stripped = query.strip()
+        if len(stripped) >= 3:
+            terms = [stripped]
+    return terms
 
 
-def search_source_raw(
+def _search_fts(
     conn: sqlite3.Connection, fts_query: str, module: str | None = None, limit: int = 20
 ) -> list[dict[str, Any]]:
     sql = (
@@ -225,129 +266,206 @@ def search_source_raw(
     return [dict(row) for row in conn.execute(sql, params)]
 
 
+def search_source(
+    conn: sqlite3.Connection, query: str, module: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    return _search_fts(conn, _fts5_escape(query), module, limit)
+
+
+def search_source_raw(
+    conn: sqlite3.Connection, fts_query: str, module: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    return _search_fts(conn, fts_query, module, limit)
+
+
 def log_query(
     conn: sqlite3.Connection,
     query_text: str,
     fts_match: str | None,
     hit_file_ids: Iterable[int],
-    was_useful: bool | None = None,
-    refinement: str | None = None,
-    template_id: int | None = None,
 ) -> int:
-    ids = list(hit_file_ids)
+    ids = list(dict.fromkeys(hit_file_ids))
+    if ids:
+        rows = conn.execute(
+            f"SELECT id FROM source_files WHERE id IN ({','.join('?' * len(ids))})", ids
+        ).fetchall()
+        valid_set = {r["id"] for r in rows}
+        ids = [i for i in ids if i in valid_set]
+
     conn.execute(
         """
-        INSERT INTO query_logs(
-            query_text, fts_match, hit_file_ids, hit_count, was_useful, refinement, template_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO query_logs(query_text, fts_match, hit_file_ids, hit_count)
+        VALUES (?, ?, ?, ?)
         """,
-        (
-            query_text,
-            fts_match,
-            json.dumps(ids),
-            len(ids),
-            None if was_useful is None else int(was_useful),
-            refinement,
-            template_id,
-        ),
+        (query_text, fts_match, json.dumps(ids), len(ids)),
     )
-    if template_id is not None and was_useful is not None:
-        update_template_feedback(conn, template_id=template_id, query_text=query_text, was_useful=was_useful)
     conn.commit()
     return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
-def save_template(
-    conn: sqlite3.Connection,
-    intent_pattern: str,
-    fts_template: str,
-    intent_keywords: Iterable[str] | None = None,
-) -> int:
-    cursor = conn.execute(
+def _find_candidate_files_from_history(
+    conn: sqlite3.Connection, search_terms: list[str], top_k: int = 10
+) -> list[int]:
+    """Find candidate file IDs from similar past queries' hit_file_ids.
+
+    Uses query_logs_fts to find similar past queries, ranks them by composite
+    score (BM25 + adopted 3x boost + time decay), then collects hit_file_ids
+    as the search candidate set. adopted_file_id is a ranking signal only.
+    """
+    if not search_terms:
+        return []
+    terms = [t for t in search_terms if len(t) >= 3]
+    if not terms:
+        return []
+    fts_query = " AND ".join(f'"{t.replace(chr(34), chr(34) + chr(34))}"' for t in terms)
+
+    rows = conn.execute(
         """
-        INSERT INTO query_templates(intent_pattern, fts_template, intent_keywords, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        WITH similar AS (
+            SELECT rowid AS log_id, bm25(query_logs_fts) AS sim_score
+            FROM query_logs_fts WHERE query_logs_fts MATCH ?
+            ORDER BY sim_score LIMIT 20
+        )
+        SELECT ql.hit_file_ids,
+               GROUP_CONCAT(qn.adopted_file_id) AS adopted_ids,
+               (-s.sim_score * 10
+                + COALESCE(SUM(CASE WHEN qn.was_useful = 1 THEN 1 ELSE 0 END), 0) * 5
+                - COALESCE(SUM(CASE WHEN qn.was_useful = 0 THEN 1 ELSE 0 END), 0) * 3
+                + CASE WHEN ql.hit_count BETWEEN 1 AND 50 THEN 1 ELSE 0 END
+               ) * (1.0 / (1 + julianday('now') - julianday(ql.created_at)))
+               AS composite_score
+        FROM similar s
+        JOIN query_logs ql ON ql.id = s.log_id
+        LEFT JOIN query_note qn ON qn.query_log_id = ql.id
+        GROUP BY ql.id
+        ORDER BY composite_score DESC
+        LIMIT ?
         """,
-        (intent_pattern, fts_template, json.dumps(list(intent_keywords or []))),
-    )
-    conn.commit()
-    return int(cursor.lastrowid)
+        (fts_query, top_k),
+    ).fetchall()
+
+    candidates: list[int] = []
+    seen: set[int] = set()
+    for row in rows:
+        for fid in json.loads(row["hit_file_ids"]):
+            if fid not in seen:
+                candidates.append(fid)
+                seen.add(fid)
+    return candidates
 
 
-def update_template(
+def search_source_with_feedback(
     conn: sqlite3.Connection,
-    template_id: int,
     *,
-    fts_template: str | None = None,
-    intent_pattern: str | None = None,
-    intent_keywords: Iterable[str] | None = None,
-) -> None:
-    fields: list[str] = []
-    params: list[Any] = []
-    if fts_template is not None:
-        fields.append("fts_template = ?")
-        params.append(fts_template)
-    if intent_pattern is not None:
-        fields.append("intent_pattern = ?")
-        params.append(intent_pattern)
-    if intent_keywords is not None:
-        fields.append("intent_keywords = ?")
-        params.append(json.dumps(list(intent_keywords)))
-    if not fields:
-        return
-    fields.append("updated_at = CURRENT_TIMESTAMP")
-    params.append(template_id)
-    conn.execute(f"UPDATE query_templates SET {', '.join(fields)} WHERE id = ?", params)
-    conn.commit()
+    query: str | None = None,
+    raw_query: str | None = None,
+    module: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search with history-first logic and automatic query logging.
 
+    Path 1: Find similar past queries via query_logs_fts → collect hit_file_ids
+            as candidate set → FTS5 search within candidates (fast, targeted).
+    Path 2: Fallback to full FTS5 search (no history or candidates yielded nothing).
+    """
+    query_text = raw_query or query
+    if not query_text:
+        return []
+    fts_query = raw_query if raw_query else _fts5_escape(query)
+    terms = _extract_search_terms(query_text)
 
-def get_templates(conn: sqlite3.Connection, query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    if query:
+    # Path 1: history candidates + targeted FTS5
+    candidates = _find_candidate_files_from_history(conn, terms)
+    if candidates:
+        ph = ",".join("?" * len(candidates))
         rows = conn.execute(
-            """
-            SELECT qt.*, bm25(query_templates_fts) AS rank
-            FROM query_templates_fts JOIN query_templates qt ON qt.id = query_templates_fts.rowid
-            WHERE query_templates_fts MATCH ?
-            ORDER BY success_rate DESC, useful_count DESC, rank LIMIT ?
+            f"""
+            SELECT sf.id, sf.file_path, sf.module_name,
+                   bm25(source_files_fts) AS rank,
+                   snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet
+            FROM source_files_fts
+            JOIN source_files sf ON sf.id = source_files_fts.rowid
+            WHERE source_files_fts MATCH ? AND sf.id IN ({ph})
             """,
-            (query, limit),
+            [fts_query, *candidates],
         ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM query_templates
-            ORDER BY success_rate DESC, useful_count DESC, updated_at DESC LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(row) for row in rows]
+
+        if rows:
+            results = [dict(r) for r in rows]
+            # Sort by candidate order (adopted files ranked higher) + BM25
+            rank_map = {fid: i for i, fid in enumerate(candidates)}
+            results.sort(key=lambda r: (rank_map.get(r["id"], 999), r["rank"]))
+            results = results[:limit]
+            for r in results:
+                r["source"] = "history_refined"
+            log_query(conn, query_text, fts_query, [r["id"] for r in results])
+            return results
+
+    # Path 2: fallback to full FTS5
+    rows = _search_fts(conn, fts_query, module, limit)
+    results = [dict(r) for r in rows]
+    for r in results:
+        r["source"] = "fts"
+    log_query(conn, query_text, fts_query, [r["id"] for r in results])
+    return results
 
 
-def update_template_feedback(
-    conn: sqlite3.Connection,
-    template_id: int,
-    query_text: str,
-    was_useful: bool,
-) -> None:
-    row = conn.execute("SELECT example_queries FROM query_templates WHERE id = ?", (template_id,)).fetchone()
-    if row is None:
-        return
-    examples = json.loads(row["example_queries"] or "[]")
-    if query_text not in examples:
-        examples = [query_text, *examples][:20]
-    total = conn.execute(
-        "SELECT count(*) FROM query_logs WHERE template_id = ? AND was_useful IS NOT NULL",
-        (template_id,),
-    ).fetchone()[0]
-    useful = conn.execute(
-        "SELECT count(*) FROM query_logs WHERE template_id = ? AND was_useful = 1",
-        (template_id,),
-    ).fetchone()[0]
-    conn.execute(
+def record_feedback(conn: sqlite3.Connection, file_path: str, was_useful: bool = True) -> bool:
+    """Mark a file as adopted if it was in recent search results."""
+    file_row = conn.execute(
+        "SELECT id FROM source_files WHERE file_path = ?", (file_path,)
+    ).fetchone()
+    if file_row is None:
+        return False
+    file_id = file_row["id"]
+
+    log_row = conn.execute(
         """
-        UPDATE query_templates
-        SET useful_count = ?, success_rate = ?, example_queries = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SELECT id FROM query_logs
+        WHERE created_at > datetime('now', '-2 hours')
+          AND hit_file_ids LIKE ?
+        ORDER BY created_at DESC LIMIT 1
         """,
-        (useful, useful / total if total else 0.0, json.dumps(examples), template_id),
-    )
+        (f"%{file_id}%",),
+    ).fetchone()
+    if log_row is None:
+        return False
+
+    existing = conn.execute(
+        "SELECT id FROM query_note WHERE query_log_id = ?", (log_row["id"],)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE query_note SET was_useful = ?, adopted_file_id = ? WHERE query_log_id = ?",
+            (int(was_useful), file_id, log_row["id"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO query_note(query_log_id, adopted_file_id, was_useful) VALUES (?, ?, ?)",
+            (log_row["id"], file_id, int(was_useful)),
+        )
+    conn.commit()
+    return True
+
+
+def prune_stale_data(conn: sqlite3.Connection) -> dict[str, int]:
+    """Remove dead data. Returns counts of deleted items."""
+    stale_logs = conn.execute(
+        """
+        DELETE FROM query_logs
+        WHERE created_at < datetime('now', '-60 days')
+          AND id NOT IN (SELECT query_log_id FROM query_note)
+        """
+    ).rowcount
+
+    stale_notes = conn.execute(
+        """
+        DELETE FROM query_note
+        WHERE created_at < datetime('now', '-90 days')
+        """
+    ).rowcount
+
+    if stale_logs + stale_notes > 100:
+        conn.execute("VACUUM")
+    conn.commit()
+    return {"logs_deleted": stale_logs, "notes_deleted": stale_notes}

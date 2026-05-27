@@ -9,13 +9,9 @@ from .db import (
     connect,
     get_source_anchored,
     get_source_by_path,
-    get_templates,
     initialize_schema,
-    log_query,
-    save_template,
-    search_source,
-    search_source_raw,
-    update_template,
+    record_feedback,
+    search_source_with_feedback,
 )
 
 mcp = FastMCP("unreal-source-mcp")
@@ -49,21 +45,27 @@ def search_unreal_source(
          - '"Material" NOT "hlsl"'
          - '"Lumen" OR "RayTracing"'
     If both query and raw_query are given, raw_query takes precedence.
+
+    The system automatically:
+    - Searches query_logs_fts for similar past queries first (history-boosted)
+    - Falls back to full FTS5 search if no history match
+    - Records each search in query_logs
+    - Results include a "source" field: "history_refined" or "fts"
     Returns filename + code snippet.
     """
     if raw_query is None and query is None:
         return [{"error": "Provide either query or raw_query"}]
     with _conn() as conn:
-        if raw_query is not None:
-            try:
-                rows = search_source_raw(conn, fts_query=raw_query, module=module, limit=max(1, min(limit, 100)))
-            except Exception as exc:
-                return [{"error": f"FTS5 query error: {exc}", "query": raw_query}]
-            log_query(conn, query_text=raw_query, fts_match=raw_query, hit_file_ids=[row["id"] for row in rows])
-        else:
-            rows = search_source(conn, query=query, module=module, limit=max(1, min(limit, 100)))
-            log_query(conn, query_text=query, fts_match=query, hit_file_ids=[row["id"] for row in rows])
-        return rows
+        try:
+            return search_source_with_feedback(
+                conn,
+                query=query,
+                raw_query=raw_query,
+                module=module,
+                limit=max(1, min(limit, 100)),
+            )
+        except Exception as exc:
+            return [{"error": f"FTS5 query error: {exc}", "query": raw_query or query}]
 
 
 @mcp.tool()
@@ -81,6 +83,8 @@ def get_file_content(
     2. Anchor (anchor): finds the anchor string via instr() and extracts a
        context_chars-sized window centered on it. Avoids reading the entire file.
        context_chars defaults to 500, roughly 12-15 lines of code.
+
+    Automatically records feedback when the file was in recent search results.
     """
     with _conn() as conn:
         if anchor is not None:
@@ -90,6 +94,7 @@ def get_file_content(
                 if row is None:
                     return {"found": False, "file_path": file_path}
                 return {"found": False, "file_path": file_path, "anchor_found": False}
+            record_feedback(conn, file_path)
             return {
                 "found": True,
                 "file_path": result["file_path"],
@@ -107,6 +112,7 @@ def get_file_content(
             start = max(1, start_line or 1)
             end = min(len(lines), end_line or len(lines))
             content = "\n".join(lines[start - 1 : end])
+        record_feedback(conn, file_path)
         return {
             "found": True,
             "file_path": row["file_path"],
@@ -118,61 +124,43 @@ def get_file_content(
 @mcp.tool()
 def log_unreal_query(
     query_text: str,
-    fts_match: str | None = None,
     was_useful: bool | None = None,
     refinement: str | None = None,
-    template_id: int | None = None,
-) -> dict[str, int]:
-    """Store a query observation for later template mining."""
+) -> dict[str, str]:
+    """Record explicit feedback for a recent query.
+
+    Finds the most recent query_log matching query_text and writes a query_note.
+    Use this to correct or supplement the automatic feedback from get_file_content.
+    """
     with _conn() as conn:
-        log_id = log_query(
-            conn,
-            query_text,
-            fts_match,
-            [],
-            was_useful=was_useful,
-            refinement=refinement,
-            template_id=template_id,
-        )
-        return {"id": log_id}
-
-
-@mcp.tool()
-def save_query_template(
-    intent_pattern: str,
-    fts_template: str,
-    intent_keywords: list[str] | None = None,
-) -> dict[str, int]:
-    """Save a reusable search template after user confirmation."""
-    with _conn() as conn:
-        template_id = save_template(conn, intent_pattern, fts_template, intent_keywords)
-        return {"id": template_id}
-
-
-@mcp.tool()
-def update_query_template(
-    template_id: int,
-    fts_template: str | None = None,
-    intent_pattern: str | None = None,
-    intent_keywords: list[str] | None = None,
-) -> dict[str, int]:
-    """Update an existing query template's FTS expression or metadata."""
-    with _conn() as conn:
-        update_template(
-            conn,
-            template_id,
-            fts_template=fts_template,
-            intent_pattern=intent_pattern,
-            intent_keywords=intent_keywords,
-        )
-    return {"updated": template_id}
-
-
-@mcp.tool()
-def get_query_templates(query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    """Return saved query templates, optionally ranked by template FTS search."""
-    with _conn() as conn:
-        return get_templates(conn, query=query, limit=max(1, min(limit, 100)))
+        log_row = conn.execute(
+            "SELECT id FROM query_logs WHERE query_text = ? ORDER BY created_at DESC LIMIT 1",
+            (query_text,),
+        ).fetchone()
+        if log_row is None:
+            return {"status": "no_matching_log"}
+        if was_useful is not None or refinement is not None:
+            existing = conn.execute(
+                "SELECT id FROM query_note WHERE query_log_id = ?", (log_row["id"],)
+            ).fetchone()
+            if existing:
+                if was_useful is not None:
+                    conn.execute(
+                        "UPDATE query_note SET was_useful = ? WHERE query_log_id = ?",
+                        (int(was_useful), log_row["id"]),
+                    )
+                if refinement is not None:
+                    conn.execute(
+                        "UPDATE query_note SET refinement = ? WHERE query_log_id = ?",
+                        (refinement, log_row["id"]),
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO query_note(query_log_id, was_useful, refinement) VALUES (?, ?, ?)",
+                    (log_row["id"], int(was_useful) if was_useful is not None else None, refinement),
+                )
+            conn.commit()
+        return {"status": "ok"}
 
 
 def main() -> None:

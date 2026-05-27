@@ -1,40 +1,141 @@
-一、 为什么 FTS5 能完美解决“一行一文件”的 Token 浪费问题？
-如果您用传统的 Vector DB（向量数据库），整文件存储是灾难。但如果您用 SQLite 的 FTS5，整文件存储反而是标准且最高效的用法，核心魔法在于 FTS5 的 snippet()（片段提取） 功能。
-1. 精准的代码片段提取 (Snippet Extraction)
-在 FTS5 中，您把整个几千行的 BasePassPixelShader.usf 存入数据库的一行。当 Agent 搜索关键词（例如 Roughness 和 Lumen）时，您并不需要把整个文件返回给 Agent。
-您可以让系统执行如下 SQL 查询：
-code
-SQL
-SELECT 
-    filename, 
-    snippet(shader_table, 1, '<<<', '>>>', '...', 20) AS matched_code
-FROM shader_table 
-WHERE content MATCH 'Lumen AND Roughness' 
-ORDER BY rank LIMIT 3;
-结果：数据库会自动且极速地返回包含关键词的前后 20 个单词的代码片段，并用 <<< >>> 标记出来。
-Token 消耗暴降：Agent 看到的不再是上万 Token 的完整文件，而是高度浓缩的、带有上下文的几十个 Token 的代码块。这不仅极大地节约了 Token，而且大模型的注意力会高度集中，回答准确率直线飙升。
-2. 代码搜索的终极杀器：毫秒级精准匹配
-Unreal Engine Shader 包含了大量特定的宏、变量名和函数签名（比如 FGBufferData, #define USE_RAYTRACING）。
-向量大模型（Embedding）在处理这些“火星文”符号时往往很吃力（语义模糊）。
-而 FTS5 构建的是倒排索引 (Inverted Index)。Agent 直接把变量名作为关键词去 MATCH，无论代码库有几百万行，查询速度都在毫秒级，而且是 100% 精准命中。
-二、 架构演进：如何让这个系统在实际开发中完美运转？
-为了让这个方案达到您“提速、省钱、准”的最终目的，我建议在工程细节上做以下设计：
-1. 给 Agent 配备“双刃剑”工具 (Tool Design)
-Agent 不需要直接写 SQL，您给它封装两个工具：
-工具 A：search_code(keywords)
-底层调用 FTS5 并使用 snippet()，只返回代码摘要。让 Agent 快速浏览哪些文件包含它要找的东西。
-工具 B：read_file_lines(filename, start_line, end_line)
-如果 Agent 看了 snippet() 觉得不够，它可以通过这个工具，精准读取那个文件的第 100 到 150 行。
-(这样做，既利用了整文件存储的完整性，又实现了 Token 消耗的按需分配)
-2. FTS5 的分词器陷阱 (Tokenizer Setup)
-默认的 FTS5 分词器是针对自然语言（英文单词）的，它遇到标点符号会截断。Shader 代码里全是 . 和 _（比如 Material.Roughness）。
-核心优化：建立 FTS5 表时，一定要使用 Trigram (trigram tokenizer)，或者自定义分词规则（将 _ 等视为字符的一部分）。这样 Agent 搜索 GetGBuffer 时，才能精确匹配出完整的函数名。
-3. 您的点睛之笔：查询模板缓存 (Query Routing Cache)
-在这个 FTS5 架构下，您的“查询模板”想法将发挥出 200% 的威力。
-用户：“UE5 怎么把自发光写进 GBuffer？”
-Agent 首次处理：思考 -> 决定调用 search_code('GBuffer Emissive') -> 阅读 Snippet -> 发现不够 -> 调用 read_file_lines('ShadingModels.ush', ...) -> 给出正确答案。 （耗时 15秒，消耗 3000 Token）。
-系统记录：将 "自发光写进 GBuffer" 的语义特征，直接绑定到这条成功的 FTS5 SQL 语句或最终的代码片段上。
-下一个用户提问：直接命中缓存，无需 Agent 推理，系统瞬间从 FTS5 提取对应代码片段丢给 LLM 生成人类语言回答。（耗时 2秒，消耗 500 Token）。
-最终总结
-如果您想表达的是 FTS5（或者是类似 BM25 的倒排索引数据库，比如 Elasticsearch），那么您的完整思路：【一文件一记录存储】 + 【FTS5 提取 Snippet】 + 【Agent 检索】 + 【记忆查询模板】，不仅完全合理，而且是目前业界处理庞大代码库（Codebase RAG）最实用、成本最低、落地效果最敏捷的架构之一。
-它完美避开了向量数据库在代码检索时的“水土不服”，又用 snippet() 巧妙化解了“整文件塞入”带来的 Token 黑洞，非常值得动手去实现！
+查询日志表
+
+记录 Agent 每一次生成的搜索关键字（可能是多个词）。
+sql
+
+CREATE TABLE query_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_keywords TEXT NOT NULL,         -- Agent 转化后的关键字，如 "快速排序 递归"
+    original_question TEXT,               -- 原始自然语言问题（可选，用于分析）
+    session_id TEXT,                      -- 会话标识，关联多轮交互
+    user_id TEXT,                         -- 可选
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+1.3 查询-代码反馈表（记录有效性）
+
+这是 “有用日志”的核心，记录了某次查询后，用户（或 Agent）与特定代码片段的交互结果，从中可以挖掘出“哪个查询真正解决了问题”。
+sql
+
+CREATE TABLE query_code_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_log_id INTEGER NOT NULL REFERENCES query_log(id),
+    code_id INTEGER NOT NULL REFERENCES code_snippets(id),
+    -- 有效性指标（按需选用）
+    was_adopted INTEGER DEFAULT 0,       -- 1: 最终被采纳/复制/执行成功，0: 仅浏览
+    click_count INTEGER DEFAULT 1,       -- 该次查询中，此代码被点击/展开次数
+    dwell_time_ms INTEGER,               -- 在代码上的停留时长（毫秒）
+    user_rating INTEGER,                 -- 显式评分 (1-5)，若有
+    feedback_time DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+    was_adopted 是最强的有效性信号（Agent 判断该代码解决了当前问题，或用户选中粘贴）。
+
+    综合这些字段，你可以计算一个 有效性得分，例如：
+    text
+
+    score = (was_adopted * 10) + log(click_count + 1) + log(dwell_time_ms + 1) * 0.01
+2. 为查询日志建立 FTS5 索引（实现“以搜代搜”）
+
+对 query_log.query_keywords 建 FTS5 索引，当 Agent 产生新的关键字时，快速匹配出历史上语义/关键词相似的查询。
+sql
+
+CREATE VIRTUAL TABLE query_log_fts USING fts5(
+    query_keywords,
+    content='query_log',
+    content_rowid='id',
+    tokenize='porter unicode61 remove_diacritics 2'  -- 英文可用 porter 词干，中文需配合分词
+);
+
+-- 保持同步的触发器
+CREATE TRIGGER query_log_ai AFTER INSERT ON query_log BEGIN
+    INSERT INTO query_log_fts(rowid, query_keywords) VALUES (new.id, new.query_keywords);
+END;
+-- ... delete 和 update 触发器类似
+
+3. 利用“有用日志”加速搜索的具体方法
+
+当 Agent 收到一个新问题，并将其转化为关键字 :new_keywords 后，按以下流程 优先利用历史有效日志：
+
+    找相似历史查询
+    在 query_log_fts 中搜索与 :new_keywords 最相关的查询日志。
+    sql
+
+    SELECT ql.id, ql.query_keywords, bm25(query_log_fts, 0) AS relevance
+    FROM query_log_fts
+    JOIN query_log ql ON ql.id = query_log_fts.rowid
+    WHERE query_log_fts MATCH :new_keywords
+    ORDER BY relevance
+    LIMIT 20;
+
+    聚合这些相似查询的“有效性”高代码
+    对上一步得到的 top_k 个历史查询 ID，找出它们之中 被采纳最多、有效性得分最高 的代码片段。这就是“历史证明有效”的答案。
+    sql
+
+    WITH similar_queries AS (
+        SELECT rowid AS log_id, bm25(query_log_fts, 0) AS sim_score
+        FROM query_log_fts
+        WHERE query_log_fts MATCH :new_keywords
+        ORDER BY sim_score
+        LIMIT 20
+    )
+    SELECT
+        cs.id,
+        cs.title,
+        cs.code,
+        -- 加权后的总有效性得分：相似度 * 累积有效性
+        SUM( qcf.was_adopted * 10 + qcf.click_count ) * AVG(sq.sim_score) AS weighted_score
+    FROM similar_queries sq
+    JOIN query_code_feedback qcf ON qcf.query_log_id = sq.log_id
+    JOIN code_snippets cs ON cs.id = qcf.code_id
+    GROUP BY cs.id
+    ORDER BY weighted_score DESC
+    LIMIT 10;
+
+    决定搜索策略
+
+        若相似查询数量充足且得分高（例如加权最高得分 > 阈值），可直接将上述结果作为“缓存答案”返回给用户，完全跳过对代码库的大规模 FTS 搜索。这就是加速的关键——将实时搜索转化为历史日志匹配。
+
+        若历史匹配不足，则回退到对 code_snippets 的全文搜索（代码库也需要建 FTS5 索引），并正常记录本次查询及后续反馈。
+
+    记录新查询与反馈，形成闭环
+
+        无论走哪条路径，新的 query_log 都要记录。
+
+        当用户/Agent 最终选择了某个代码片段时，写入 query_code_feedback，更新其有效性数据，让未来相似查询能更快命中。
+
+4. 有效性设计：让日志“更聪明”
+
+除了被动收集反馈，还可以主动设计 时间衰减 和 反作弊：
+
+    时间衰减：代码库会演进，太老的反馈可能过时。在聚合时乘以衰减因子：
+    sql
+
+    ... * (1.0 / (1 + (julianday('now') - julianday(qcf.feedback_time)))) ...
+
+    全局热度 vs 查询相关性：
+
+        全局热门代码（被所有查询高频采纳）可能淹没个性化推荐，可在计算得分时除以代码的总采纳次数（类似 TF-IDF），让结果更贴合当前查询。
+
+    Agent 自动标记采纳：若你的 Agent 能判断任务执行成功（如编译通过、测试通过），可自动设置 was_adopted = 1，无需人工反馈。
+
+5. 完整表结构汇总
+sql
+
+-- 代码库
+CREATE TABLE code_snippets (...);
+-- 代码 FTS（用于回退搜索）
+CREATE VIRTUAL TABLE code_fts USING fts5(title, description, code, content='code_snippets', content_rowid='id');
+
+-- 查询日志 + FTS
+CREATE TABLE query_log (...);
+CREATE VIRTUAL TABLE query_log_fts USING fts5(...);
+
+-- 有效性反馈
+CREATE TABLE query_code_feedback (...);
+CREATE INDEX idx_feedback_qid ON query_code_feedback(query_log_id);
+CREATE INDEX idx_feedback_cid ON query_code_feedback(code_id);
+
+6. 总结：加速的本质
+
+通过 query_log_fts 对新查询进行相似匹配，再用 query_code_feedback 中记录的“有效性得分”直接推荐历史高采纳代码。这样，高频相似查询不再每次都重搜整个代码库，实现了 “搜索→采纳→加速未来搜索” 的循环。有效性字段（尤其是 was_adopted）让日志从无用噪声变为可复用的知识资产。

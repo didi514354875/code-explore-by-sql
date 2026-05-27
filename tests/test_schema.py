@@ -2,12 +2,13 @@ from unreal_source_mcp.db import (
     SOURCE_EXTENSIONS,
     SourceFile,
     connect,
-    get_templates,
     initialize_schema,
     log_query,
-    save_template,
+    prune_stale_data,
+    record_feedback,
     search_source,
     search_source_raw,
+    search_source_with_feedback,
     upsert_source_file,
 )
 
@@ -72,24 +73,101 @@ def test_trigram_matches_dotted_symbols(tmp_path):
     assert rows
 
 
-def test_template_feedback_updates_stats(tmp_path):
+def test_log_query_and_feedback_loop(tmp_path):
     db_path = tmp_path / "source.db"
     conn = connect(db_path)
     initialize_schema(conn)
-
-    template_id = save_template(
+    upsert_source_file(
         conn,
-        intent_pattern="find lifecycle function",
-        fts_template="BeginPlay Tick",
-        intent_keywords=["lifecycle", "actor"],
+        SourceFile(
+            file_path="Engine/Source/Runtime/Core/Actor.cpp",
+            module_name="Core",
+            raw_content="void AActor::BeginPlay() { Super::BeginPlay(); }",
+        ),
     )
-    log_query(conn, "where is actor BeginPlay", "BeginPlay", [], was_useful=True, template_id=template_id)
+    conn.commit()
 
-    templates = get_templates(conn, "lifecycle", limit=10)
+    log_id = log_query(conn, "BeginPlay", "BeginPlay", [1])
+    assert log_id > 0
 
-    assert templates[0]["id"] == template_id
-    assert templates[0]["useful_count"] == 1
-    assert templates[0]["success_rate"] == 1.0
+    row = conn.execute("SELECT * FROM query_logs WHERE id = ?", (log_id,)).fetchone()
+    assert row["query_text"] == "BeginPlay"
+    assert row["hit_count"] == 1
+
+    result = record_feedback(conn, "Engine/Source/Runtime/Core/Actor.cpp", was_useful=True)
+    assert result is True
+
+    note = conn.execute("SELECT * FROM query_note WHERE query_log_id = ?", (log_id,)).fetchone()
+    assert note is not None
+    assert note["was_useful"] == 1
+
+
+def test_record_feedback_no_recent_query(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Core/Orphan.cpp",
+            module_name="Core",
+            raw_content="void Orphan() {}",
+        ),
+    )
+    conn.commit()
+
+    result = record_feedback(conn, "Engine/Source/Runtime/Core/Orphan.cpp")
+    assert result is False
+
+
+def test_search_with_feedback_logs_query(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Renderer/Lumen.cpp",
+            module_name="Renderer",
+            raw_content="void FLumenScene::Render() { TraceLumen(); }",
+        ),
+    )
+    conn.commit()
+
+    rows = search_source_with_feedback(conn, query="Lumen")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "fts"
+
+    log = conn.execute("SELECT * FROM query_logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert log["query_text"] == "Lumen"
+
+
+def test_search_with_feedback_uses_history(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    fid = upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Renderer/Lumen.cpp",
+            module_name="Renderer",
+            raw_content="void FLumenScene::Render() { TraceLumen(); }",
+        ),
+    )
+    conn.commit()
+
+    # First search: no history, full FTS5
+    rows = search_source_with_feedback(conn, query="Lumen")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "fts"
+
+    # Record feedback (adopted file)
+    record_feedback(conn, "Engine/Source/Runtime/Renderer/Lumen.cpp", was_useful=True)
+
+    # Second search: history-first, candidate set from hit_file_ids
+    rows = search_source_with_feedback(conn, query="Lumen")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "history_refined"
 
 
 def test_snippet_extraction(tmp_path):
@@ -195,6 +273,79 @@ def test_raw_query_invalid_syntax(tmp_path):
 
     try:
         search_source_raw(conn, "!!! invalid !!!")
-        assert False, "Should have raised"
+        raise AssertionError("Should have raised")
     except sqlite3.OperationalError:
         pass
+
+
+def test_prune_stale_data(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+
+    log_query(conn, "old_query", "old_query", [])
+
+    conn.execute(
+        "UPDATE query_logs SET created_at = datetime('now', '-61 days') WHERE query_text = 'old_query'"
+    )
+    conn.commit()
+
+    result = prune_stale_data(conn)
+    assert result["logs_deleted"] == 1
+
+    remaining = conn.execute("SELECT count(*) FROM query_logs").fetchone()[0]
+    assert remaining == 0
+
+
+def test_prune_keeps_noted_logs(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+
+    fid = upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Core/Keep.cpp",
+            module_name="Core",
+            raw_content="void Keep() {}",
+        ),
+    )
+    conn.commit()
+
+    log_id = log_query(conn, "keep_query", "keep_query", [fid])
+    conn.execute(
+        "UPDATE query_logs SET created_at = datetime('now', '-61 days') WHERE id = ?",
+        (log_id,),
+    )
+    conn.execute(
+        "INSERT INTO query_note(query_log_id, was_useful) VALUES (?, 1)", (log_id,)
+    )
+    conn.commit()
+
+    result = prune_stale_data(conn)
+    assert result["logs_deleted"] == 0
+
+    remaining = conn.execute("SELECT count(*) FROM query_logs").fetchone()[0]
+    assert remaining == 1
+
+
+def test_query_log_view(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    fid = upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Core/View.cpp",
+            module_name="Core",
+            raw_content="void View() {}",
+        ),
+    )
+    conn.commit()
+
+    log_id = log_query(conn, "View", "View", [fid])
+    record_feedback(conn, "Engine/Source/Runtime/Core/View.cpp", was_useful=True)
+
+    rows = conn.execute("SELECT * FROM query_log_view WHERE log_id = ?", (log_id,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["was_useful"] == 1

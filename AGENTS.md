@@ -6,15 +6,22 @@ This repository provides a local MCP server for Unreal Engine source retrieval u
 
 One file = one row. FTS5 `snippet()` extracts relevant code fragments, so the agent never needs to read whole files. Trigram tokenizer ensures code symbols like `GetGBuffer`, `Material.Roughness`, `UE_LOG` are searchable.
 
-## Tools (5)
+The system maintains a closed feedback loop: search results are automatically logged, and when the agent reads a file, feedback is recorded. Future similar searches are accelerated by this history.
 
-1. **`search_unreal_source(query?, raw_query?, module?, limit?)`** — FTS5 search, returns filename + code snippet.
+## Tools (3)
+
+1. **`search_unreal_source(query?, raw_query?, module?, limit?)`** — FTS5 search with automatic history acceleration.
    - `query`: simple literal match (single keyword or phrase)
    - `raw_query`: advanced FTS5 expression with AND/OR/NOT and column filters
-2. **`get_file_content(file_path, start_line?, end_line?)`** — Read specific lines when snippet context is insufficient.
-3. **`get_query_templates(query?, limit?)`** — Check cached templates for recurring intents.
-4. **`log_unreal_query(...)`** — Record query feedback for template learning.
-5. **`save_query_template(...)`** — Persist a template after user confirmation.
+   - System checks query_logs_fts for similar past queries first; falls back to full FTS5
+   - Each search is auto-logged in query_logs
+   - Results include `source` field: `"history_refined"` or `"fts"`
+
+2. **`get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`** — Read specific lines when snippet context is insufficient.
+   - Automatically records feedback in query_note when the file was in recent search results
+
+3. **`log_unreal_query(query_text, was_useful?, refinement?)`** — Record explicit feedback (optional).
+   - Use only to correct or supplement automatic feedback
 
 ## FTS5 Query Syntax (for raw_query)
 
@@ -36,13 +43,12 @@ Columns: `file_path`, `module_name`, `raw_content`
 
 ## Recommended flow
 
-1. Call `get_query_templates` to check for cached templates matching the intent.
-2. Call `search_unreal_source` with keywords — returns snippets, not whole files.
-3. If snippet context is insufficient, call `get_file_content` with a narrow line range.
-4. Optionally save a query template if the search was useful and likely to recur.
+1. Call `search_unreal_source` with keywords — returns snippets, not whole files.
+2. Call `get_file_content` with a narrow line range if snippet context is insufficient (auto-feedback).
+3. Call `log_unreal_query` only if you need to correct the automatic feedback.
 
 ## Guidance
 
 - Avoid returning large file bodies — use `search_unreal_source` first.
-- Save query templates only after user confirmation.
+- The feedback loop is automatic — no need to manually log unless correcting.
 - If the database has not been built yet, guide the user toward indexing first.
