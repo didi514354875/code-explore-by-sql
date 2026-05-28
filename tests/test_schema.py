@@ -349,3 +349,41 @@ def test_query_log_view(tmp_path):
     rows = conn.execute("SELECT * FROM query_log_view WHERE log_id = ?", (log_id,)).fetchall()
     assert len(rows) == 1
     assert rows[0]["was_useful"] == 1
+
+
+def test_expanded_terms_boost_history(tmp_path):
+    db_path = tmp_path / "source.db"
+    conn = connect(db_path)
+    initialize_schema(conn)
+    fid = upsert_source_file(
+        conn,
+        SourceFile(
+            file_path="Engine/Source/Runtime/Renderer/Lumen.cpp",
+            module_name="Renderer",
+            raw_content="void FLumenScene::Render() { TraceLumen(); }",
+        ),
+    )
+    conn.commit()
+
+    # First search: no history, full FTS5
+    rows = search_source_with_feedback(conn, query="Lumen")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "fts"
+
+    # Record feedback
+    record_feedback(conn, "Engine/Source/Runtime/Renderer/Lumen.cpp", was_useful=True)
+
+    # Second search: same word, history works (baseline)
+    rows = search_source_with_feedback(conn, query="Lumen")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "history_refined"
+
+    # Third search: different word, no expansion → no history match
+    rows = search_source_with_feedback(conn, query="FLumenScene")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "fts"
+
+    # Fourth search: different word, but expanded_terms bridges to past "Lumen" query
+    rows = search_source_with_feedback(conn, query="FLumenScene", expanded_terms=["Lumen"])
+    assert len(rows) == 1
+    assert rows[0]["source"] == "history_refined"

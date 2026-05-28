@@ -31,6 +31,7 @@ def _conn():
 def search_unreal_source(
     query: str | None = None,
     raw_query: str | None = None,
+    expanded_terms: list[str] | None = None,
     module: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
@@ -46,8 +47,15 @@ def search_unreal_source(
          - '"Lumen" OR "RayTracing"'
     If both query and raw_query are given, raw_query takes precedence.
 
+    expanded_terms: Optional extra keywords from intent expansion. Use world knowledge
+    to expand the search intent into related terms that may appear in past query logs.
+    Example: searching for "Material architecture" could expand to
+    ["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy",
+     "MaterialShared"]. These terms are merged with auto-extracted terms for history
+    matching via LIKE OR, improving hit rate on past queries.
+
     The system automatically:
-    - Searches query_logs_fts for similar past queries first (history-boosted)
+    - Searches query_logs for similar past queries first (history-boosted)
     - Falls back to full FTS5 search if no history match
     - Records each search in query_logs
     - Results include a "source" field: "history_refined" or "fts"
@@ -61,6 +69,7 @@ def search_unreal_source(
                 conn,
                 query=query,
                 raw_query=raw_query,
+                expanded_terms=expanded_terms,
                 module=module,
                 limit=max(1, min(limit, 100)),
             )

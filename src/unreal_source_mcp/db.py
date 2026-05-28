@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -118,6 +119,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_note_log ON query_note(query_log_id);
+        CREATE INDEX IF NOT EXISTS idx_logs_created ON query_logs(created_at);
         """
     )
     conn.commit()
@@ -233,19 +235,43 @@ def get_source_anchored(
 
 
 def _fts5_escape(query: str) -> str:
-    escaped = query.replace('"', '""')
-    return f'"{escaped}"'
+    words = re.findall(r'[A-Za-z0-9_]{3,}', query)
+    if not words:
+        stripped = query.strip()
+        if len(stripped) >= 3:
+            words = [stripped]
+    if not words:
+        return '""'
+    return " AND ".join(f'"{w.replace(chr(34), chr(34)+chr(34))}"' for w in words)
 
 
 def _extract_search_terms(query: str) -> list[str]:
-    """Extract meaningful terms from a query for log matching."""
-    import re
-    terms = re.findall(r'"([^"]{3,})"', query)
+    """Extract meaningful keywords from a query for history matching.
+
+    General approach: pull all alphanumeric words >= 3 chars, deduplicate
+    case-insensitively, skip FTS5/SQL operators. Domain-agnostic.
+    """
+    _STOP_WORDS = frozenset({
+        'and', 'or', 'not', 'in', 'is', 'null', 'like', 'the', 'for',
+        'from', 'with', 'where', 'select', 'class', 'void', 'struct',
+    })
+
+    raw_words = re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', query)
+
+    seen: set[str] = set()
+    terms: list[str] = []
+    for w in raw_words:
+        low = w.lower()
+        if low not in seen and low not in _STOP_WORDS:
+            seen.add(low)
+            terms.append(w)
+
     if not terms:
         stripped = query.strip()
         if len(stripped) >= 3:
             terms = [stripped]
-    return terms
+
+    return terms[:12]
 
 
 def _search_fts(
@@ -308,40 +334,33 @@ def _find_candidate_files_from_history(
 ) -> list[int]:
     """Find candidate file IDs from similar past queries' hit_file_ids.
 
-    Uses query_logs_fts to find similar past queries, ranks them by composite
-    score (BM25 + adopted 3x boost + time decay), then collects hit_file_ids
-    as the search candidate set. adopted_file_id is a ranking signal only.
+    Uses FTS5 on query_logs_fts (OR logic: any term match qualifies).
+    Ranks by composite score (feedback boost + time decay).
     """
     if not search_terms:
         return []
     terms = [t for t in search_terms if len(t) >= 3]
     if not terms:
         return []
-    fts_query = " AND ".join(f'"{t.replace(chr(34), chr(34) + chr(34))}"' for t in terms)
+
+    fts_or = " OR ".join(f'"{t}"' for t in terms)
 
     rows = conn.execute(
         """
-        WITH similar AS (
-            SELECT rowid AS log_id, bm25(query_logs_fts) AS sim_score
-            FROM query_logs_fts WHERE query_logs_fts MATCH ?
-            ORDER BY sim_score LIMIT 20
-        )
-        SELECT ql.hit_file_ids,
-               GROUP_CONCAT(qn.adopted_file_id) AS adopted_ids,
-               (-s.sim_score * 10
-                + COALESCE(SUM(CASE WHEN qn.was_useful = 1 THEN 1 ELSE 0 END), 0) * 5
-                - COALESCE(SUM(CASE WHEN qn.was_useful = 0 THEN 1 ELSE 0 END), 0) * 3
-                + CASE WHEN ql.hit_count BETWEEN 1 AND 50 THEN 1 ELSE 0 END
-               ) * (1.0 / (1 + julianday('now') - julianday(ql.created_at)))
-               AS composite_score
-        FROM similar s
-        JOIN query_logs ql ON ql.id = s.log_id
-        LEFT JOIN query_note qn ON qn.query_log_id = ql.id
+        SELECT ql.id, ql.hit_file_ids, ql.hit_count, ql.created_at
+        FROM query_logs_fts qft
+                JOIN query_logs ql ON ql.id = qft.rowid
+                LEFT JOIN query_note qn ON qn.query_log_id = ql.id
+        WHERE qft.query_logs_fts MATCH ?
         GROUP BY ql.id
-        ORDER BY composite_score DESC
+        ORDER BY (
+            COUNT(CASE WHEN qn.was_useful = 1 THEN 1 END) * 5
+            - COUNT(CASE WHEN qn.was_useful = 0 THEN 1 END) * 3
+            + CASE WHEN ql.hit_count BETWEEN 1 AND 50 THEN 1 ELSE 0 END
+        ) * (1.0 / (1 + julianday('now') - julianday(ql.created_at))) DESC
         LIMIT ?
         """,
-        (fts_query, top_k),
+        (fts_or, top_k),
     ).fetchall()
 
     candidates: list[int] = []
@@ -359,20 +378,31 @@ def search_source_with_feedback(
     *,
     query: str | None = None,
     raw_query: str | None = None,
+    expanded_terms: list[str] | None = None,
     module: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     """Search with history-first logic and automatic query logging.
 
-    Path 1: Find similar past queries via query_logs_fts → collect hit_file_ids
+    Path 1: Find similar past queries via LIKE OR → collect hit_file_ids
             as candidate set → FTS5 search within candidates (fast, targeted).
     Path 2: Fallback to full FTS5 search (no history or candidates yielded nothing).
+
+    expanded_terms: extra keywords from intent expansion (agent-supplied).
     """
     query_text = raw_query or query
     if not query_text:
         return []
     fts_query = raw_query if raw_query else _fts5_escape(query)
     terms = _extract_search_terms(query_text)
+
+    # Merge agent-supplied expanded terms
+    if expanded_terms:
+        seen = {t.lower() for t in terms}
+        for t in expanded_terms:
+            if len(t) >= 3 and t.lower() not in seen:
+                seen.add(t.lower())
+                terms.append(t)
 
     # Path 1: history candidates + targeted FTS5
     candidates = _find_candidate_files_from_history(conn, terms)
@@ -421,12 +451,12 @@ def record_feedback(conn: sqlite3.Connection, file_path: str, was_useful: bool =
 
     log_row = conn.execute(
         """
-        SELECT id FROM query_logs
-        WHERE created_at > datetime('now', '-2 hours')
-          AND hit_file_ids LIKE ?
-        ORDER BY created_at DESC LIMIT 1
+        SELECT ql.id FROM query_logs ql, json_each(ql.hit_file_ids) AS je
+        WHERE ql.created_at > datetime('now', '-2 hours')
+          AND je.value = ?
+        ORDER BY ql.created_at DESC LIMIT 1
         """,
-        (f"%{file_id}%",),
+        (file_id,),
     ).fetchone()
     if log_row is None:
         return False
