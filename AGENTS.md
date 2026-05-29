@@ -4,7 +4,7 @@ This repository provides a local MCP server for Unreal Engine source retrieval u
 
 ## Architecture
 
-One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fragments via a **two-step deferred query** (rank first, snippet only for top-N), so the agent never needs to read whole files for search results.
+One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fragments via a **two-step deferred query** (rank first, snippet only for top-N, truncated to 300 chars), producing compact ~2,600 token responses for 20 results (95% token reduction vs full snippets).
 
 **Bracket skeleton index**: A 6-state FSM scans C/C++ source tracking brace pairs while ignoring braces in comments, strings, and raw string literals. Each brace pair records depth, open/close line, block type, and block name. This provides structural context without AST parsing — robust against macros and incomplete syntax.
 
@@ -12,101 +12,59 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
 
 **History-as-ranking-signal**: Past search feedback adjusts result ranking but never filters out results. This prevents confirmation bias while still accelerating relevant results.
 
-### Query pipeline
+### Token cost quick reference
 
-```
-search_source_with_feedback()
-  ├── _search_fts()              # Two-step FTS5: rank → snippet for top-N only
-  ├── _get_history_signals()     # Feedback scores (ranking, not filtering)
-  ├── Composite scoring          # base_score + hist_bonus + discovery bonus
-  ├── _apply_scope_filter()      # Bracket-based block_type/block_name filter
-  └── _cluster_results()         # Merge hits in same code block
-```
+| Operation | ~Tokens | Note |
+|-----------|---------|------|
+| `search_unreal_source` (20 results) | ~2,600 | Compact 300-char snippets |
+| `get_file_content(anchor=...)` | ~125 | **Always prefer** over full read |
+| `get_file_content` (full file) | ~45,000 | Avoid — use anchor or line range |
+| `find_callers` (specific symbol) | 127–3,000 | Use `scope` for common symbols |
+| `find_include_graph` | 50–2,100 | Cheap — use freely |
 
 ## Tools (5)
 
-### 1. `search_unreal_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
+1. **`search_unreal_source`** — FTS5 search with history ranking, scope filtering, compact snippets.
+   - Simple: `query="GetGBuffer"`
+   - Advanced: `raw_query='"GetGBuffer" AND "Emissive"'`
+   - `scope_filter` must be a **JSON string**: `'{"block_type": "function"}'`
+   - `module="Renderer"` — filter by UE module name
 
-FTS5 search with automatic history acceleration and structural features.
+2. **`get_file_content`** — Read file content. Prefer **anchor mode** for efficiency.
+   - Anchor: `anchor="Render", context_chars=500` (~125 tokens)
+   - Line range: `start_line=100, end_line=200`
+   - Auto-records feedback from search results
 
-- **Simple mode** (`query`): literal text match. `"GetGBuffer"`, `"FMaterial Render"`
-- **Advanced mode** (`raw_query`): raw FTS5 expression with AND/OR/NOT and column filters
-- `expanded_terms`: domain-specific terms for history matching (e.g., `["FMaterial", "UMaterialInterface"]`)
-- `module`: filter by UE module name (e.g., `"Renderer"`, `"UnrealEd"`, `"Niagara"`)
-- `cluster`: merge multiple hits in the same code block into one result with `hit_count`
-- `scope_filter`: JSON with `block_type` and/or `block_name` to restrict results (e.g., `'{"block_type": "function"}'`)
-- Results include `source` field: `"history_refined"` or `"fts"`
-- Results include `final_score`: composite of FTS5 rank + history bonus + discovery bonus
+3. **`log_unreal_query`** — Record explicit feedback (optional, only to correct automatic feedback)
 
-### 2. `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
+4. **`find_include_graph`** — Include dependency graph (upstream/downstream, recursive, depth control)
 
-Read specific lines or anchor-based context. Two extraction modes:
-- **Line range**: `start_line` / `end_line` — traditional line-based extraction
-- **Anchor**: finds a string via `instr()` and extracts a window around it — avoids reading the whole file
-
-Automatically records feedback when the file was in recent search results.
-
-### 3. `log_unreal_query(query_text, was_useful?, refinement?)`
-
-Record explicit feedback for a recent query. Use only to correct or supplement the automatic feedback from `get_file_content`.
-
-### 4. `find_include_graph(file_path, direction?, depth?)`
-
-Query include dependency relationships for a file.
-- `direction`: `"upstream"` (who includes this file), `"downstream"` (what this file includes), or `"both"`
-- `depth`: recursion depth (1 = direct dependencies only)
-- Returns edges with source/target file paths and include paths
-
-### 5. `find_callers(symbol, scope?)`
-
-Find callers of a symbol using FTS5 text search + bracket skeleton structural context.
-- Searches for the symbol in all indexed files
-- Uses bracket_index to locate which function/class each occurrence belongs to
-- Skips the definition block (where the symbol is the block name)
-- `scope`: optional module name to limit search
-
-## FTS5 Query Syntax (for raw_query)
-
-| Operator | Syntax | Example |
-|----------|--------|---------|
-| AND | `"A" AND "B"` | `'"GetGBuffer" AND "Emissive"'` |
-| OR | `"A" OR "B"` | `'"Lumen" OR "RayTracing"'` |
-| NOT | `"A" NOT "B"` | `'"Material" NOT "hlsl"'` |
-| Grouping | `("A" OR "B") AND "C"` | `'("alpha" OR "beta") AND "gamma"'` |
-| Column filter | `column : "term"` | `'file_path : "BasePass"'` |
-
-Columns: `file_path`, `module_name`, `raw_content`
-
-**Rules:**
-- All terms must be 3+ characters (trigram tokenizer requirement)
-- Phrase queries use `"double quotes"`
-- NEAR and prefix (`*`) operators do NOT work with trigram tokenizer
-- Use `query` for simple lookups, `raw_query` when you need boolean logic or column-scoped search
-
-## Block types (from bracket skeleton + symbol sniffer)
-
-| block_type | Description | Example |
-|------------|-------------|---------|
-| `namespace` | Namespace block | `namespace MyEngine { ... }` |
-| `class` | Class or struct | `class UMyClass : public UObject { ... }` |
-| `enum` | Enum (plain or enum class) | `enum class ELightType { ... }` |
-| `function` | Function/method | `void FRenderer::Render() { ... }` |
-| `control_flow` | if/for/while/switch | `if (bEnabled) { ... }` |
-| `macro` | Preprocessor #define | `#define IMPLEMENT_MODULE(...) { ... }` |
-| `unknown` | Unrecognized block | Braces without matching pattern |
+5. **`find_callers`** — Caller lookup with line-range verification.
+   - Returns exact `caller_line` per call site
+   - **Always use `scope`** for common symbols like "Render" (500+ callers otherwise)
 
 ## Recommended flow
 
-1. **Search**: `search_unreal_source` with keywords — returns snippets, not whole files.
-2. **Drill down**: `get_file_content` with anchor mode or narrow line range if snippet context is insufficient (auto-feedback).
-3. **Explore structure**: `find_include_graph` to understand file dependencies, `find_callers` to trace call sites.
-4. **Correct feedback**: `log_unreal_query` only if you need to correct the automatic feedback.
+1. `search_unreal_source` → compact snippets (~2,600 tok)
+2. `get_file_content(anchor=...)` → deep context (~125 tok each)
+3. `find_callers` / `find_include_graph` → structural exploration
+4. `log_unreal_query` → only to correct feedback
+
+## FTS5 Query Syntax (for raw_query)
+
+| Operator | Example |
+|----------|---------|
+| AND | `'"A" AND "B"'` |
+| OR | `'"A" OR "B"'` |
+| NOT | `'"A" NOT "B"'` |
+| Grouping | `'("A" OR "B") AND "C"'` |
+| Column filter | `'file_path : "BasePass"'` |
+
+All terms must be 3+ characters. NEAR and prefix (`*`) do NOT work with trigram tokenizer.
 
 ## Guidance
 
-- Avoid returning large file bodies — use `search_unreal_source` first.
-- The feedback loop is automatic — no need to manually log unless correcting.
-- Use `cluster=true` when searching common terms to reduce result noise.
-- Use `scope_filter` to narrow results to specific block types (e.g., only functions).
-- Use `anchor` mode in `get_file_content` for efficient single-symbol context — it's ~50x faster than reading the whole file.
-- If the database has not been built yet, guide the user toward indexing first.
+- Use the `unreal-source-lookup` skill for detailed tool documentation and search strategy
+- Avoid full file reads — anchor mode is 358x cheaper in tokens
+- History feedback is automatic — no need to manually log unless correcting
+- If the database has not been built yet, guide the user toward indexing first
