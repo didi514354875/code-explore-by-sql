@@ -8,6 +8,7 @@ from .db import (
     DEFAULT_EXCLUDE_PARTS,
     SOURCE_EXTENSIONS,
     SourceFile,
+    backfill_structural_index,
     connect,
     initialize_schema,
     upsert_source_file,
@@ -28,17 +29,42 @@ def iter_source_files(root: Path, include_plugins: bool = True) -> list[Path]:
 
 
 def infer_module_name(path: Path) -> str | None:
+    """Infer the UE module name from the file path.
+
+    For paths under .../Source/{Module}/..., returns {Module}.
+    For paths like .../Source/Runtime/Renderer/..., returns "Renderer"
+    (skips category directories: Runtime, Editor, Developer, Programs, Games, Plugins).
+    """
     parts = path.parts
-    if "Source" in parts:
-        idx = parts.index("Source")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    return None
+    if "Source" not in parts:
+        return None
+
+    idx = parts.index("Source")
+    if idx + 1 >= len(parts):
+        return None
+
+    # Skip category directories that group multiple modules
+    _CATEGORIES = {"Runtime", "Editor", "Developer", "Programs", "Games", "Plugins"}
+    first_after = parts[idx + 1]
+
+    if first_after in _CATEGORIES and idx + 2 < len(parts):
+        # .../Source/Runtime/Renderer/Private/... -> Renderer
+        return parts[idx + 2]
+    else:
+        # .../Source/MyModule/Private/... -> MyModule
+        return first_after
 
 
 def build_index(root: Path, db_path: Path, limit: int | None = None) -> int:
+    """Two-phase build: fast file import, then parallel structural indexing."""
+    import time
+
     conn = connect(db_path)
     initialize_schema(conn)
+
+    # Phase 1: Import file contents (skip structural indexing for speed)
+    print(f"Phase 1: Importing files...", flush=True)
+    start = time.time()
     count = 0
     for path in iter_source_files(root)[:limit]:
         try:
@@ -55,11 +81,22 @@ def build_index(root: Path, db_path: Path, limit: int | None = None) -> int:
                 raw_content=content,
                 content_hash=digest,
             ),
+            skip_structural=True,
         )
         count += 1
         if count % 500 == 0:
             conn.commit()
     conn.commit()
+    elapsed = time.time() - start
+    print(f"Phase 1 done: {count} files in {elapsed:.1f}s", flush=True)
+
+    # Phase 2: Parallel structural indexing
+    print(f"Phase 2: Building structural index...", flush=True)
+    start = time.time()
+    backfill_structural_index(conn, batch_size=500, workers=0)
+    elapsed = time.time() - start
+    print(f"Phase 2 done in {elapsed:.1f}s", flush=True)
+
     conn.close()
     return count
 

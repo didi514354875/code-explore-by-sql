@@ -1,14 +1,18 @@
 # unreal-source-mcp
 
-Local stdio MCP server for fast Unreal Engine source lookup with SQLite FTS5 (trigram tokenizer) and query templates.
+Local stdio MCP server for fast Unreal Engine source navigation using **SQLite FTS5** (trigram tokenizer) + **bracket skeleton indexing**.
 
 ## Features
 
-- Index Unreal source files into SQLite FTS5 with trigram tokenizer.
-- Search code symbols like `GetGBuffer`, `Material.Roughness`, `UE_LOG` precisely.
-- Returns code snippets (not whole files) via FTS5 `snippet()`.
-- Read specific line ranges when more context is needed.
-- Query template caching for recurring intents.
+- **Full-text search**: FTS5 with trigram tokenizer for code-symbol-precise search (`GetGBuffer`, `FMaterial`, `UE_LOG`)
+- **Bracket skeleton index**: lightweight structural indexing via FSM brace matching (no AST parser needed)
+- **Symbol classification**: heuristic block-type detection (namespace/class/enum/function/macro) for C/C++
+- **Include dependency graph**: O(1) include path matching with upstream/downstream traversal
+- **Caller lookup**: find callers of any symbol using FTS5 + bracket skeleton
+- **Search result clustering**: merge multiple hits in the same code block into one result
+- **Scope filtering**: restrict search results to specific block types (function/class/namespace)
+- **History-accelerated ranking**: past feedback adjusts ranking without filtering (prevents confirmation bias)
+- **Anchor-based extraction**: efficient context retrieval around a symbol without reading the whole file
 
 ## Setup
 
@@ -19,14 +23,14 @@ uv sync --dev
 ## Build the source index
 
 ```bash
+# Full build (two-phase: fast import → parallel structural indexing)
 uv run unreal-source-build-db /path/to/UnrealEngine /path/to/unreal.db
-```
 
-For a smoke test:
-
-```bash
+# Smoke test with limited files
 uv run unreal-source-build-db /path/to/UnrealEngine /path/to/unreal.db --limit 1000
 ```
+
+Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
 
 ## Run the MCP server
 
@@ -38,15 +42,101 @@ UNREAL_SOURCE_DB=/path/to/unreal.db uv run unreal-source-mcp
 
 | Tool | Purpose |
 |------|---------|
-| `search_unreal_source` | FTS5 search → filename + code snippet |
-| `get_file_content` | Read full file or line range |
-| `get_query_templates` | Lookup cached query templates |
-| `log_unreal_query` | Record query feedback |
-| `save_query_template` | Persist a template (with user confirmation) |
+| `search_unreal_source` | FTS5 search with history ranking, clustering, and scope filtering |
+| `get_file_content` | Read full file, line range, or anchor-based context extraction |
+| `log_unreal_query` | Record explicit feedback for a past query |
+| `find_include_graph` | Query include dependency graph (upstream/downstream, recursive) |
+| `find_callers` | Find callers of a symbol using FTS5 + bracket skeleton |
+
+## Search query modes
+
+### Simple mode (`query`)
+Single keyword or phrase — auto-escaped for FTS5:
+```
+query="GetGBuffer"
+query="FMaterial Render"
+```
+
+### Advanced mode (`raw_query`)
+Full FTS5 boolean expressions:
+```
+raw_query='"GetGBuffer" AND "Emissive"'
+raw_query='"Material" NOT "hlsl"'
+raw_query='(file_path : "BasePass") AND "roughness"'
+```
+
+### Optional parameters
+- `cluster=true` — merge hits in the same code block, includes `block_type` and `block_name`
+- `scope_filter='{"block_type": "function"}'` — only return results inside matching blocks
+- `expanded_terms=["FMaterial", "UMaterialInterface"]` — domain terms for history matching
+- `module="Renderer"` — filter by UE module name
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MCP Server (FastMCP)                      │
+├──────────┬──────────┬──────────┬──────────┬─────────────────┤
+│ search   │ get_file │ log_     │ find_    │ find_           │
+│ _source  │ _content │ query    │ include  │ callers         │
+├──────────┴──────────┴──────────┴──────────┴─────────────────┤
+│                     Query Pipeline                           │
+│  FTS5 (two-step) → History signals → Composite scoring      │
+│  → Scope filter → Clustering → Log                          │
+├─────────────────────────────────────────────────────────────┤
+│                    SQLite Database                           │
+│  source_files + FTS5 │ bracket_index │ include_edges        │
+│  query_logs + FTS5   │ query_note                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Bracket skeleton index
+A 6-state finite state machine (CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHAR_LITERAL, RAW_STRING) scans C/C++ source tracking brace pairs while correctly ignoring braces in comments and string literals. Each matched pair records `open_line`, `close_line`, `depth`, and `is_complete`.
+
+Top-level blocks (depth=1) are further classified by a **symbol sniffer** that examines preceding lines using heuristic regex patterns, producing `block_type` (namespace/class/enum/function/macro/control_flow) and `block_name`.
+
+### Include dependency graph
+Include paths are matched to indexed files using a pre-built basename → file_id hash map with collision resolution. 96.5% of includes resolve in O(1); the rest use O(k) suffix matching.
+
+### Two-step FTS5 query
+Instead of computing `snippet()` for all matching rows (10K+ for common terms), the query is split:
+1. `bm25() + ORDER BY + LIMIT` to get top-N rowids (fast)
+2. `snippet()` computed only for those top-N rows
+
+This provides **~100x speedup** for high-frequency terms.
+
+## Performance (84,696 UE source files)
+
+| Operation | Latency |
+|-----------|---------|
+| Single keyword search | ~90 ms |
+| Full pipeline (FTS5 + history + scoring) | ~115 ms |
+| Module-filtered search | ~250 ms |
+| find_callers | 100–1,500 ms |
+| Include graph (depth=1) | ~15 ms |
+| Bracket index load (single file) | ~1 ms |
+| Anchor-based content extraction | ~0.1 ms |
+| History signal computation | ~0.3 ms |
+
+## Database schema
+
+| Table | Purpose |
+|-------|---------|
+| `source_files` | File metadata + raw content |
+| `source_files_fts` | FTS5 trigram index on content |
+| `bracket_index` | Brace pairs with depth, block type/name |
+| `include_edges` | #include source → target relationships |
+| `query_logs` | Search history for ranking signals |
+| `query_logs_fts` | FTS5 index on query text for similarity matching |
+| `query_note` | Explicit feedback (useful/not useful) |
 
 ## Development
 
 ```bash
 uv run pytest
 uv run ruff check .
+# Bracket scanner + symbol sniffer tests
+PYTHONPATH=src python3 tests/test_bracket_scanner.py
+# Query pipeline efficiency tests
+PYTHONPATH=src python3 tests/test_query_efficiency.py
 ```

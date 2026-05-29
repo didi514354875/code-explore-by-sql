@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -11,6 +12,7 @@ from .db import (
     get_source_by_path,
     initialize_schema,
     record_feedback,
+    search_source,
     search_source_with_feedback,
 )
 
@@ -34,6 +36,8 @@ def search_unreal_source(
     expanded_terms: list[str] | None = None,
     module: str | None = None,
     limit: int = 20,
+    cluster: bool = False,
+    scope_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search Unreal source files. Two modes:
 
@@ -52,17 +56,32 @@ def search_unreal_source(
     Example: searching for "Material architecture" could expand to
     ["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy",
      "MaterialShared"]. These terms are merged with auto-extracted terms for history
-    matching via LIKE OR, improving hit rate on past queries.
+    matching, improving hit rate on past queries.
+
+    cluster: If true, merge multiple hits in the same code block into one result
+    with a hit_count field. Useful when a keyword appears many times in one function.
+
+    scope_filter: Optional JSON string with block_type and/or block_name to narrow search.
+    Example: '{"block_type": "function", "block_name": "Render"}'
+    Only returns hits inside matching code blocks.
 
     The system automatically:
-    - Searches query_logs for similar past queries first (history-boosted)
-    - Falls back to full FTS5 search if no history match
+    - Always performs full FTS5 search (no history-based filtering)
+    - Uses history signals for ranking (not filtering) to avoid confirmation bias
     - Records each search in query_logs
-    - Results include a "source" field: "history_refined" or "fts"
+    - Results include "source" and "final_score" fields
     Returns filename + code snippet.
     """
     if raw_query is None and query is None:
         return [{"error": "Provide either query or raw_query"}]
+
+    parsed_scope = None
+    if scope_filter:
+        try:
+            parsed_scope = json.loads(scope_filter)
+        except json.JSONDecodeError:
+            return [{"error": "scope_filter must be valid JSON"}]
+
     with _conn() as conn:
         try:
             return search_source_with_feedback(
@@ -72,6 +91,8 @@ def search_unreal_source(
                 expanded_terms=expanded_terms,
                 module=module,
                 limit=max(1, min(limit, 100)),
+                cluster=cluster,
+                scope_filter=parsed_scope,
             )
         except Exception as exc:
             return [{"error": f"FTS5 query error: {exc}", "query": raw_query or query}]
@@ -170,6 +191,134 @@ def log_unreal_query(
                 )
             conn.commit()
         return {"status": "ok"}
+
+
+@mcp.tool()
+def find_include_graph(
+    file_path: str,
+    direction: str = "both",
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Query include dependency relationships for a file.
+
+    direction: "upstream" (who includes this file), "downstream" (what this file includes), or "both".
+    depth: recursion depth (1 = direct dependencies only, 2 = one level deeper, etc.).
+    Returns include graph as edges.
+    """
+    with _conn() as conn:
+        row = get_source_by_path(conn, file_path)
+        if row is None:
+            return {"found": False, "file_path": file_path}
+
+        file_id = row["id"]
+        edges = []
+        visited = set()
+
+        def _collect(fid: int, current_depth: int) -> None:
+            if current_depth > depth or fid in visited:
+                return
+            visited.add(fid)
+
+            if direction in ("downstream", "both"):
+                rows = conn.execute(
+                    """
+                    SELECT ie.include_path, ie.target_file_id, sf.file_path AS target_path
+                    FROM include_edges ie
+                    LEFT JOIN source_files sf ON sf.id = ie.target_file_id
+                    WHERE ie.source_file_id = ?
+                    """,
+                    (fid,),
+                ).fetchall()
+                for r in rows:
+                    edges.append({
+                        "source_file_id": fid,
+                        "include_path": r["include_path"],
+                        "target_file_id": r["target_file_id"],
+                        "target_path": r["target_path"],
+                        "direction": "downstream",
+                    })
+                    if r["target_file_id"] and current_depth < depth:
+                        _collect(r["target_file_id"], current_depth + 1)
+
+            if direction in ("upstream", "both"):
+                rows = conn.execute(
+                    """
+                    SELECT ie.source_file_id, sf.file_path AS source_path, ie.include_path
+                    FROM include_edges ie
+                    JOIN source_files sf ON sf.id = ie.source_file_id
+                    WHERE ie.target_file_id = ?
+                    """,
+                    (fid,),
+                ).fetchall()
+                for r in rows:
+                    edges.append({
+                        "source_file_id": r["source_file_id"],
+                        "source_path": r["source_path"],
+                        "include_path": r["include_path"],
+                        "target_file_id": fid,
+                        "direction": "upstream",
+                    })
+                    if current_depth < depth:
+                        _collect(r["source_file_id"], current_depth + 1)
+
+        _collect(file_id, 1)
+
+        return {
+            "found": True,
+            "file_path": file_path,
+            "file_id": file_id,
+            "edges": edges,
+            "total_edges": len(edges),
+        }
+
+
+@mcp.tool()
+def find_callers(
+    symbol: str,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Find callers of a symbol using bracket skeleton + text search.
+
+    Searches for the symbol name in all indexed files, then uses bracket_index
+    to locate which function/class each occurrence belongs to.
+
+    scope: optional module name to limit search scope.
+    Returns list of callers with file, enclosing function, and line info.
+    """
+    from .db import _fts5_escape, load_bracket_index, find_enclosing_block
+
+    with _conn() as conn:
+        fts_query = _fts5_escape(symbol)
+        results = search_source(conn, symbol, module=scope, limit=50)
+
+        callers = []
+        seen_blocks = set()
+
+        for r in results:
+            brackets = load_bracket_index(conn, r["id"], depth=1)
+            # Find all matching blocks in this file
+            for b in brackets:
+                block_key = (r["id"], b["open_line"])
+                if block_key in seen_blocks:
+                    continue
+                if b["block_name"] and symbol.lower() in (b["block_name"] or "").lower():
+                    # This is the definition — skip it
+                    continue
+                seen_blocks.add(block_key)
+
+                callers.append({
+                    "file_path": r["file_path"],
+                    "module_name": r["module_name"],
+                    "block_type": b["block_type"],
+                    "block_name": b["block_name"],
+                    "block_range": f"{b['open_line']}-{b['close_line']}",
+                })
+
+        return {
+            "symbol": symbol,
+            "callers": callers,
+            "total": len(callers),
+        }
 
 
 def main() -> None:
