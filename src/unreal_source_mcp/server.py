@@ -280,12 +280,13 @@ def find_callers(
     """Find callers of a symbol using bracket skeleton + text search.
 
     Searches for the symbol name in all indexed files, then uses bracket_index
-    to locate which function/class each occurrence belongs to.
+    to locate which function/class each occurrence belongs to by finding the
+    symbol text within block line ranges (not just file-level matching).
 
     scope: optional module name to limit search scope.
     Returns list of callers with file, enclosing function, and line info.
     """
-    from .db import _fts5_escape, load_bracket_index, find_enclosing_block
+    from .db import _fts5_escape, load_bracket_index, find_enclosing_block, get_source_by_path
 
     with _conn() as conn:
         fts_query = _fts5_escape(symbol)
@@ -293,25 +294,72 @@ def find_callers(
 
         callers = []
         seen_blocks = set()
+        symbol_lower = symbol.lower()
 
         for r in results:
-            brackets = load_bracket_index(conn, r["id"], depth=1)
-            # Find all matching blocks in this file
-            for b in brackets:
-                block_key = (r["id"], b["open_line"])
+            # Load ALL bracket blocks (not just depth=1) for precise enclosing
+            brackets_all = load_bracket_index(conn, r["id"])
+            if not brackets_all:
+                continue
+
+            # Build a quick lookup: depth=1 blocks by open_line
+            top_blocks = {b["open_line"]: b for b in brackets_all if b["depth"] == 1}
+
+            # Get file content to find exact symbol locations
+            row = get_source_by_path(conn, r["file_path"])
+            if not row:
+                continue
+            lines = row["raw_content"].splitlines()
+
+            # Find all lines containing the symbol (1-based)
+            for line_idx, line in enumerate(lines, start=1):
+                if symbol_lower not in line.lower():
+                    continue
+
+                # Skip preprocessor #include and #define lines
+                stripped = line.lstrip()
+                if stripped.startswith("#include"):
+                    continue
+
+                # Find the enclosing block for this line
+                enclosing = find_enclosing_block(brackets_all, line_idx)
+                if not enclosing:
+                    continue
+
+                # Walk up to the depth=1 parent block
+                parent = enclosing
+                # The enclosing block might already be depth=1, or we need
+                # to find which depth=1 block contains this line
+                enclosing_top = None
+                for tb_open, tb in top_blocks.items():
+                    if tb["open_line"] <= line_idx <= tb["close_line"]:
+                        enclosing_top = tb
+                        break
+
+                if not enclosing_top:
+                    continue
+
+                block_key = (r["id"], enclosing_top["open_line"])
                 if block_key in seen_blocks:
                     continue
-                if b["block_name"] and symbol.lower() in (b["block_name"] or "").lower():
-                    # This is the definition — skip it
-                    continue
+
+                # Skip the definition block (where the symbol is the block name)
+                if enclosing_top.get("block_name") and symbol_lower in (enclosing_top["block_name"] or "").lower():
+                    # Extra check: if the symbol appears on the signature line,
+                    # it's the definition, not a call
+                    sig = enclosing_top.get("signature") or ""
+                    if sig and line_idx <= enclosing_top["open_line"] + 2:
+                        continue
+
                 seen_blocks.add(block_key)
 
                 callers.append({
                     "file_path": r["file_path"],
                     "module_name": r["module_name"],
-                    "block_type": b["block_type"],
-                    "block_name": b["block_name"],
-                    "block_range": f"{b['open_line']}-{b['close_line']}",
+                    "block_type": enclosing_top["block_type"],
+                    "block_name": enclosing_top.get("block_name"),
+                    "block_range": f"{enclosing_top['open_line']}-{enclosing_top['close_line']}",
+                    "caller_line": line_idx,
                 })
 
         return {

@@ -12,20 +12,41 @@ Use this skill when the task is about **finding Unreal Engine source efficiently
 
 ## Supported file types
 
-C/C++ (`.h`, `.cpp`, `.cs`) and shader files (`.usf`, `.ush`, `.hlsl`).
+C/C++ (`.h`, `.hpp`, `.cpp`, `.cc`, `.cxx`) and shader files (`.usf`, `.ush`, `.hlsl`), plus C# (`.cs`).
 
-## Tools (3)
+## Tools (5)
 
-1. **`search_unreal_source(query?, raw_query?, expanded_terms?, module?, limit?)`** — Search with automatic history acceleration.
-   - System searches query_logs for similar past queries first, then falls back to full FTS5.
-   - Results include `source` field: `"history_refined"` (accelerated) or `"fts"` (full scan).
-   - Each search is automatically logged in query_logs.
-   - `expanded_terms`: optional extra keywords from intent expansion (see below).
-2. **`get_file_content(file_path, start_line?, end_line?, anchor?)`** — Read file content.
-   - Automatically records feedback in query_note when the file was in recent search results.
-   - Prefer anchor mode: `get_file_content(file_path="...", anchor="void FMyClass::MyMethod")`.
-3. **`log_unreal_query(query_text, was_useful?, refinement?)`** — Explicit feedback (optional).
-   - Use only to correct automatic feedback.
+### 1. `search_unreal_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
+FTS5 search with history-accelerated ranking and structural features.
+- **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
+- **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
+- `expanded_terms`: domain terms for history matching (e.g., `["FMaterial", "UMaterialInterface"]`)
+- `module`: filter by UE module name (e.g., `"Renderer"`, `"UnrealEd"`, `"Niagara"`)
+- `cluster=true`: merge hits in the same code block into one result with `hit_count`
+- `scope_filter='{"block_type": "function"}'`: restrict results to specific block types
+- Results include `source`: `"history_refined"` or `"fts"`, and `final_score`
+
+### 2. `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
+Read file content with automatic feedback.
+- **Anchor mode**: `anchor="Render", context_chars=500` — efficient context around a symbol (~0.1ms)
+- **Line range**: `start_line=100, end_line=200` — traditional line-based extraction
+- Automatically records feedback when file was in recent search results
+
+### 3. `log_unreal_query(query_text, was_useful?, refinement?)`
+Record explicit feedback. Use only to correct automatic feedback.
+
+### 4. `find_include_graph(file_path, direction?, depth?)`
+Query include dependency graph for a file.
+- `direction`: `"upstream"` (who includes this), `"downstream"` (what this includes), `"both"`
+- `depth`: recursion depth (1 = direct dependencies only)
+- Returns edges with source/target file paths and include paths
+
+### 5. `find_callers(symbol, scope?)`
+Find callers of a symbol using FTS5 + bracket skeleton structural analysis.
+- Searches for symbol text in all files, then verifies each occurrence is within a block's line range
+- Returns file, enclosing block type/name, caller line number
+- Skips definition blocks (where symbol matches block name)
+- `scope`: optional module name to limit search
 
 ## Intent expansion
 
@@ -58,7 +79,7 @@ LAYERS:
 1. Define layers before any tool call.
 2. One probe per layer. Batch probes for independent layers in parallel.
 3. Only extract after a probe narrows the file and location.
-4. Do not extract callees or sub-components unless directly asked.
+4. Use `find_callers` to trace call sites, `find_include_graph` to explore file dependencies.
 5. If a layer cannot be found, report what was searched — do not keep retrying variations.
 
 **Example** — tracing Material architecture:
@@ -89,12 +110,11 @@ This plan costs ~4 searches + ~4 extracts = **~8 tool calls** instead of 20+ fro
    - Simple: `search_unreal_source(query="GetGBuffer")`
    - With expansion: `search_unreal_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface", "MaterialResource"])`
    - Advanced: `search_unreal_source(raw_query='"GetGBuffer" AND "Emissive"')`
-   - Results include `source`: `"history_refined"` or `"fts"`.
-
-3. **Read results** — Call `get_file_content` for promising files. Feedback is automatic.
-
-4. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
-
+   - Clustered: `search_unreal_source(query="Render", cluster=true)`
+   - Scoped: `search_unreal_source(query="Render", scope_filter='{"block_type": "function"}')`
+3. **Read results** — Call `get_file_content` for promising files. Prefer anchor mode for efficiency.
+4. **Trace structure** — Use `find_callers` to find call sites, `find_include_graph` to explore file dependencies.
+5. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
 
 ## FTS5 raw_query syntax
 
@@ -111,14 +131,16 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ charact
 ## Feedback loop
 
 The system maintains a closed feedback loop automatically:
-- `search_unreal_source` checks history first (query_logs LIKE OR + query_note ranking)
+- `search_unreal_source` uses history as ranking signal (not filtering) — prevents confirmation bias
 - `get_file_content` records which files were actually useful (query_note)
-- Future similar searches are faster and more accurate based on this feedback
+- Future similar searches are ranked higher based on this feedback
+- History signals include 30-day half-life time decay
 
 ## Output expectations
 
 - Candidate file paths and module names
 - Code snippets from FTS5
-- Line ranges for further reading
+- Block type/name from bracket skeleton (when cluster=true)
+- Line ranges and caller line numbers for further reading
 - `source` field indicating history-accelerated or full-scan results
 - Note when DB indexing is needed
