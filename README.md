@@ -43,9 +43,9 @@ UNREAL_SOURCE_DB=/path/to/unreal.db uv run code-explore-by-sql
 
 | Tool | Purpose |
 |------|---------|
-| `search_unreal_source` | FTS5 search with history ranking, clustering, and scope filtering |
+| `search_code_source` | FTS5 search with history ranking, clustering, and scope filtering |
 | `get_file_content` | Read full file, line range, or anchor-based context extraction |
-| `log_unreal_query` | Record explicit feedback for a past query |
+| `log_code_query` | Record explicit feedback for a past query |
 | `find_include_graph` | Query include dependency graph (upstream/downstream, recursive) |
 | `find_callers` | Find callers of a symbol using FTS5 + bracket skeleton |
 

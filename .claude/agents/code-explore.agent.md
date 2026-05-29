@@ -13,17 +13,17 @@ User questions fall into these patterns. Each maps to a specific search strategy
 
 | User asks | Strategy | Primary tool |
 |-----------|----------|-------------|
-| "Where is X defined?" / "Find class Y" | File-path scoped search + anchor extract | `search_unreal_source(raw_query=...)` → `get_file_content(anchor=...)` |
-| "How does X work?" / "X architecture" | Layer-first: search → anchor extract per layer | Multiple `search_unreal_source` → multiple `get_file_content(anchor=...)` |
+| "Where is X defined?" / "Find class Y" | File-path scoped search + anchor extract | `search_code_source(raw_query=...)` → `get_file_content(anchor=...)` |
+| "How does X work?" / "X architecture" | Layer-first: search → anchor extract per layer | Multiple `search_code_source` → multiple `get_file_content(anchor=...)` |
 | "Who calls X?" / "X usage" | Caller lookup | `find_callers(symbol, scope=...)` |
 | "What does X include?" / "X dependencies" | Include graph traversal | `find_include_graph(file_path, direction=...)` |
-| "Find all Y in Z module" | Scoped search | `search_unreal_source(query=..., module=..., scope_filter=...)` |
+| "Find all Y in Z module" | Scoped search | `search_code_source(query=..., module=..., scope_filter=...)` |
 | "Trace the flow from X to Y" | Layer-first across subsystems | Mix of search + callers + include graph |
 
 ## Token budget rules
 
 - `get_file_content(anchor=...)` costs ~125 tokens — **always prefer** over full file (~45K)
-- `search_unreal_source` returns compact snippets (~2,600 tokens/20 results)
+- `search_code_source` returns compact snippets (~2,600 tokens/20 results)
 - `find_callers` for common symbols returns 500+ callers — **always add `scope`**
 - `find_include_graph` is cheap (50-2,100 tokens) — use freely
 - Never read a full file when anchor or line-range suffices

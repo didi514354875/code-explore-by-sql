@@ -16,7 +16,7 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
 
 | Operation | ~Tokens | Note |
 |-----------|---------|------|
-| `search_unreal_source` (20 results) | ~2,600 | Compact 300-char snippets |
+| `search_code_source` (20 results) | ~2,600 | Compact 300-char snippets |
 | `get_file_content(anchor=...)` | ~125 | **Always prefer** over full read |
 | `get_file_content` (full file) | ~45,000 | Avoid — use anchor or line range |
 | `find_callers` (specific symbol) | 127–3,000 | Use `scope` for common symbols |
@@ -24,7 +24,7 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
 
 ## Tools (5)
 
-1. **`search_unreal_source`** — FTS5 search with history ranking, scope filtering, compact snippets.
+1. **`search_code_source`** — FTS5 search with history ranking, scope filtering, compact snippets.
    - Simple: `query="GetGBuffer"`
    - Advanced: `raw_query='"GetGBuffer" AND "Emissive"'`
    - `scope_filter` must be a **JSON string**: `'{"block_type": "function"}'`
@@ -35,7 +35,7 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
    - Line range: `start_line=100, end_line=200`
    - Auto-records feedback from search results
 
-3. **`log_unreal_query`** — Record explicit feedback (optional, only to correct automatic feedback)
+3. **`log_code_query`** — Record explicit feedback (optional, only to correct automatic feedback)
 
 4. **`find_include_graph`** — Include dependency graph (upstream/downstream, recursive, depth control)
 
@@ -45,10 +45,10 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
 
 ## Recommended flow
 
-1. `search_unreal_source` → compact snippets (~2,600 tok)
+1. `search_code_source` → compact snippets (~2,600 tok)
 2. `get_file_content(anchor=...)` → deep context (~125 tok each)
 3. `find_callers` / `find_include_graph` → structural exploration
-4. `log_unreal_query` → only to correct feedback
+4. `log_code_query` → only to correct feedback
 
 ## FTS5 Query Syntax (for raw_query)
 

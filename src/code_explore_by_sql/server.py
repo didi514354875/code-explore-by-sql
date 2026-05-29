@@ -30,7 +30,7 @@ def _conn():
 
 
 @mcp.tool()
-def search_unreal_source(
+def search_code_source(
     query: str | None = None,
     raw_query: str | None = None,
     expanded_terms: list[str] | None = None,
@@ -39,7 +39,7 @@ def search_unreal_source(
     cluster: bool = False,
     scope_filter: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Search Unreal source files. Two modes:
+    """Search source code files. Two modes:
 
     1. Simple mode (query): literal text match. Use for single keyword or phrase lookups.
     2. Advanced mode (raw_query): raw FTS5 MATCH expression with AND, OR, NOT, column filters,
@@ -152,7 +152,7 @@ def get_file_content(
 
 
 @mcp.tool()
-def log_unreal_query(
+def log_code_query(
     query_text: str,
     was_useful: bool | None = None,
     refinement: str | None = None,

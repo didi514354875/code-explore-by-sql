@@ -14,7 +14,7 @@ Use this skill when the task is about **finding source code efficiently** with t
 
 | Operation | ~Tokens | When to use |
 |-----------|---------|-------------|
-| search_unreal_source (20 results) | ~2,600 | Initial discovery |
+| search_code_source (20 results) | ~2,600 | Initial discovery |
 | get_file_content (anchor, 500 chars) | ~125 | **Always prefer** for single-symbol context |
 | get_file_content (line range, 100 lines) | ~900 | Need broader context |
 | get_file_content (full file) | ~45,000 | **Avoid** unless file is small |
@@ -30,7 +30,7 @@ C/C++ (`.h`, `.hpp`, `.cpp`, `.cc`, `.cxx`) and shader files (`.usf`, `.ush`, `.
 
 ## Tools (5)
 
-### 1. `search_unreal_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
+### 1. `search_code_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
 FTS5 search with history-accelerated ranking. Returns compact 300-char snippets (~2,600 tokens for 20 results).
 - **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
 - **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
@@ -48,7 +48,7 @@ Read file content with automatic feedback.
 - Avoid full file reads (~45K tokens) — always narrow first with anchor or range
 - Automatically records feedback when file was in recent search results
 
-### 3. `log_unreal_query(query_text, was_useful?, refinement?)`
+### 3. `log_code_query(query_text, was_useful?, refinement?)`
 Record explicit feedback. Use only to correct automatic feedback.
 
 ### 4. `find_include_graph(file_path, direction?, depth?)`
@@ -71,14 +71,14 @@ Bracket skeleton is **not optional** — it is the core that makes searches prec
 
 ### 1. `scope_filter` — precision filter for searches
 
-Every `search_unreal_source` call should consider adding `scope_filter` to eliminate noise. Without it, a search returns implementation files, test files, and unrelated headers together. With it, you get **only the block type you need**.
+Every `search_code_source` call should consider adding `scope_filter` to eliminate noise. Without it, a search returns implementation files, test files, and unrelated headers together. With it, you get **only the block type you need**.
 
 ```python
 # Bad: 10 results, 60% noise (cpp files, tests, unrelated elements)
-search_unreal_source(query="class MySettings", module="MyModule")
+search_code_source(query="class MySettings", module="MyModule")
 
 # Good: fewer results, all class declarations
-search_unreal_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')
+search_code_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')
 ```
 
 **When to use which scope_filter**:
@@ -171,7 +171,7 @@ LAYERS:
 ```
 
 **MODE determines the primary tool**:
-- `discovery`: `search_unreal_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
+- `discovery`: `search_code_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
 - `call_trace`: `find_callers(symbol, scope=...)` directly. For execution flow, call chains, virtual dispatch.
 - `dependency`: `find_include_graph`. For file-level include relationships.
 
@@ -239,10 +239,10 @@ This plan costs ~3 searches (~8K tokens) + 1 find_callers (~1K tokens) + ~3 anch
 
 1. **Expand intent** — Generate related terms from the user's request.
 2. **Classify each sub-question** as `discovery`, `call_trace`, or `dependency` (see decision matrix above).
-3. **For discovery** — Call `search_unreal_source` with keywords + expanded_terms + `scope_filter`.
-   - Simple: `search_unreal_source(query="GetGBuffer")`
-   - With scope_filter: `search_unreal_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')`
-   - With expansion: `search_unreal_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
+3. **For discovery** — Call `search_code_source` with keywords + expanded_terms + `scope_filter`.
+   - Simple: `search_code_source(query="GetGBuffer")`
+   - With scope_filter: `search_code_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')`
+   - With expansion: `search_code_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
 4. **For call_trace** — Call `find_callers(symbol, scope=...)` directly. Do NOT attempt anchor guessing for execution flow questions.
    - `find_callers("Generate", scope="MyModule")` → reveals the execution trigger chain
    - `find_callers("ExecuteInternal", scope="MyModule")` → reveals all concrete implementations
@@ -251,7 +251,7 @@ This plan costs ~3 searches (~8K tokens) + 1 find_callers (~1K tokens) + ~3 anch
    - Or use `block_range` from search/find_callers results: `get_file_content(start_line=X, end_line=X+50)`
    - This costs ~125 tokens vs ~45,000 for a full file read
 6. **For dependency** — Call `find_include_graph` for file-level relationships.
-7. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
+7. **Correct if needed** — Call `log_code_query` only if automatic feedback was wrong.
 
 ## FTS5 raw_query syntax
 
@@ -268,7 +268,7 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ charact
 ## Feedback loop
 
 The system maintains a closed feedback loop automatically:
-- `search_unreal_source` uses history as ranking signal (not filtering) — prevents confirmation bias
+- `search_code_source` uses history as ranking signal (not filtering) — prevents confirmation bias
 - `get_file_content` records which files were actually useful (query_note)
 - Future similar searches are ranked higher based on this feedback
 - History signals include 30-day half-life time decay

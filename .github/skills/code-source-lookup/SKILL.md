@@ -14,7 +14,7 @@ Use this skill when the task is about **finding source code efficiently** with t
 
 | Operation | ~Tokens | When to use |
 |-----------|---------|-------------|
-| search_unreal_source (20 results) | ~2,600 | Initial discovery |
+| search_code_source (20 results) | ~2,600 | Initial discovery |
 | get_file_content (anchor, 500 chars) | ~125 | **Always prefer** for single-symbol context |
 | get_file_content (line range, 100 lines) | ~900 | Need broader context |
 | get_file_content (full file) | ~45,000 | **Avoid** unless file is small |
@@ -30,7 +30,7 @@ C/C++ (`.h`, `.hpp`, `.cpp`, `.cc`, `.cxx`) and shader files (`.usf`, `.ush`, `.
 
 ## Tools (5)
 
-### 1. `search_unreal_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
+### 1. `search_code_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
 FTS5 search with history-accelerated ranking. Returns compact 300-char snippets (~2,600 tokens for 20 results).
 - **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
 - **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
@@ -48,7 +48,7 @@ Read file content with automatic feedback.
 - Avoid full file reads (~45K tokens) — always narrow first with anchor or range
 - Automatically records feedback when file was in recent search results
 
-### 3. `log_unreal_query(query_text, was_useful?, refinement?)`
+### 3. `log_code_query(query_text, was_useful?, refinement?)`
 Record explicit feedback. Use only to correct automatic feedback.
 
 ### 4. `find_include_graph(file_path, direction?, depth?)`
@@ -94,7 +94,7 @@ LAYERS:
 ```
 
 **MODE determines the primary tool**:
-- `discovery`: `search_unreal_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
+- `discovery`: `search_code_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
 - `call_trace`: `find_callers(symbol, scope=...)` directly. For execution flow, call chains, virtual dispatch.
 - `dependency`: `find_include_graph`. For file-level include relationships.
 
@@ -131,16 +131,16 @@ This plan costs ~3 searches (~8K tokens) + ~3 anchors (~400 tokens) = **~8.4K to
 
 1. **Expand intent** — Generate related terms from the user's request.
 2. **Classify each sub-question** as `discovery`, `call_trace`, or `dependency`.
-3. **For discovery** — Call `search_unreal_source` with keywords + expanded_terms + `scope_filter`.
-   - Simple: `search_unreal_source(query="GetGBuffer")`
-   - With scope_filter: `search_unreal_source(query="MyClass", scope_filter='{"block_type": "class"}')`
-   - With expansion: `search_unreal_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
+3. **For discovery** — Call `search_code_source` with keywords + expanded_terms + `scope_filter`.
+   - Simple: `search_code_source(query="GetGBuffer")`
+   - With scope_filter: `search_code_source(query="MyClass", scope_filter='{"block_type": "class"}')`
+   - With expansion: `search_code_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
 4. **For call_trace** — Call `find_callers(symbol, scope=...)` directly.
 5. **Read results** — Call `get_file_content` with **anchor mode** for promising files.
    - `get_file_content(file_path="...", anchor="class FMyClass : public")` ← generic pattern, never guess base class
    - This costs ~125 tokens vs ~45,000 for a full file read
 6. **For dependency** — Call `find_include_graph` for file-level relationships.
-7. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
+7. **Correct if needed** — Call `log_code_query` only if automatic feedback was wrong.
 
 ## FTS5 raw_query syntax
 
@@ -157,7 +157,7 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ charact
 ## Feedback loop
 
 The system maintains a closed feedback loop automatically:
-- `search_unreal_source` uses history as ranking signal (not filtering) — prevents confirmation bias
+- `search_code_source` uses history as ranking signal (not filtering) — prevents confirmation bias
 - `get_file_content` records which files were actually useful (query_note)
 - Future similar searches are ranked higher based on this feedback
 - History signals include 30-day half-life time decay
