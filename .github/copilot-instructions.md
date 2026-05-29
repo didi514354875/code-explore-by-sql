@@ -2,7 +2,7 @@
 
 ## Project
 
-Python MCP server for Unreal Engine source navigation using SQLite FTS5 (trigram tokenizer) with bracket skeleton structural indexing, include dependency graph, and history-accelerated search.
+Python MCP server for source code navigation using SQLite FTS5 (trigram tokenizer) with bracket skeleton structural indexing, include dependency graph, and history-accelerated search.
 
 ## Commands
 

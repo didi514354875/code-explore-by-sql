@@ -1,14 +1,14 @@
 ---
-name: unreal-source-lookup
-description: 'Use for Unreal Engine source lookup and symbol search. Trigger on requests like find Unreal symbol, trace function, search engine source, inspect macro, locate class implementation, or search shader code.'
-argument-hint: 'Describe the Unreal symbol, subsystem, macro, class, shader, or behavior you need to locate.'
+name: code-source-lookup
+description: 'Use for source code lookup and symbol search. Trigger on requests like find symbol, trace function, search source, inspect macro, locate class implementation, or search code.'
+argument-hint: 'Describe the symbol, subsystem, macro, class, or behavior you need to locate.'
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Unreal Source Lookup
+# Code Source Lookup
 
-Use this skill when the task is about **finding Unreal Engine source efficiently** with the local MCP server. Token budget awareness is critical — every tool call costs context window.
+Use this skill when the task is about **finding source code efficiently** with the local MCP server. Token budget awareness is critical — every tool call costs context window.
 
 ## Token cost guide
 
@@ -35,7 +35,7 @@ FTS5 search with history-accelerated ranking. Returns compact 300-char snippets 
 - **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
 - **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
 - `expanded_terms`: domain terms for history matching (e.g., `["FMaterial", "UMaterialInterface"]`)
-- `module`: filter by UE module name (e.g., `"Renderer"`, `"UnrealEd"`, `"Niagara"`)
+- `module`: filter by module name (e.g., `"Renderer"`, `"Core"`, `"Editor"`)
 - `scope_filter`: **must be a JSON string**, not a dict! e.g. `'{"block_type": "function"}'`
 - `cluster=true`: limited benefit (~1% token reduction) — skip unless needed
 - Results include `source`: `"history_refined"` or `"fts"`, and `final_score`
@@ -72,9 +72,9 @@ Find callers of a symbol using FTS5 + bracket skeleton structural analysis.
 The key insight: do not search history only with the user's exact words. Past queries contain class names, file paths, and code symbols — not user prose.
 
 Examples:
-- "Material architecture" → `expanded_terms=["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy", "MaterialShared"]`
-- "Lumen lighting" → `expanded_terms=["Lumen", "FLumenScene", "LumenRayTracing", "RayTracing"]`
-- "Niagara particles" → `expanded_terms=["Niagara", "FNiagaraSystem", "FNiagaraEmitter", "NiagaraScript"]`
+- "Material architecture" → `expanded_terms=["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy"]`
+- "Rendering pipeline" → `expanded_terms=["FRenderer", "RenderPass", "FScene", "FViewInfo"]`
+- "Particle system" → `expanded_terms=["ParticleSystem", "FParticleEmitter", "ParticleModule"]`
 
 Use expanded_terms on the **first search** of a new intent to maximize history hit rate. Subsequent searches in the same session build their own history automatically.
 
@@ -88,50 +88,59 @@ Before searching, identify the **layers** of the system you need to trace. For e
 INTENT: <one-sentence user intent>
 LAYERS:
   - <layer>: <role>
-    PROBE: <search query or raw_query>
-    EXTRACT: <anchor or line range, only after probe succeeds>
+    MODE: discovery | call_trace | dependency
+    PROBE: <search query, with scope_filter if applicable>
+    EXTRACT: <anchor pattern or line range>
 ```
+
+**MODE determines the primary tool**:
+- `discovery`: `search_unreal_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
+- `call_trace`: `find_callers(symbol, scope=...)` directly. For execution flow, call chains, virtual dispatch.
+- `dependency`: `find_include_graph`. For file-level include relationships.
 
 **Rules**:
-1. Define layers before any tool call.
+1. Define layers before any tool call. Assign each layer a MODE.
 2. One probe per layer. Batch probes for independent layers in parallel.
-3. Only extract after a probe narrows the file and location. **Always use anchor mode** for extraction.
-4. Use `find_callers` to trace call sites (with `scope` for common symbols), `find_include_graph` for dependencies.
-5. If a layer cannot be found, report what was searched — do not keep retrying variations.
+3. For `discovery` layers: add `scope_filter` to searches by default. Use `"class XXX : public"` anchor pattern (never guess the base class).
+4. For `call_trace` layers: use `find_callers` with `scope` — do NOT try to guess function signatures as anchors.
+5. Only extract after a probe narrows the file and location. **Always use anchor mode** for extraction.
+6. If a layer cannot be found, report what was searched — do not keep retrying variations.
 
-**Example** — tracing Material architecture:
+**Example** — tracing a rendering system:
 
 ```
-INTENT: Analyze Unreal Material system architecture
+INTENT: Analyze rendering material system architecture
 LAYERS:
   - Asset layer: UMaterialInterface, UMaterial, UMaterialInstance
+    MODE: discovery
     PROBE: raw_query='(file_path : "MaterialInterface.h") AND "class UMaterialInterface"'
-    EXTRACT: anchor="class UMaterialInterface : public UObject"
-  - Compile layer: FMaterial, FMaterialResource, FHLSLMaterialTranslator
+    EXTRACT: anchor="class UMaterialInterface : public"
+  - Compile layer: FMaterial, FMaterialResource
+    MODE: discovery
     PROBE: raw_query='(file_path : "MaterialShared.h") AND "class FMaterialResource"'
-    EXTRACT: anchor="class FMaterialResource : public FMaterial"
-  - Shader map layer: FMaterialShaderMapLayout
-    PROBE: raw_query='(file_path : "MaterialShaderMapLayout.h")'
-    EXTRACT: anchor="FMaterialShaderMapLayout"
+    EXTRACT: anchor="class FMaterialResource : public"
   - Render proxy layer: FMaterialRenderProxy
+    MODE: discovery
     PROBE: raw_query='(file_path : "MaterialRenderProxy.h") AND "class FMaterialRenderProxy"'
-    EXTRACT: anchor="class FMaterialRenderProxy"
+    EXTRACT: anchor="class FMaterialRenderProxy : public"
 ```
 
-This plan costs ~4 searches (~10K tokens) + ~4 anchors (~500 tokens) = **~10.5K tokens** instead of 200K+ from unstructured full-file reads.
+This plan costs ~3 searches (~8K tokens) + ~3 anchors (~400 tokens) = **~8.4K tokens** instead of 200K+ from unstructured full-file reads.
 
 ## Retrieval procedure
 
 1. **Expand intent** — Generate related terms from the user's request.
-2. **Search** — Call `search_unreal_source` with keywords + expanded_terms.
+2. **Classify each sub-question** as `discovery`, `call_trace`, or `dependency`.
+3. **For discovery** — Call `search_unreal_source` with keywords + expanded_terms + `scope_filter`.
    - Simple: `search_unreal_source(query="GetGBuffer")`
+   - With scope_filter: `search_unreal_source(query="MyClass", scope_filter='{"block_type": "class"}')`
    - With expansion: `search_unreal_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
-   - Advanced: `search_unreal_source(raw_query='"GetGBuffer" AND "Emissive"')`
-3. **Read results** — Call `get_file_content` with **anchor mode** for promising files.
-   - `get_file_content(file_path="...", anchor="void FMyClass::MyMethod")`
+4. **For call_trace** — Call `find_callers(symbol, scope=...)` directly.
+5. **Read results** — Call `get_file_content` with **anchor mode** for promising files.
+   - `get_file_content(file_path="...", anchor="class FMyClass : public")` ← generic pattern, never guess base class
    - This costs ~125 tokens vs ~45,000 for a full file read
-4. **Trace structure** — Use `find_callers` (with `scope` for common symbols) for call sites, `find_include_graph` for dependencies.
-5. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
+6. **For dependency** — Call `find_include_graph` for file-level relationships.
+7. **Correct if needed** — Call `log_unreal_query` only if automatic feedback was wrong.
 
 ## FTS5 raw_query syntax
 

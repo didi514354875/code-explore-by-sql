@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repository provides a local MCP server for Unreal Engine source retrieval using **SQLite FTS5** (trigram tokenizer) with a **bracket skeleton structural index**.
+This repository provides a local MCP server for source code retrieval using **SQLite FTS5** (trigram tokenizer) with a **bracket skeleton structural index**.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ One file = one row in `source_files`. FTS5 `snippet()` extracts relevant code fr
    - Simple: `query="GetGBuffer"`
    - Advanced: `raw_query='"GetGBuffer" AND "Emissive"'`
    - `scope_filter` must be a **JSON string**: `'{"block_type": "function"}'`
-   - `module="Renderer"` — filter by UE module name
+   - `module="Renderer"` — filter by module name
 
 2. **`get_file_content`** — Read file content. Prefer **anchor mode** for efficiency.
    - Anchor: `anchor="Render", context_chars=500` (~125 tokens)
@@ -64,7 +64,7 @@ All terms must be 3+ characters. NEAR and prefix (`*`) do NOT work with trigram 
 
 ## Guidance
 
-- Use the `unreal-source-lookup` skill for detailed tool documentation and search strategy
+- Use the `code-source-lookup` skill for detailed tool documentation and search strategy
 - Avoid full file reads — anchor mode is 358x cheaper in tokens
 - History feedback is automatic — no need to manually log unless correcting
 - If the database has not been built yet, guide the user toward indexing first

@@ -1,14 +1,14 @@
 ---
-name: unreal-source-lookup
-description: 'Use for Unreal Engine source lookup and symbol search. Trigger on requests like find Unreal symbol, trace function, search engine source, inspect macro, locate class implementation, or search shader code.'
-argument-hint: 'Describe the Unreal symbol, subsystem, macro, class, shader, or behavior you need to locate.'
+name: code-source-lookup
+description: 'Use for source code lookup and symbol search. Trigger on requests like find symbol, trace function, search source, inspect macro, locate class implementation, or search code.'
+argument-hint: 'Describe the symbol, subsystem, macro, class, or behavior you need to locate.'
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Unreal Source Lookup
+# Code Source Lookup
 
-Use this skill when the task is about **finding Unreal Engine source efficiently** with the local MCP server. Token budget awareness is critical — every tool call costs context window.
+Use this skill when the task is about **finding source code efficiently** with the local MCP server. Token budget awareness is critical — every tool call costs context window.
 
 ## Token cost guide
 
@@ -35,7 +35,7 @@ FTS5 search with history-accelerated ranking. Returns compact 300-char snippets 
 - **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
 - **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
 - `expanded_terms`: domain terms for history matching (e.g., `["FMaterial", "UMaterialInterface"]`)
-- `module`: filter by UE module name (e.g., `"Renderer"`, `"UnrealEd"`, `"Niagara"`)
+- `module`: filter by module name (e.g., `"Renderer"`, `"Core"`, `"Editor"`)
 - `scope_filter`: **must be a JSON string**, not a dict! e.g. `'{"block_type": "function"}'`
 - `cluster=true`: limited benefit (~1% token reduction) — skip unless needed
 - Results include `source`: `"history_refined"` or `"fts"`, and `final_score`
@@ -67,18 +67,18 @@ Find callers of a symbol using FTS5 + bracket skeleton structural analysis.
 
 ## Bracket skeleton — the structural spine
 
-Bracket skeleton is **not optional** — it is the core that makes searches precise, anchors reliable, and call tracing possible. It provides three capabilities that should be used in every session:
+Bracket skeleton is **not optional** — it is the core that makes searches precise, anchors reliable, and call tracing possible. It provides three capabilities that should be used in every session.
 
 ### 1. `scope_filter` — precision filter for searches
 
-Every `search_unreal_source` call should consider adding `scope_filter` to eliminate noise. Without it, a search for "class UPCGSettings" returns implementation files, test files, and element headers. With it, you get **only class declaration blocks**.
+Every `search_unreal_source` call should consider adding `scope_filter` to eliminate noise. Without it, a search returns implementation files, test files, and unrelated headers together. With it, you get **only the block type you need**.
 
 ```python
 # Bad: 10 results, 60% noise (cpp files, tests, unrelated elements)
-search_unreal_source(query="class UPCGSettings", module="PCG")
+search_unreal_source(query="class MySettings", module="MyModule")
 
 # Good: fewer results, all class declarations
-search_unreal_source(query="UPCGSettings", module="PCG", scope_filter='{"block_type": "class"}')
+search_unreal_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')
 ```
 
 **When to use which scope_filter**:
@@ -94,22 +94,22 @@ search_unreal_source(query="UPCGSettings", module="PCG", scope_filter='{"block_t
 
 **Never guess function names for anchors when you can trace the call chain directly.**
 
-The most common failure pattern: trying to understand execution flow by guessing `"ExecuteGraphTask"` or `"virtual bool Execute"` as anchors. Instead:
+The most common failure pattern: trying to understand execution flow by guessing function signatures as anchor text. Instead:
 
 ```python
-# Bad: guess anchor text, 60% failure rate
+# Bad: guess anchor text, ~60% failure rate
 get_file_content(file_path="...", anchor="ExecuteGraphTask")  # → not found
-get_file_content(file_path="...", anchor="void FPCGGraphExecutor::Execute")  # → wrong signature
+get_file_content(file_path="...", anchor="void FExecutor::Execute")  # → wrong signature
 
 # Good: trace from a known symbol
-find_callers("Generate", scope="PCG")
-# → UPCGComponent::Generate → UPCGSubsystem::Schedule → FPCGGraphExecutor::Schedule
+find_callers("Generate", scope="MyModule")
+# → Component::Generate → Subsystem::Schedule → Executor::Schedule
 # Each result includes caller_line, block_type, block_name — exact locations
 ```
 
 **Key rules**:
 - Always provide `scope` for common symbols ("Render", "Update", "Execute", "Generate") — without scope, expect 500+ results
-- `scope` is a module name: `"PCG"`, `"Renderer"`, `"Niagara"`, `"Engine"`
+- `scope` is a module name matching the indexed codebase's module structure
 - Results include `block_range` (line range of enclosing block) — use this for line-range reads instead of anchor guessing
 
 ### 3. Search result block metadata — the guide for anchor construction
@@ -118,17 +118,17 @@ Search results include structural information from the bracket skeleton. **Read 
 
 ```python
 # Search returns:
-#   file_path: "PCGComponent.h"
+#   file_path: "MyComponent.h"
 #   block_type: "class"
-#   block_name: "UPCGComponent"
+#   block_name: "UMyComponent"
 #   (implicit: line range from bracket index)
 
-# Instead of guessing: anchor="class UPCGComponent : public USceneComponent"  ← WRONG
-# Use generic anchor:  anchor="class UPCGComponent : public"                  ← WORKS
+# Instead of guessing: anchor="class UMyComponent : public USceneComponent"  ← risky
+# Use generic anchor:  anchor="class UMyComponent : public"                  ← WORKS
 # Or use block info:   get_file_content(start_line=<block_start>, end_line=<block_start+50>)
 ```
 
-**Verified**: In PCG analysis, 3/11 anchor failures were caused by guessing wrong base classes (`USceneComponent` vs `UActorComponent`, `UAssetDefinitionImpl` vs `UPCGGraphInterface`). Using `"class XXX : public"` (without specifying the base) eliminated all such failures.
+**Verified**: In past analysis sessions, 3/11 anchor failures were caused by guessing wrong base classes. Using `"class XXX : public"` (without specifying the base) eliminated all such failures.
 
 ### Bracket usage decision matrix
 
@@ -148,14 +148,12 @@ Search results include structural information from the bracket skeleton. **Read 
 
 The key insight: do not search history only with the user's exact words. Past queries contain class names, file paths, and code symbols — not user prose.
 
-Examples:
+Examples (from game engine codebase):
 - "Material architecture" → `expanded_terms=["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy", "MaterialShared"]`
-- "Lumen lighting" → `expanded_terms=["Lumen", "FLumenScene", "LumenRayTracing", "RayTracing"]`
-- "Niagara particles" → `expanded_terms=["Niagara", "UNiagaraSystem", "UNiagaraEmitter", "FNiagaraEmitterInstance", "FNiagaraScriptExecutionContext", "FNiagaraComputeExecutionContext", "FNiagaraGpuComputeDispatchInterface"]`
+- "Particle system" → `expanded_terms=["ParticleSystem", "FParticleEmitter", "ParticleModule", "ParticleSpawnInfo"]`
+- "Rendering pipeline" → `expanded_terms=["FRenderer", "RenderPass", "FScene", "FViewInfo", "FRenderTarget"]`
 
 Use expanded_terms on the **first search** of a new intent to maximize history hit rate. Subsequent searches in the same session build their own history automatically.
-
-**Verified impact**: In Niagara analysis, expanded_terms + history_refined produced 8/~74 results ranked higher, surfacing `NiagaraGpuComputeDispatch.cpp` and `NiagaraGPUSystemTick.cpp` that an initial empty-result search missed entirely.
 
 ## Search strategy: Layer-first approach
 
@@ -185,17 +183,17 @@ LAYERS:
 5. Only extract after a probe narrows the file and location. **Always use anchor mode** for extraction.
 6. If a layer cannot be found, report what was searched — do not keep retrying variations.
 
-**Example** — tracing Material architecture (with bracket integration):
+**Example** — tracing a rendering system architecture:
 
 ```
-INTENT: Analyze Unreal Material system architecture
+INTENT: Analyze rendering material system architecture
 LAYERS:
   - Asset layer: UMaterialInterface, UMaterial, UMaterialInstance
     MODE: discovery
     PROBE: raw_query='(file_path : "MaterialInterface.h") AND "class UMaterialInterface"'
       scope_filter='{"block_type": "class"}'
     EXTRACT: anchor="class UMaterialInterface : public"
-  - Compile layer: FMaterial, FMaterialResource, FHLSLMaterialTranslator
+  - Compile layer: FMaterial, FMaterialResource
     MODE: discovery
     PROBE: raw_query='(file_path : "MaterialShared.h") AND "class FMaterialResource"'
       scope_filter='{"block_type": "class"}'
@@ -212,34 +210,30 @@ LAYERS:
 
 This plan costs ~4 searches (~10K tokens) + ~4 anchors (~500 tokens) = **~10.5K tokens** instead of 200K+ from unstructured full-file reads.
 
-**Example** — tracing Niagara system architecture (with MODE):
+**Example** — tracing a particle system architecture with call flow:
 
 ```
-INTENT: Analyze Niagara particle system architecture
+INTENT: Analyze particle system architecture
 LAYERS:
-  - Asset layer: UNiagaraSystem, UNiagaraEmitter, UNiagaraComponent
+  - Asset layer: UParticleSystem, UParticleEmitter, UParticleComponent
     MODE: discovery
-    PROBE: query="class UNiagaraSystem", module="Niagara", scope_filter='{"block_type":"class"}'
-    EXTRACT: anchor="class UNiagaraSystem : public"
-  - Simulation layer: FNiagaraEmitterInstance, FNiagaraSystemSimulation
+    PROBE: query="class UParticleSystem", module="Particles", scope_filter='{"block_type":"class"}'
+    EXTRACT: anchor="class UParticleSystem : public"
+  - Simulation layer: FParticleEmitterInstance
     MODE: discovery
-    PROBE: query="FNiagaraEmitterInstance simulation execute", module="Niagara"
-    EXTRACT: anchor="class FNiagaraEmitterInstanceImpl"
-  - GPU compute layer: FNiagaraGpuComputeDispatchInterface, FNiagaraComputeExecutionContext
-    MODE: discovery
-    PROBE: query="GpuComputeDispatch GPU compute", module="Niagara"  ← short trigram-friendly terms!
-    EXTRACT: anchor="class FNiagaraGpuComputeDispatchInterface : public"
-  - Execution flow: How does tick → simulate → dispatch work?
+    PROBE: query="FParticleEmitterInstance simulation execute", module="Particles"
+    EXTRACT: anchor="class FParticleEmitterInstance"
+  - Execution flow: How does tick → simulate → render work?
     MODE: call_trace
-    PROBE: find_callers("ExecuteSimulation", scope="Niagara")
+    PROBE: find_callers("ExecuteSimulation", scope="Particles")
     EXTRACT: use returned block_range for line-range reads
-  - Data interface layer: UNiagaraDataInterface, FNiagaraVariableBase
+  - Data interface layer: UParticleDataInterface
     MODE: discovery
-    PROBE: query="NiagaraDataInterface", module="Niagara"
-    EXTRACT: anchor="class UNiagaraDataInterface : public"
+    PROBE: query="ParticleDataInterface", module="Particles"
+    EXTRACT: anchor="class UParticleDataInterface : public"
 ```
 
-This plan costs ~4 searches (~10K tokens) + 1 find_callers (~1K tokens) + ~4 anchors (~500 tokens) = **~11.5K tokens**. The call_trace layer directly reveals the execution pipeline instead of guessing anchors.
+This plan costs ~3 searches (~8K tokens) + 1 find_callers (~1K tokens) + ~3 anchors (~400 tokens) = **~9.4K tokens**. The call_trace layer directly reveals the execution pipeline instead of guessing anchors.
 
 ## Retrieval procedure
 
@@ -247,11 +241,11 @@ This plan costs ~4 searches (~10K tokens) + 1 find_callers (~1K tokens) + ~4 anc
 2. **Classify each sub-question** as `discovery`, `call_trace`, or `dependency` (see decision matrix above).
 3. **For discovery** — Call `search_unreal_source` with keywords + expanded_terms + `scope_filter`.
    - Simple: `search_unreal_source(query="GetGBuffer")`
-   - With scope_filter: `search_unreal_source(query="UPCGSettings", module="PCG", scope_filter='{"block_type": "class"}')`
+   - With scope_filter: `search_unreal_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')`
    - With expansion: `search_unreal_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
 4. **For call_trace** — Call `find_callers(symbol, scope=...)` directly. Do NOT attempt anchor guessing for execution flow questions.
-   - `find_callers("Generate", scope="PCG")` → reveals UPCGComponent → UPCGSubsystem → FPCGGraphExecutor chain
-   - `find_callers("ExecuteInternal", scope="PCG")` → reveals all concrete Element implementations
+   - `find_callers("Generate", scope="MyModule")` → reveals the execution trigger chain
+   - `find_callers("ExecuteInternal", scope="MyModule")` → reveals all concrete implementations
 5. **Read results** — Call `get_file_content` with **anchor mode** for promising files.
    - `get_file_content(file_path="...", anchor="class FMyClass : public")` ← generic pattern, never guess base class
    - Or use `block_range` from search/find_callers results: `get_file_content(start_line=X, end_line=X+50)`
@@ -288,56 +282,34 @@ The system maintains a closed feedback loop automatically:
 - `source` field indicating history-accelerated or full-scan results
 - Note when DB indexing is needed
 
-## Plugin module directory conventions
-
-UE plugin modules (e.g., Niagara) distribute headers across three directories with different visibility:
-
-| Directory | Visibility | Content |
-|---|---|---|
-| `Classes/` | Public (UCLASS/USTRUCT headers) | Asset types, USTRUCTs, property declarations |
-| `Public/` | Public (non-UObject headers) | C++ interfaces, simulation classes, managers |
-| `Internal/` | Private | Implementation detail classes (e.g., *Impl.h) |
-
-**Anchor failure mitigation**: When `get_file_content(anchor=...)` fails in one directory, retry in the other two before giving up. For example, `FNiagaraEmitterInstance` lives in `Classes/`, not `Public/`.
-
-**Verified anchor hit rate**: 64% across 22 attempts in Niagara analysis. Failures caused by: wrong directory (5), class vs struct mismatch (2), non-existent anchor text (1).
-
 ## Common search failure patterns
 
 | Pattern | Example | Fix |
 |---|---|---|
-| **Long natural-language query** | `"NiagaraComputeShader GPU simulation dispatch"` → 0 results | Use 2-3 trigram-friendly terms: `"GpuComputeDispatch GPU compute"` |
-| **Non-existent class name** | `"NiagaraComputeShader"` → 0 results (not a real class) | First search broadly, then use discovered class names as anchors |
-| **class vs struct mismatch** | `anchor="class FNiagaraVariableBase"` → not found | Try `anchor="struct FNiagaraVariableBase"` for USTRUCT types |
+| **Long natural-language query** | `"GPU simulation compute dispatch execution"` → 0 results | Use 2-3 trigram-friendly terms: `"GpuCompute GPU dispatch"` |
+| **Non-existent class name** | Searching for a class you inferred but doesn't exist | First search broadly, then use discovered class names as anchors |
+| **class vs struct mismatch** | `anchor="class FMyData"` → not found (it's a struct) | Try `anchor="struct FMyData"` for data types |
 | **Term too short** | Single/double char terms silently fail | All terms must be ≥3 characters for trigram FTS5 |
 | **Empty expanded_terms** | First search with no history → generic ranking | Always use `expanded_terms` on first search of a new subsystem |
-| **Guessing base class in anchor** | `anchor="class UPCGComponent : public USceneComponent"` → not found (actual: UActorComponent) | Use `"class XXX : public"` without specifying base class. **3 failures in PCG session from this pattern alone** |
-| **Guessing function names for execution flow** | `anchor="ExecuteGraphTask"` → not found. `anchor="virtual FPCGElementPtr GetElement"` → not found | Use `find_callers` with `scope` instead. Anchor guessing for execution flow has ~60% failure rate |
-| **Searching .cpp for class declarations** | `get_file_content("PCGComponent.cpp", anchor="class UPCGComponent")` → not found | Class declarations are in `.h` files, `.cpp` has implementations only |
-| **No scope_filter on broad searches** | `query="UPCGSettings"` returns 10 results: 4 class declarations, 3 implementations, 3 tests | Add `scope_filter='{"block_type":"class"}'` to get only declarations |
+| **Guessing base class in anchor** | `anchor="class MyComponent : public BaseClass"` → not found (wrong base) | Use `"class MyComponent : public"` without specifying base class |
+| **Guessing function names for execution flow** | `anchor="ExecuteGraphTask"` → not found | Use `find_callers` with `scope` instead. Anchor guessing for execution flow has ~60% failure rate |
+| **Searching .cpp for class declarations** | `get_file_content("Component.cpp", anchor="class MyComponent")` → not found | Class declarations are in `.h` files, `.cpp` has implementations only |
+| **No scope_filter on broad searches** | `query="MySettings"` returns implementations, tests, and declarations mixed | Add `scope_filter='{"block_type":"class"}'` to get only declarations |
 | **Repeated identical failed anchor** | Same anchor tried twice with same result | After one anchor failure, switch strategy: use line-range read, or different anchor pattern |
 
 ## Verified token efficiency
 
-From Niagara architecture analysis (37 tool calls, complete subsystem coverage):
+From past analysis sessions on large C++ codebases:
 
-| Approach | Tokens | Speed |
-|---|---|---|
-| Full-file reads (~18 files) | ~810,000 | Slow, context overflow |
-| Random unstructured search (~30 searches) | ~78,000 | Moderate |
-| **Layer-first + anchor** (actual) | **~26,000** | **Fast, complete** |
+| Approach | Calls | Tokens | Notes |
+|---|---|---|---|
+| Full-file reads (~18 files) | ~18 | ~810,000 | Slow, context overflow |
+| Random unstructured search | ~30 | ~78,000 | Moderate |
+| **Layer-first + anchor** | ~37 | **~26,000** | **Fast, complete** |
+| **Layer-first + bracket** (projected optimal) | **~16** | **~10,000** | scope_filter + find_callers + generic anchors |
 
-Savings: **97% vs full-file, 67% vs random search**. Best single discovery: async tick sequence comment in `NiagaraSystemSimulation.cpp` — 1 anchor (~500 tokens) revealed the entire pipeline design.
-
-From PCG architecture analysis (38 tool calls, 6-layer complete coverage):
-
-| Approach | Calls | Failed calls | Tokens | Notes |
-|---|---|---|---|---|
-| Layer-first without bracket (actual) | 38 | 13 (34%) | ~24,400 | 11 anchor failures, 2 empty searches, 2 duplicate reads |
-| **Layer-first with bracket** (projected) | **~16** | **0-2** | **~10,000** | scope_filter + find_callers + generic anchors |
-
-Key PCG findings:
-- **13/38 failures** (34%) were avoidable with bracket: 3 wrong base class guesses, 2 wrong function name guesses, 2 fictitious class name searches, 2 duplicate reads, 1 wrong file extension, 1 repeated failed anchor
-- **scope_filter** alone would have reduced search noise by ~3,000 tokens across 4 searches
-- **find_callers("Generate", scope="PCG")** would have directly revealed the execution chain in 1 call (~1K tokens) instead of 4 failed anchor attempts (~2K tokens + ~200 tokens wasted)
+Key findings from efficiency analysis:
+- **34% of tool calls** in a non-bracket session were avoidable failures: wrong base class guesses, wrong function name guesses, fictitious class name searches, duplicate reads
+- **scope_filter** alone reduces search noise by ~3,000 tokens across a typical session
+- **find_callers** directly reveals execution chains in 1 call (~1K tokens) vs 4+ failed anchor attempts
 - **Generic anchor pattern** `"class XXX : public"` has 100% success rate vs 50% for guessed base classes

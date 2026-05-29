@@ -1,6 +1,6 @@
 # unreal-source-mcp
 
-Local stdio MCP server for fast Unreal Engine source navigation using **SQLite FTS5** (trigram tokenizer) + **bracket skeleton indexing**.
+Local stdio MCP server for fast source code navigation using **SQLite FTS5** (trigram tokenizer) + **bracket skeleton indexing**.
 
 ## Features
 
@@ -70,7 +70,7 @@ raw_query='(file_path : "BasePass") AND "roughness"'
 - `cluster=true` — merge hits in the same code block, includes `block_type` and `block_name`
 - `scope_filter='{"block_type": "function"}'` — only return results inside matching blocks
 - `expanded_terms=["FMaterial", "UMaterialInterface"]` — domain terms for history matching
-- `module="Renderer"` — filter by UE module name
+- `module="Renderer"` — filter by module name
 
 ## Architecture
 
@@ -106,7 +106,7 @@ Instead of computing `snippet()` for all matching rows (10K+ for common terms), 
 
 This provides **~100x speedup** for high-frequency terms and **95% token reduction**.
 
-## Performance (84,696 UE source files)
+## Performance (example: 84,696 source files from a game engine codebase)
 
 | Operation | Latency | ~Tokens |
 |-----------|---------|---------|
