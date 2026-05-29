@@ -2,9 +2,9 @@
   "mcpServers": {
     "unreal-source-mcp": {
       "command": "uv",
-      "args": ["run", "--directory", "/home/yanwei/Documents/myproj/mysql", "unreal-source-mcp"],
+      "args": ["run", "--directory", "/root/myproject/mysql", "unreal-source-mcp"],
       "env": {
-        "UNREAL_SOURCE_DB": "/home/yanwei/Documents/myproj/mysql/unreal.db"
+        "UNREAL_SOURCE_DB": "/root/myproject/mysql/unreal.db"
       }
     }
   }
