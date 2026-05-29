@@ -8,11 +8,12 @@ Local stdio MCP server for fast Unreal Engine source navigation using **SQLite F
 - **Bracket skeleton index**: lightweight structural indexing via FSM brace matching (no AST parser needed)
 - **Symbol classification**: heuristic block-type detection (namespace/class/enum/function/macro) for C/C++
 - **Include dependency graph**: O(1) include path matching with upstream/downstream traversal
-- **Caller lookup**: find callers of any symbol using FTS5 + bracket skeleton
+- **Caller lookup**: find callers of any symbol using FTS5 + bracket skeleton with line-range verification
 - **Search result clustering**: merge multiple hits in the same code block into one result
 - **Scope filtering**: restrict search results to specific block types (function/class/namespace)
 - **History-accelerated ranking**: past feedback adjusts ranking without filtering (prevents confirmation bias)
 - **Anchor-based extraction**: efficient context retrieval around a symbol without reading the whole file
+- **Token-efficient responses**: compact snippets (~2,600 tokens/20 results, 95% reduction vs full snippets)
 
 ## Setup
 
@@ -101,22 +102,22 @@ Include paths are matched to indexed files using a pre-built basename → file_i
 ### Two-step FTS5 query
 Instead of computing `snippet()` for all matching rows (10K+ for common terms), the query is split:
 1. `bm25() + ORDER BY + LIMIT` to get top-N rowids (fast)
-2. `snippet()` computed only for those top-N rows
+2. `snippet()` computed only for those top-N rows, truncated to 300 chars
 
-This provides **~100x speedup** for high-frequency terms.
+This provides **~100x speedup** for high-frequency terms and **95% token reduction**.
 
 ## Performance (84,696 UE source files)
 
-| Operation | Latency |
-|-----------|---------|
-| Single keyword search | ~90 ms |
-| Full pipeline (FTS5 + history + scoring) | ~115 ms |
-| Module-filtered search | ~250 ms |
-| find_callers | 100–1,500 ms |
-| Include graph (depth=1) | ~15 ms |
-| Bracket index load (single file) | ~1 ms |
-| Anchor-based content extraction | ~0.1 ms |
-| History signal computation | ~0.3 ms |
+| Operation | Latency | ~Tokens |
+|-----------|---------|---------|
+| Single keyword search (20 results) | ~90 ms | ~2,600 |
+| Full pipeline (FTS5 + history + scoring) | ~115 ms | ~2,600 |
+| Module-filtered search | ~250 ms | ~2,600 |
+| find_callers (precise, per-symbol) | 100–900 ms | 127–3,100 |
+| Include graph (depth=1) | ~15 ms | 50–2,100 |
+| Anchor-based content extraction | ~0.1 ms | ~125 |
+| Full file read (avoid!) | ~25 ms | ~45,000 |
+| **Typical 3-search workflow** | **~400 ms** | **~4,500** |
 
 ## Database schema
 
@@ -139,4 +140,6 @@ uv run ruff check .
 PYTHONPATH=src python3 tests/test_bracket_scanner.py
 # Query pipeline efficiency tests
 PYTHONPATH=src python3 tests/test_query_efficiency.py
+# Token & efficiency benchmark
+PYTHONPATH=src python3 tests/test_benchmark.py
 ```

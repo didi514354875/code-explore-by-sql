@@ -64,7 +64,7 @@ search_source_with_feedback()
   ├── Step 1: _search_fts()  — Two-step FTS5 query
   │     ├── Step 1a: bm25() + ORDER BY + LIMIT → top-N rowids
   │     ├── Step 1b: Module filter via JOIN on candidates (if module set)
-  │     └── Step 1c: snippet() only for final top-N
+  │     └── Step 1c: substr(snippet(), 1, 300) only for final top-N
   │
   ├── Step 2: _get_history_signals()  — Past feedback scores
   │     └── query_logs_fts MATCH terms → file_id → weighted score
@@ -105,14 +105,36 @@ This replaces the original per-include `LIKE '%path%'` query (O(N) per include) 
 
 ```
 find_callers(symbol, scope?)
-  ├── search_source(symbol, limit=50)     # FTS5 find occurrences
+  ├── search_source(symbol, limit=50)     # FTS5 find files containing symbol
   │
   └── For each result file:
-        ├── load_bracket_index(file_id, depth=1)  # Get top-level blocks
-        └── For each block:
-              ├── Skip if block_name matches symbol (definition)
-              └── Record as caller with block_type, block_name, range
+        ├── load_bracket_index(file_id)           # ALL depths (not just depth=1)
+        ├── get_source_by_path(file_path)         # Get file content
+        ├── For each line containing symbol:
+        │     ├── Skip #include lines
+        │     ├── Find enclosing depth=1 block via line range
+        │     ├── Skip definition blocks (block_name match + signature heuristic)
+        │     └── Record caller with caller_line, block_type, block_name, range
+        └── Deduplicate by (file_id, block_open_line)
 ```
+
+**Key improvement**: Instead of returning ALL blocks in files that contain the symbol text,
+the algorithm verifies the symbol appears within each candidate block's line range by scanning
+the actual file content. This reduces false positives from 59 → 3 for `SampleLumenCard` (95%).
+
+### 6. Token-Efficient Response Design
+
+The dominant cost in LLM consumption is the FTS5 `snippet()` output. The trigram tokenizer
+returns full source lines around matches, producing 4–12 KB per result.
+
+**Solution**: `substr(snippet(...), 1, 300)` in `_search_fts()` truncates each snippet:
+
+| Component | Token cost | Notes |
+|-----------|-----------|-------|
+| Search result (20 results) | ~2,600 | 300-char snippets, compact JSON |
+| find_callers result | 127–3,100 | Depends on caller count |
+| find_include_graph | 52–2,100 | Depends on edge count |
+| Anchor extraction (500 chars) | ~125 | Use instead of full file read (~45K tok) |
 
 ---
 
@@ -178,19 +200,34 @@ build_index(root, db_path)
 
 Tested on 84,696 Unreal Engine source files (2.5 GB database), 2-core machine.
 
-### Query latency
+### Query latency and token cost
 
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| Single keyword (Render, 11K matches) | 88 ms | Two-step FTS5 |
-| Full pipeline (FTS5 + history + scoring) | 115 ms | Best=108ms |
-| Module-filtered search | 246 ms | JOIN on candidates, not subquery |
-| 10-query rapid-fire average | 501 ms | Mix of common/rare terms |
-| find_callers (Render) | 107 ms | 285 callers found |
-| find_include_graph (depth=1) | 15 ms | Per file |
-| Bracket index load (depth=1) | 0.9 ms | Per file |
-| Anchor content extraction | 0.1 ms | instr + substr |
-| History signal computation | 0.3 ms | FTS5 on query_logs |
+LLM context window is the primary constraint. Token estimates use ~4 chars/token for code.
+
+| Operation | Latency | ~Tokens | Notes |
+|-----------|---------|---------|-------|
+| Single keyword (Render, 11K matches) | 130 ms | 2,654 | 20 results, 300-char snippets |
+| Full pipeline (FTS5 + history + scoring) | 305 ms | 2,654 | History adds ~175ms, ~0 tokens |
+| Module-filtered search | 246 ms | 2,600 | JOIN on candidates |
+| find_callers (SampleLumenCard) | 330 ms | 127 | 3 precise callers |
+| find_callers (BeginRenderPass) | 860 ms | 3,116 | 63 callers |
+| find_callers (Render) | 148 ms | 27,626 | 525 callers — use scope to limit |
+| find_include_graph (depth=1) | 2–15 ms | 52–2,100 | Depends on edge count |
+| Anchor content extraction | 0.1 ms | 125 | **358x fewer tokens** than full read |
+| Full file read | 25 ms | 44,762 | Avoid — use anchor or line range |
+| **3-search workflow** | **~400 ms** | **~4,500** | 3 searches + 1 anchor extract |
+
+### Token optimization
+
+The dominant cost is FTS5 `snippet()` output. The trigram tokenizer returns full source lines around matches, producing 4–12 KB per result (20 results = ~70K tokens).
+
+**Solution**: `substr(snippet(...), 1, 300)` truncates each snippet to 300 characters.
+
+| Metric | Before | After | Reduction |
+|--------|--------|-------|-----------|
+| Per-result snippet | 4.5–12.7 KB | 300 B | 15–42x |
+| 20 results response | 270 KB (~69K tok) | 10 KB (~2.6K tok) | **26x** |
+| Typical 3-search workflow | ~94K tok | ~4.5K tok | **95%** |
 
 ### Indexing throughput
 
@@ -209,7 +246,9 @@ Tested on 84,696 Unreal Engine source files (2.5 GB database), 2-core machine.
 |-------------|----------------|---------|
 | Two-step FTS5 (defer snippet) | 9,600ms → 88ms | 109x |
 | Module filter (JOIN vs subquery) | 35,800ms → 246ms | 145x |
+| Snippet truncation (300 chars) | ~69K → ~2.6K tokens | 26x token reduction |
 | Include matching (hash vs LIKE) | O(N) per include → O(1) | ~100,000x |
+| find_callers line-range verification | 59 false positives → 3 accurate | 95% FP reduction |
 | Multi-process scanning | 19.3min → 3.3min | 5.8x |
 | No-brace file skip | Skips 3.3% of files entirely | ~3% |
 | Line-level fast skip | Skips ~60-70% of lines in CODE state | ~2x on scanner |
