@@ -747,17 +747,18 @@ def _search_fts(
             return []
 
     # Step 3: Fetch file metadata + compact snippets only for the final candidates
-    # Trigram tokenizer's snippet() returns full lines around matches which can be
-    # very large. We truncate to 300 chars to keep responses compact for LLM consumption.
+    # Use num_tokens=15 so snippets include enough context for precise block attribution.
+    # Truncate to 300 chars to keep responses compact for LLM consumption.
     rowids = [str(r["fts_rowid"]) for r in ranked]
     rank_map = {r["fts_rowid"]: r["rank"] for r in ranked}
 
     results = []
     for row in conn.execute(
         "SELECT sf.id, sf.file_path, sf.module_name, "
-        "substr(snippet(source_files_fts, 2, '...', '...', ' … ', 6), 1, 300) AS snippet "
+        "substr(snippet(source_files_fts, 2, '...', '...', ' … ', 15), 1, 300) AS snippet "
         "FROM source_files_fts JOIN source_files sf ON sf.id = source_files_fts.rowid "
-        f"WHERE source_files_fts.rowid IN ({','.join(rowids)})"
+        f"WHERE source_files_fts MATCH ? AND source_files_fts.rowid IN ({','.join(rowids)})",
+        (fts_query,),
     ):
         d = dict(row)
         d["rank"] = rank_map.get(d["id"], 0)
@@ -858,38 +859,93 @@ def _get_history_signals(
     return file_scores
 
 
+def _snippet_to_line_numbers(
+    content: str, snippet: str, marker: str = "...", separator: str = " … "
+) -> list[int]:
+    """Extract hit line numbers from an FTS5 snippet by matching fragments back into raw_content.
+
+    FTS5 snippet() returns raw text fragments from the indexed column.
+    By stripping match markers and searching in raw_content, we recover
+    the character offset of each fragment and convert to 1-based line numbers.
+
+    Lines <5 (file header / copyright / first include) are filtered out as
+    they're never inside a meaningful code block.
+    """
+    lines: list[int] = []
+    fragments = snippet.split(separator)
+    for frag in fragments:
+        clean = frag.replace(marker, "")
+        if len(clean.strip()) < 5:
+            continue
+        pos = content.find(clean)
+        line = -1
+        if pos >= 0:
+            line = content[:pos].count("\n") + 1
+        else:
+            # substr truncation fallback: match with leading portion
+            trunc = clean[: max(1, int(len(clean) * 0.8))]
+            pos2 = content.find(trunc)
+            if pos2 >= 0:
+                line = content[:pos2].count("\n") + 1
+        if line >= 5:
+            lines.append(line)
+    return lines
+
+
 def _cluster_results(
     conn: sqlite3.Connection, fts_results: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Cluster FTS results by enclosing code block using bracket skeleton.
 
-    Multiple hits in the same top-level block are merged into one result
-    with hit_count and the best snippet.
+    Uses snippet-to-line-number mapping to find the precise enclosing block
+    for each hit, then merges hits in the same block into one result.
     """
     if not fts_results:
         return []
 
-    # Batch-load bracket indices for all involved files
+    from collections import defaultdict
+
     file_ids = list({r["id"] for r in fts_results})
+
+    # Batch-load raw_content for snippet line number extraction
+    id_list = ",".join(str(fid) for fid in file_ids)
+    content_map: dict[int, str] = {}
+    for row in conn.execute(
+        f"SELECT id, raw_content FROM source_files WHERE id IN ({id_list})"
+    ):
+        content_map[row["id"]] = row["raw_content"]
+
+    # Batch-load bracket indices for all involved files
     bracket_cache: dict[int, list[dict[str, Any]]] = {}
     for fid in file_ids:
         bracket_cache[fid] = load_bracket_index(conn, fid, depth=1)
 
-    # Group results by enclosing block
-    from collections import defaultdict
+    # Group results by enclosing block using precise line numbers
+    import bisect
 
     clusters: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
 
     for r in fts_results:
-        # Extract line number from snippet position (approximate)
-        # We use the file content to find actual match lines
+        content = content_map.get(r["id"])
         brackets = bracket_cache.get(r["id"], [])
-        # For now, cluster by file since we don't have exact line numbers from FTS5
-        # We use the bracket data to find the first matching block
-        # This is a simplification — full implementation would need match positions
-        key = (r["id"], 0)  # file-level clustering as baseline
-        if brackets:
-            key = (r["id"], brackets[0]["open_line"])
+
+        hit_lines = _snippet_to_line_numbers(content, r["snippet"]) if content else []
+
+        block = None
+        if hit_lines and brackets:
+            block = find_enclosing_block(brackets, hit_lines[0], max_depth=1)
+            # Fallback: hit may be on the declaration line before '{'.
+            # Find the nearest block whose open_line follows the hit line.
+            if block is None:
+                opens = [b["open_line"] for b in brackets]
+                idx = bisect.bisect_right(opens, hit_lines[0])
+                if idx < len(brackets):
+                    # Only accept if within a reasonable lookback (20 lines)
+                    candidate = brackets[idx]
+                    if candidate["open_line"] - hit_lines[0] <= 20:
+                        block = candidate
+
+        key = (r["id"], block["open_line"]) if block else (r["id"], 0)
         clusters[key].append(r)
 
     # Build clustered results
