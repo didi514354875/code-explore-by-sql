@@ -28,34 +28,48 @@ def iter_source_files(root: Path, include_plugins: bool = True) -> list[Path]:
     return files
 
 
-def infer_module_name(path: Path) -> str | None:
-    """Infer the UE module name from the file path.
+def infer_module_name(
+    path: Path,
+    source_marker: str = "Source",
+    categories: set[str] | None = None,
+) -> str | None:
+    """Infer the module name from the file path.
 
-    For paths under .../Source/{Module}/..., returns {Module}.
-    For paths like .../Source/Runtime/Renderer/..., returns "Renderer"
-    (skips category directories: Runtime, Editor, Developer, Programs, Games, Plugins).
+    Looks for `source_marker` in the path, then takes the next component.
+    If that component is in `categories`, skips it and takes the one after.
+
+    Examples with source_marker="Source", categories={"Runtime","Editor"}:
+      .../Source/Runtime/Renderer/Private/... -> "Renderer"
+      .../Source/MyModule/Private/...          -> "MyModule"
+
+    With default categories=None (no skipping):
+      .../Source/Runtime/Renderer/Private/... -> "Runtime"
+      .../src/core/...                         -> None (no "Source" marker)
     """
     parts = path.parts
-    if "Source" not in parts:
+    if source_marker not in parts:
         return None
 
-    idx = parts.index("Source")
+    idx = parts.index(source_marker)
     if idx + 1 >= len(parts):
         return None
 
-    # Skip category directories that group multiple modules
-    _CATEGORIES = {"Runtime", "Editor", "Developer", "Programs", "Games", "Plugins"}
     first_after = parts[idx + 1]
+    cats = categories or set()
 
-    if first_after in _CATEGORIES and idx + 2 < len(parts):
-        # .../Source/Runtime/Renderer/Private/... -> Renderer
+    if first_after in cats and idx + 2 < len(parts):
         return parts[idx + 2]
     else:
-        # .../Source/MyModule/Private/... -> MyModule
         return first_after
 
 
-def build_index(root: Path, db_path: Path, limit: int | None = None) -> int:
+def build_index(
+    root: Path,
+    db_path: Path,
+    limit: int | None = None,
+    source_marker: str = "Source",
+    categories: set[str] | None = None,
+) -> int:
     """Two-phase build: fast file import, then parallel structural indexing."""
     import time
 
@@ -77,7 +91,7 @@ def build_index(root: Path, db_path: Path, limit: int | None = None) -> int:
             conn,
             SourceFile(
                 file_path=rel,
-                module_name=infer_module_name(path),
+                module_name=infer_module_name(path, source_marker, categories),
                 raw_content=content,
                 content_hash=digest,
             ),
@@ -102,12 +116,26 @@ def build_index(root: Path, db_path: Path, limit: int | None = None) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build SQLite FTS5 index for Unreal source.")
-    parser.add_argument("root", type=Path, help="Unreal source root directory")
+    parser = argparse.ArgumentParser(description="Build SQLite FTS5 index for source code.")
+    parser.add_argument("root", type=Path, help="Source root directory")
     parser.add_argument("db", type=Path, help="SQLite database path")
     parser.add_argument("--limit", type=int, default=None, help="Optional file limit for smoke tests")
+    parser.add_argument(
+        "--source-marker",
+        default="Source",
+        help="Path component marking the source root (default: Source). "
+        'Use "src" for typical CMake projects, "." to use the root.',
+    )
+    parser.add_argument(
+        "--categories",
+        default="",
+        help="Comma-separated category directories to skip after source marker "
+        '(e.g. "Runtime,Editor,Developer"). Empty = no skipping.',
+    )
     args = parser.parse_args()
-    count = build_index(args.root, args.db, args.limit)
+
+    cats = {c.strip() for c in args.categories.split(",") if c.strip()} or None
+    count = build_index(args.root, args.db, args.limit, args.source_marker, cats)
     print(f"Indexed {count} files into {args.db}")
 
 

@@ -1064,6 +1064,78 @@ def record_feedback(conn: sqlite3.Connection, file_path: str, was_useful: bool =
     return True
 
 
+def get_directory_structure(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return a compact directory structure summary from the indexed database.
+
+    Returns:
+      - total_files: total number of indexed files.
+      - total_modules: total number of distinct modules.
+      - modules: list of {module_name, file_count} — top 30 by file_count DESC.
+        module_name is None for files that couldn't be classified.
+      - top_dirs: dict with level_1 and level_2 keys, each a list of
+        {path, file_count} capped at 50 entries.
+    """
+    total = conn.execute("SELECT COUNT(*) AS c FROM source_files").fetchone()["c"]
+
+    # Module breakdown — top 30
+    modules = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT module_name, COUNT(*) AS file_count "
+            "FROM source_files GROUP BY module_name ORDER BY file_count DESC LIMIT 30"
+        ).fetchall()
+    ]
+
+    total_modules = conn.execute(
+        "SELECT COUNT(DISTINCT module_name) AS c FROM source_files"
+    ).fetchone()["c"]
+
+    # Level 1: first path component
+    level_1 = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT "
+            "  CASE WHEN instr(file_path, '/') = 0 THEN file_path "
+            "       ELSE substr(file_path, 1, instr(file_path, '/') - 1) "
+            "  END AS path, "
+            "  COUNT(*) AS file_count "
+            "FROM source_files GROUP BY path ORDER BY file_count DESC LIMIT 50"
+        ).fetchall()
+    ]
+
+    # Level 2: first two path components
+    level_2 = [
+        dict(r)
+        for r in conn.execute(
+            "WITH parts AS ("
+            "  SELECT file_path,"
+            "    CASE WHEN instr(file_path, '/') = 0 THEN file_path"
+            "         ELSE substr(file_path, 1, instr(file_path, '/') - 1)"
+            "    END AS p1,"
+            "    substr(file_path, instr(file_path, '/') + 1) AS rest"
+            "  FROM source_files"
+            ")"
+            "SELECT"
+            "  CASE"
+            "    WHEN instr(rest, '/') = 0 THEN p1 || '/' || rest"
+            "    ELSE p1 || '/' || substr(rest, 1, instr(rest, '/') - 1)"
+            "  END AS path,"
+            "  COUNT(*) AS file_count"
+            " FROM parts GROUP BY path ORDER BY file_count DESC LIMIT 50"
+        ).fetchall()
+    ]
+
+    return {
+        "total_files": total,
+        "total_modules": total_modules,
+        "modules": modules,
+        "top_dirs": {
+            "level_1": level_1,
+            "level_2": level_2,
+        },
+    }
+
+
 def prune_stale_data(conn: sqlite3.Connection) -> dict[str, int]:
     """Remove dead data. Returns counts of deleted items."""
     stale_logs = conn.execute(

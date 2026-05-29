@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import (
     connect,
+    get_directory_structure as get_directory_structure_db,
     get_source_anchored,
     get_source_by_path,
     initialize_schema,
@@ -20,7 +21,7 @@ mcp = FastMCP("code-explore-by-sql")
 
 
 def _db_path() -> str:
-    return os.environ.get("UNREAL_SOURCE_DB", "unreal.db")
+    return os.environ.get("CODE_EXPLORE_DB", os.environ.get("UNREAL_SOURCE_DB", "unreal.db"))
 
 
 def _conn():
@@ -373,6 +374,24 @@ def find_callers(
             "callers": callers,
             "total": len(callers),
         }
+
+
+@mcp.tool()
+def get_directory_structure() -> dict[str, Any]:
+    """Get the directory structure summary from the indexed database.
+
+    Returns:
+      - total_files: total number of indexed source files.
+      - total_modules: total number of distinct modules.
+      - modules: list of {module_name, file_count} — top 30 by file_count.
+        Use module_name as `module` param in search_code_source or `scope` in find_callers.
+      - top_dirs: dict with level_1 and level_2 keys, each a list of {path, file_count}.
+
+    Use this to discover valid module names before searching, especially when
+    exploring an unfamiliar codebase.
+    """
+    with _conn() as conn:
+        return get_directory_structure_db(conn)
 
 
 def main() -> None:
