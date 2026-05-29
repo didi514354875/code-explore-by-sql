@@ -746,14 +746,16 @@ def _search_fts(
         if not ranked:
             return []
 
-    # Step 3: Fetch file metadata + snippets only for the final candidates
+    # Step 3: Fetch file metadata + compact snippets only for the final candidates
+    # Trigram tokenizer's snippet() returns full lines around matches which can be
+    # very large. We truncate to 300 chars to keep responses compact for LLM consumption.
     rowids = [str(r["fts_rowid"]) for r in ranked]
     rank_map = {r["fts_rowid"]: r["rank"] for r in ranked}
 
     results = []
     for row in conn.execute(
         "SELECT sf.id, sf.file_path, sf.module_name, "
-        "snippet(source_files_fts, 2, '[', ']', ' … ', 16) AS snippet "
+        "substr(snippet(source_files_fts, 2, '...', '...', ' … ', 6), 1, 300) AS snippet "
         "FROM source_files_fts JOIN source_files sf ON sf.id = source_files_fts.rowid "
         f"WHERE source_files_fts.rowid IN ({','.join(rowids)})"
     ):
