@@ -1,4 +1,4 @@
-from unreal_source_mcp.db import (
+from code_explore_by_sql.db import (
     SOURCE_EXTENSIONS,
     SourceFile,
     connect,

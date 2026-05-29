@@ -1,16 +1,16 @@
 {
   "servers": {
-    "unreal-source-mcp": {
+    "code-explore-by-sql": {
       "type": "stdio",
       "command": "uv",
       "args": [
         "--directory",
-        "/home/yanwei/Documents/myproj/mysql",
+        "/home/yanwei/Documents/myproj/CodeExploreBySQL",
         "run",
-        "unreal-source-mcp"
+        "code-explore-by-sql"
       ],
       "env": {
-        "UNREAL_SOURCE_DB": "/home/yanwei/Documents/myproj/mysql/unreal.db"
+        "UNREAL_SOURCE_DB": "/home/yanwei/Documents/myproj/CodeExploreBySQL/unreal.db"
       }
     }
   }

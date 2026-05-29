@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "unreal-source-mcp": {
+    "code-explore-by-sql": {
       "command": "uv",
-      "args": ["run", "--directory", "/root/myproject/CodeExploreBySQL", "unreal-source-mcp"],
+      "args": ["run", "--directory", "/root/myproject/CodeExploreBySQL", "code-explore-by-sql"],
       "env": {
         "UNREAL_SOURCE_DB": "/root/myproject/CodeExploreBySQL/unreal.db"
       }

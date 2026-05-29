@@ -220,8 +220,8 @@ def _scan_file_content(
 
     Designed to run in a subprocess. Returns (file_id, bracket_rows, include_rows).
     """
-    from unreal_source_mcp.bracket_scanner import scan_brackets
-    from unreal_source_mcp.symbol_sniffer import sniff_blocks_for_file
+    from code_explore_by_sql.bracket_scanner import scan_brackets
+    from code_explore_by_sql.symbol_sniffer import sniff_blocks_for_file
 
     bracket_rows: list[tuple] = []
     include_rows: list[tuple] = []
@@ -505,8 +505,8 @@ def rebuild_structural_index(
     unique_map/collision_map: pre-built include lookups (avoids per-include LIKE queries).
     auto_commit: if False, caller is responsible for committing (batch optimization).
     """
-    from unreal_source_mcp.bracket_scanner import scan_brackets
-    from unreal_source_mcp.symbol_sniffer import sniff_blocks_for_file
+    from code_explore_by_sql.bracket_scanner import scan_brackets
+    from code_explore_by_sql.symbol_sniffer import sniff_blocks_for_file
 
     if not skip_delete:
         conn.execute("DELETE FROM bracket_index WHERE file_id = ?", (file_id,))

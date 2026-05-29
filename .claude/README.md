@@ -5,14 +5,14 @@
 ```json
 {
   "servers": {
-    "unreal-source-mcp": {
+    "code-explore-by-sql": {
       "type": "stdio",
       "command": "uv",
       "args": [
         "--directory",
-        "/path/to/mysql",
+        "/path/to/CodeExploreBySQL",
         "run",
-        "unreal-source-mcp"
+        "code-explore-by-sql"
       ],
       "env": {
         "UNREAL_SOURCE_DB": "/absolute/path/to/unreal.db"

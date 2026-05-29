@@ -1,7 +1,7 @@
 ---
 description: 'Specialist for C/C++ source code exploration using SQLite FTS5 with trigram tokenizer and bracket skeleton index.'
 name: 'Code Explorer'
-tools: [read, search, unreal-source-mcp/*]
+tools: [read, search, code-explore-by-sql/*]
 user-invocable: true
 disable-model-invocation: false
 ---

@@ -16,7 +16,7 @@ from .db import (
     search_source_with_feedback,
 )
 
-mcp = FastMCP("unreal-source-mcp")
+mcp = FastMCP("code-explore-by-sql")
 
 
 def _db_path() -> str:

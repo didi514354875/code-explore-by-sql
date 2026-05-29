@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import sys
 
-from unreal_source_mcp.bracket_scanner import scan_brackets, BracketBlock
-from unreal_source_mcp.symbol_sniffer import sniff_block, sniff_blocks_for_file, BlockInfo
+from code_explore_by_sql.bracket_scanner import scan_brackets, BracketBlock
+from code_explore_by_sql.symbol_sniffer import sniff_block, sniff_blocks_for_file, BlockInfo
 
 PASS = 0
 FAIL = 0
@@ -371,7 +371,7 @@ enum class EMyEnum {
 }  // namespace MyNS
 """.split("\n")
 
-from unreal_source_mcp.bracket_scanner import scan_brackets
+from code_explore_by_sql.bracket_scanner import scan_brackets
 
 blocks = scan_brackets("\n".join(lines))
 top_blocks = [(b.open_line - 1, b.close_line - 1) for b in blocks if b.depth == 1]

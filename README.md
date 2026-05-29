@@ -1,4 +1,4 @@
-# unreal-source-mcp
+# code-explore-by-sql
 
 Local stdio MCP server for fast source code navigation using **SQLite FTS5** (trigram tokenizer) + **bracket skeleton indexing**.
 
@@ -25,10 +25,10 @@ uv sync --dev
 
 ```bash
 # Full build (two-phase: fast import → parallel structural indexing)
-uv run unreal-source-build-db /path/to/UnrealEngine /path/to/unreal.db
+uv run code-explore-by-sql-build-db /path/to/UnrealEngine /path/to/unreal.db
 
 # Smoke test with limited files
-uv run unreal-source-build-db /path/to/UnrealEngine /path/to/unreal.db --limit 1000
+uv run code-explore-by-sql-build-db /path/to/UnrealEngine /path/to/unreal.db --limit 1000
 ```
 
 Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
@@ -36,7 +36,7 @@ Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
 ## Run the MCP server
 
 ```bash
-UNREAL_SOURCE_DB=/path/to/unreal.db uv run unreal-source-mcp
+UNREAL_SOURCE_DB=/path/to/unreal.db uv run code-explore-by-sql
 ```
 
 ## Tools (5)
