@@ -43,12 +43,15 @@ _EXPORT_KEYWORDS = re.compile(
 _NAMESPACE_RE = re.compile(r"\bnamespace\s+(\w+)")
 
 # Class/struct pattern (handles final, alignas, attributes, export macros)
+# Allows zero or more qualifiers between class/struct and the name:
+#   - __attribute__((...))
+#   - UPPER_CASE token, optionally with parenthesized args (e.g. UE_DEPRECATED(5.7, "msg"))
+# This deliberately excludes camelCase / PascalCase tokens so the real name
+# isn't swallowed as an export macro.
 _CLASS_RE = re.compile(
     r"\b(class|struct)\s+"
-    r"(?:__attribute__\([^)]*\)\s*)?"  # optional __attribute__
-    r"(?:\w+\s+)?"  # optional export macro like MYMODULE_API
-    r"(\w+)",  # the name
-    re.IGNORECASE,
+    r"(?:(?:__attribute__\s*\(\([^)]*\)\)|[A-Z][A-Z0-9_]*(?:\s*\([^)]*\))?)\s+)*"
+    r"(\w+)",
 )
 
 # Enum pattern
@@ -64,6 +67,31 @@ _FUNC_NAME_RE = re.compile(r"(\w+(?:\s*::\s*\w+)*)\s*\([^)]*\)\s*$")
 
 # Preprocessor define
 _DEFINE_RE = re.compile(r"#\s*define\s+")
+
+# Block-defining keywords used to locate the actual definition line in
+# sniff_blocks_for_file (excludes forward-decl-only contexts).
+_BLOCK_KW_RE = re.compile(r"\b(class|struct|namespace|enum)\b")
+
+# Block / line comment stripping
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_TEMPLATE_RE = re.compile(r"\btemplate\s*<[^<>]*>")
+
+
+def _strip_comments(text: str) -> str:
+    """Remove C/C++ block and line comments from a string."""
+    text = _BLOCK_COMMENT_RE.sub(" ", text)
+    text = _LINE_COMMENT_RE.sub(" ", text)
+    return text
+
+
+def _strip_template(text: str) -> str:
+    """Remove `template<...>` prefixes (handles up to 1 level of nested <>)."""
+    while True:
+        new = _TEMPLATE_RE.sub(" ", text)
+        if new == text:
+            return text
+        text = new
 
 
 @dataclass(frozen=True)
@@ -100,6 +128,11 @@ def sniff_block(
     joined = " ".join(context)
     # Collapse whitespace
     joined_clean = re.sub(r"\s+", " ", joined).strip()
+    # Strip comments and template<...> prefixes so the regexes below see
+    # only structural code tokens.
+    joined_clean = _strip_comments(joined_clean)
+    joined_clean = _strip_template(joined_clean)
+    joined_clean = re.sub(r"\s+", " ", joined_clean).strip()
 
     # 0. Preprocessor define (must be first — #define FOO() looks like a function)
     if any(_DEFINE_RE.match(line) for line in context):
@@ -169,23 +202,50 @@ def sniff_blocks_for_file(
         if open_text.endswith("{"):
             open_text = open_text[:-1].rstrip()
 
-        # Collect preceding lines — only need up to 5 non-blank, non-UE-macro
-        preceding: list[str] = []
+        # Locate the actual definition start by scanning backwards for a line
+        # that contains a class/struct/namespace/enum keyword and is not a
+        # forward declaration (does not end with ';').  Stop at any forward
+        # declaration we encounter so neighbouring forward decls are excluded.
+        def_start: int | None = None
         for j in range(open_line - 1, max(open_line - 20, -1), -1):
-            if j < 0:
-                break
             _, txt = stripped_lines[j]
-            if not txt:
+            stripped = txt.strip()
+            if not stripped or _UE_MACRO_RE.match(stripped):
                 continue
-            if _UE_MACRO_RE.match(txt):
+            stripped_no_cmt = _strip_comments(stripped).strip()
+            if not stripped_no_cmt:
                 continue
-            preceding.insert(0, txt)
-            if len(preceding) >= 5:
+            if stripped_no_cmt.endswith(";"):
+                # Forward declaration / unrelated statement — stop.
                 break
+            if _BLOCK_KW_RE.search(stripped_no_cmt):
+                def_start = j
+                break
+
+        preceding: list[str] = []
+        if def_start is not None:
+            # Collect lines from def_start up to (but excluding) open_line.
+            for j in range(def_start, open_line):
+                _, txt = stripped_lines[j]
+                stripped = txt.strip()
+                if not stripped or _UE_MACRO_RE.match(stripped):
+                    continue
+                preceding.append(stripped)
+        else:
+            # Fallback (functions / control flow / unknown blocks):
+            # collect up to 5 non-blank, non-UE-macro lines preceding open_line.
+            for j in range(open_line - 1, max(open_line - 20, -1), -1):
+                _, txt = stripped_lines[j]
+                stripped = txt.strip()
+                if not stripped or _UE_MACRO_RE.match(stripped):
+                    continue
+                preceding.insert(0, stripped)
+                if len(preceding) >= 5:
+                    break
 
         # Append open_line declaration text
         if open_text.strip():
-            preceding.append(open_text)
+            preceding.append(open_text.strip())
 
         info = sniff_block(preceding, open_line, lines)
         results.append((open_line, info))
