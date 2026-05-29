@@ -37,7 +37,7 @@ def search_code_source(
     module: str | None = None,
     limit: int = 20,
     cluster: bool = False,
-    scope_filter: str | None = None,
+    scope_filter: str | dict | None = None,
 ) -> list[dict[str, Any]]:
     """Search source code files. Two modes:
 
@@ -61,8 +61,9 @@ def search_code_source(
     cluster: If true, merge multiple hits in the same code block into one result
     with a hit_count field. Useful when a keyword appears many times in one function.
 
-    scope_filter: Optional JSON string with block_type and/or block_name to narrow search.
-    Example: '{"block_type": "function", "block_name": "Render"}'
+    scope_filter: Optional dict or JSON string with block_type and/or block_name to narrow search.
+    Example (dict): {"block_type": "function", "block_name": "Render"}
+    Example (JSON string): '{"block_type": "class"}'
     Only returns hits inside matching code blocks.
 
     The system automatically:
@@ -77,10 +78,15 @@ def search_code_source(
 
     parsed_scope = None
     if scope_filter:
-        try:
-            parsed_scope = json.loads(scope_filter)
-        except json.JSONDecodeError:
-            return [{"error": "scope_filter must be valid JSON"}]
+        if isinstance(scope_filter, dict):
+            parsed_scope = scope_filter
+        elif isinstance(scope_filter, str):
+            try:
+                parsed_scope = json.loads(scope_filter)
+            except json.JSONDecodeError:
+                return [{"error": "scope_filter must be a valid JSON string or dict"}]
+        else:
+            return [{"error": "scope_filter must be a dict or JSON string, got " + type(scope_filter).__name__}]
 
     with _conn() as conn:
         try:

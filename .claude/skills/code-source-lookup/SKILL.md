@@ -8,250 +8,161 @@ disable-model-invocation: false
 
 # Code Source Lookup
 
-Use this skill when the task is about **finding source code efficiently** with the local MCP server. Token budget awareness is critical — every tool call costs context window.
+Efficient source code lookup using the local MCP server.
 
 ## Token cost guide
 
 | Operation | ~Tokens | When to use |
 |-----------|---------|-------------|
-| search_code_source (20 results) | ~2,600 | Initial discovery |
-| get_file_content (anchor, 500 chars) | ~125 | **Always prefer** for single-symbol context |
-| get_file_content (line range, 100 lines) | ~900 | Need broader context |
-| get_file_content (full file) | ~45,000 | **Avoid** unless file is small |
+| search_code_source (20 results) | 2,600 | Initial discovery |
+| get_file_content (anchor, 500 chars) | 125 | **Always prefer** for single-symbol context |
+| get_file_content (line range, 100 lines) | 900 | Need broader context |
+| get_file_content (full file) | 45,000 | **Avoid** unless file is small |
 | find_callers (specific symbol) | 127–3,000 | Trace call sites |
-| find_callers (common symbol like "Render") | ~27,000 | **Use `scope` to limit!** |
+| find_callers (common symbol) | ~27,000 | **Use `scope` to limit!** |
 | find_include_graph (depth=1) | 50–2,100 | File dependencies |
-
-**Rule: never read a full file when anchor mode suffices.** Anchor is 358x cheaper.
-
-## Supported file types
-
-C/C++ (`.h`, `.hpp`, `.cpp`, `.cc`, `.cxx`) and shader files (`.usf`, `.ush`, `.hlsl`), plus C# (`.cs`).
 
 ## Tools (5)
 
-### 1. `search_code_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
-FTS5 search with history-accelerated ranking. Returns compact 300-char snippets (~2,600 tokens for 20 results).
-- **Simple**: `query="GetGBuffer"` — auto-escaped FTS5 match
-- **Advanced**: `raw_query='"GetGBuffer" AND "Emissive"'` — boolean operators, column filters
-- `expanded_terms`: domain terms for history matching (e.g., `["FMaterial", "UMaterialInterface"]`)
-- `module`: filter by module name (e.g., `"Renderer"`, `"Core"`, `"Editor"`)
-- `scope_filter`: **must be a JSON string**, not a dict! e.g. `'{"block_type": "function"}'`
-- `cluster=true`: limited benefit (~1% token reduction) — skip unless needed
-- Results include `source`: `"history_refined"` or `"fts"`, and `final_score`
-- Snippets are compact previews — use `get_file_content` with `anchor` for full context
+### `search_code_source(query?, raw_query?, expanded_terms?, module?, limit?, cluster?, scope_filter?)`
+FTS5 search with history-accelerated ranking (~2,600 tokens/20 results).
+- Simple: `query="GetGBuffer"` / Advanced: `raw_query='"A" AND "B"'`
+- `expanded_terms`: domain class/symbol names for ranking boost (e.g. `["FMaterial"]`)
+- `module` / `scope_filter` / `cluster` — see Bracket skeleton section
+- Results include `source` (history_refined or fts) and `final_score`
 
-### 2. `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
-Read file content with automatic feedback.
-- **Anchor mode** (preferred): `anchor="Render", context_chars=500` — ~125 tokens, 0.1ms
-- **Line range**: `start_line=100, end_line=200` — ~900 tokens for 100 lines
-- Avoid full file reads (~45K tokens) — always narrow first with anchor or range
-- Automatically records feedback when file was in recent search results
+### `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
+Read file via anchor (preferred) or line range. Auto-records feedback.
+- anchor="Render", context_chars=500 → ~125 tokens, 0.1ms
+- start_line=100, end_line=200 → ~900 tokens for 100 lines
+- Avoid full file reads (~45K tokens)
 
-### 3. `log_code_query(query_text, was_useful?, refinement?)`
-Record explicit feedback. Use only to correct automatic feedback.
+### `log_code_query(query_text, was_useful?, refinement?)`
+Record explicit feedback. Only needed to correct automatic feedback.
 
-### 4. `find_include_graph(file_path, direction?, depth?)`
-Query include dependency graph for a file. Very cheap (0–15ms, 50–2,100 tokens).
-- `direction`: `"upstream"` (who includes this), `"downstream"` (what this includes), `"both"`
-- `depth`: recursion depth (1 = direct dependencies only)
-- Returns edges with source/target file paths and include paths
+### `find_include_graph(file_path, direction?, depth?)`
+File dependency query. direction: upstream (who includes this) / downstream / both. depth: recursion level.
 
-### 5. `find_callers(symbol, scope?)`
-Find callers of a symbol using FTS5 + bracket skeleton structural analysis.
-- Verifies symbol text within each block's line range (not just file-level match)
-- Returns `caller_line` (exact line number), `block_type`, `block_name`, `block_range`
-- Skips definition blocks (where symbol matches block name)
-- **For common symbols** (e.g., "Render", "Update"), always use `scope` to limit results — otherwise may return 500+ callers
-- `scope`: module name to limit search (e.g., `"Renderer"`, `"Engine"`)
+### `find_callers(symbol, scope?)`
+Find callers using bracket skeleton analysis. Returns caller_line, block_type/name, block_range.
+- Always use `scope` for common symbols (Render, Update, etc.)
+- `scope`: module name — derived from `Engine/Source/<Category>` in the file path (see [[unreal-source-module-structure]])
 
-## Bracket skeleton — the structural spine
+## Bracket skeleton — structural spine
 
-Bracket skeleton is **not optional** — it is the core that makes searches precise, anchors reliable, and call tracing possible. It provides three capabilities that should be used in every session.
+Bracket skeleton provides three capabilities used in every session.
 
-### 1. `scope_filter` — precision filter for searches
+### 1. scope_filter — block-type filter for `search_code_source`
 
-Every `search_code_source` call should consider adding `scope_filter` to eliminate noise. Without it, a search returns implementation files, test files, and unrelated headers together. With it, you get **only the block type you need**.
+**Accepts dict or JSON string.** Param format:
 
-```python
-# Bad: 10 results, 60% noise (cpp files, tests, unrelated elements)
-search_code_source(query="class MySettings", module="MyModule")
+| Field | Required | Valid values |
+|-------|----------|-------------|
+| `block_type` | No | namespace / class / enum / function / control_flow / macro / unknown |
+| `block_name` | No | Exact block name, case-insensitive |
 
-# Good: fewer results, all class declarations
-search_code_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')
+> Note: `struct X` and `class X` are **both** classified as `block_type="class"`. There is no `"struct"` type.
+
+**Passing format (verified)**:
+```
+✓ scope_filter={"block_type": "class"}                                         ← dict (preferred)
+✓ scope_filter="{\"block_type\": \"class\"}"                                   ← JSON string
+✓ scope_filter={"block_type": "function", "block_name": "Render"}              ← dict
+✗ scope_filter='{"block_type": "class"}'                                       ← single-quotes: may be parsed as str, not valid JSON
 ```
 
-**When to use which scope_filter**:
+**When scope_filter errors → fallback**: Use raw_query column filter instead:
+`raw_query='(file_path : "MaterialShared") AND "FMaterial"'` or `(module_name : "Runtime")`
 
-| Task | scope_filter | Why |
-|------|-------------|-----|
-| Discover class hierarchy | `'{"block_type": "class"}'` | Only class declarations, no implementations |
-| Find struct definitions | `'{"block_type": "struct"}'` | Data types, context structs |
-| Locate function implementations | `'{"block_type": "function"}'` | Skip declarations, get bodies |
-| Find specific class method | `'{"block_type": "function", "block_name": "FMyClass"}'` | Only methods inside that class |
+**block_type classification** (from `symbol_sniffer.py`):
 
-### 2. `find_callers` — direct call chain tracing (replaces anchor guessing)
+| type | matches |
+|------|---------|
+| class | `class X` / `struct X` |
+| enum | `enum X` / `enum class X` |
+| function | block ending with `)`, not control-flow |
+| namespace | `namespace X` |
+| macro | `#define` |
+| control_flow | `if`/`for`/`while`/`switch` (non-top-level) |
+| unknown | unclassifiable |
 
-**Never guess function names for anchors when you can trace the call chain directly.**
+### 2. find_callers — when to use (and when not to)
 
-The most common failure pattern: trying to understand execution flow by guessing function signatures as anchor text. Instead:
-
-```python
-# Bad: guess anchor text, ~60% failure rate
-get_file_content(file_path="...", anchor="ExecuteGraphTask")  # → not found
-get_file_content(file_path="...", anchor="void FExecutor::Execute")  # → wrong signature
-
-# Good: trace from a known symbol
-find_callers("Generate", scope="MyModule")
-# → Component::Generate → Subsystem::Schedule → Executor::Schedule
-# Each result includes caller_line, block_type, block_name — exact locations
-```
-
-**Key rules**:
-- Always provide `scope` for common symbols ("Render", "Update", "Execute", "Generate") — without scope, expect 500+ results
-- `scope` is a module name matching the indexed codebase's module structure
-- Results include `block_range` (line range of enclosing block) — use this for line-range reads instead of anchor guessing
-
-### 3. Search result block metadata — the guide for anchor construction
-
-Search results include structural information from the bracket skeleton. **Read it before constructing anchors.**
+**Use for** → who calls a function, where a virtual is dispatched, where execution enters.
+**Don't use for** → data flow, how values are computed/passed, class hierarchies.
 
 ```python
-# Search returns:
-#   file_path: "MyComponent.h"
-#   block_type: "class"
-#   block_name: "UMyComponent"
-#   (implicit: line range from bracket index)
-
-# Instead of guessing: anchor="class UMyComponent : public USceneComponent"  ← risky
-# Use generic anchor:  anchor="class UMyComponent : public"                  ← WORKS
-# Or use block info:   get_file_content(start_line=<block_start>, end_line=<block_start+50>)
+# ✓ find_callers("Execute", scope="Renderer")    # who calls Execute
+# ✓ search_code_source("class FMaterial")          # structural/type discovery
+# ✓ search_code_source("FillUniformBuffer")        # find implementation
 ```
 
-**Verified**: In past analysis sessions, 3/11 anchor failures were caused by guessing wrong base classes. Using `"class XXX : public"` (without specifying the base) eliminated all such failures.
+Results include `block_range` — use for line-range reads instead of guessing anchors.
 
-### Bracket usage decision matrix
+### 3. Anchor construction
 
-| Question type | Primary tool | scope_filter? | find_callers? |
-|---------------|-------------|---------------|---------------|
-| "What classes exist in X?" | search | `'{"block_type":"class"}'` | No |
-| "What does class X inherit?" | search → anchor | No | No |
-| "Who calls function X?" | find_callers | N/A | Yes (with scope) |
-| "What implements virtual X?" | find_callers | N/A | Yes (with scope) |
-| "How does execution flow from A to B?" | find_callers chain | N/A | Yes (with scope) |
-| "What does file X depend on?" | find_include_graph | N/A | No |
-| "What is the data hierarchy?" | search with scope_filter | `'{"block_type":"class"}'` | No |
+Always use generic anchor patterns from search result metadata:
+- search returns `block_type="class", block_name="UMyComponent"` → `anchor="class UMyComponent : public"` (never guess base class)
+- Or use block_range: `get_file_content(start_line=N, end_line=N+50)`
+
+Verified: `"class XXX : public"` has 100% success rate vs 50% for guessed base classes.
+
+### Tool decision matrix
+
+| Sub-problem | Primary tool | Secondary |
+|------------|-------------|-----------|
+| Structure/type definition | search_code_source + scope_filter | anchor |
+| Function implementation | search_code_source → anchor | line range |
+| Call chain (who calls X?) | find_callers(symbol, scope=...) | block_range |
+| Data flow (value A→B) | search_code_source → anchor | find_callers if needed |
+| File dependencies | find_include_graph | — |
 
 ## Intent expansion
 
-**Before searching**, expand the user's intent into related terms that may appear in past query logs. Use world knowledge to generate synonyms, related class names, and likely search anchors. Pass these as `expanded_terms`.
+On first search of a new subsystem, pass `expanded_terms` with class/symbol names:
+- "Material architecture" → `["FMaterial","UMaterialInterface","MaterialResource","MaterialRenderProxy"]`
+- "Particle system" → `["FParticleEmitter","ParticleModule","ParticleSpawnInfo"]`
+- "Rendering pipeline" → `["FRenderer","RenderPass","FScene","FViewInfo","FRenderTarget"]`
 
-The key insight: do not search history only with the user's exact words. Past queries contain class names, file paths, and code symbols — not user prose.
+### Validated effectiveness (real-session data)
 
-Examples (from game engine codebase):
-- "Material architecture" → `expanded_terms=["FMaterial", "UMaterialInterface", "MaterialResource", "MaterialRenderProxy", "MaterialShared"]`
-- "Particle system" → `expanded_terms=["ParticleSystem", "FParticleEmitter", "ParticleModule", "ParticleSpawnInfo"]`
-- "Rendering pipeline" → `expanded_terms=["FRenderer", "RenderPass", "FScene", "FViewInfo", "FRenderTarget"]`
+| Term type | Example | Outcome |
+|-----------|---------|---------|
+| Concrete existing class name | `FMaterialUniformExpression`, `FMaterialRenderProxy` | ✅ Precise hit |
+| Non-existent class name | `FMaterialUniformBuffer` (correct name is `FUniformExpressionCache`) | ❌ 0 results, wasted slot |
+| Pure concept word | `MaterialParameters` | ❌ Noise — Slate/Decal results |
 
-Use expanded_terms on the **first search** of a new intent to maximize history hit rate. Subsequent searches in the same session build their own history automatically.
+### Rules
+- **Only use class names known to exist in the codebase** — don't guess names
+- **After first empty result**, if an expanded_term is confirmed non-existent, replace it immediately
+- Use symbols, not prose — past queries contain class names, not natural language.
+- **First search MUST include `module` param** to narrow to the core module (e.g., `module="Runtime"` or `module="Renderer"`), to exclude plugin noise like Interchange
 
-## Search strategy: Layer-first approach
+## Search strategy: Mandatory Layer table
 
-Before searching, identify the **layers** of the system you need to trace. For each layer, plan one search probe. This avoids blind keyword spraying.
-
-**Template** (internal, do not output to user):
-
-```
-INTENT: <one-sentence user intent>
-LAYERS:
-  - <layer>: <role>
-    MODE: discovery | call_trace | dependency
-    PROBE: <search query, with scope_filter if applicable>
-    EXTRACT: <anchor pattern or line range>
-```
-
-**MODE determines the primary tool**:
-- `discovery`: `search_code_source` (with `scope_filter`) → `get_file_content` anchor. For finding classes, structs, data types.
-- `call_trace`: `find_callers(symbol, scope=...)` directly. For execution flow, call chains, virtual dispatch.
-- `dependency`: `find_include_graph`. For file-level include relationships.
-
-**Rules**:
-1. Define layers before any tool call. Assign each layer a MODE.
-2. One probe per layer. Batch probes for independent layers in parallel.
-3. For `discovery` layers: add `scope_filter` to searches by default. Use `"class XXX : public"` anchor pattern (never guess the base class).
-4. For `call_trace` layers: use `find_callers` with `scope` — do NOT try to guess function signatures as anchors.
-5. Only extract after a probe narrows the file and location. **Always use anchor mode** for extraction.
-6. If a layer cannot be found, report what was searched — do not keep retrying variations.
-
-**Example** — tracing a rendering system architecture:
+**Before any tool call**, output a Layer table:
 
 ```
-INTENT: Analyze rendering material system architecture
-LAYERS:
-  - Asset layer: UMaterialInterface, UMaterial, UMaterialInstance
-    MODE: discovery
-    PROBE: raw_query='(file_path : "MaterialInterface.h") AND "class UMaterialInterface"'
-      scope_filter='{"block_type": "class"}'
-    EXTRACT: anchor="class UMaterialInterface : public"
-  - Compile layer: FMaterial, FMaterialResource
-    MODE: discovery
-    PROBE: raw_query='(file_path : "MaterialShared.h") AND "class FMaterialResource"'
-      scope_filter='{"block_type": "class"}'
-    EXTRACT: anchor="class FMaterialResource : public"
-  - Shader map layer: FMaterialShaderMapLayout
-    MODE: discovery
-    PROBE: raw_query='(file_path : "MaterialShaderMapLayout.h")'
-    EXTRACT: anchor="FMaterialShaderMapLayout"
-  - Render proxy layer: FMaterialRenderProxy
-    MODE: discovery
-    PROBE: raw_query='(file_path : "MaterialRenderProxy.h") AND "class FMaterialRenderProxy"'
-    EXTRACT: anchor="class FMaterialRenderProxy : public"
+LAYER TABLE:
+  1. [name] — [sub-problem type], MODULE=[Runtime/Renderer/...], PROBE=[tool call], EXTRACT=[method]
+  2. ...
 ```
 
-This plan costs ~4 searches (~10K tokens) + ~4 anchors (~500 tokens) = **~10.5K tokens** instead of 200K+ from unstructured full-file reads.
+`MODULE` is mandatory for the first layer's search_code_source call — narrow to the most relevant module (Runtime, Renderer, Engine, Core) to exclude plugin noise.
 
-**Example** — tracing a particle system architecture with call flow:
+**Budget hard limits** (enforced — stop at cap, do not justify exceeding):
 
-```
-INTENT: Analyze particle system architecture
-LAYERS:
-  - Asset layer: UParticleSystem, UParticleEmitter, UParticleComponent
-    MODE: discovery
-    PROBE: query="class UParticleSystem", module="Particles", scope_filter='{"block_type":"class"}'
-    EXTRACT: anchor="class UParticleSystem : public"
-  - Simulation layer: FParticleEmitterInstance
-    MODE: discovery
-    PROBE: query="FParticleEmitterInstance simulation execute", module="Particles"
-    EXTRACT: anchor="class FParticleEmitterInstance"
-  - Execution flow: How does tick → simulate → render work?
-    MODE: call_trace
-    PROBE: find_callers("ExecuteSimulation", scope="Particles")
-    EXTRACT: use returned block_range for line-range reads
-  - Data interface layer: UParticleDataInterface
-    MODE: discovery
-    PROBE: query="ParticleDataInterface", module="Particles"
-    EXTRACT: anchor="class UParticleDataInterface : public"
-```
+| Resource | Cap | When exceeded |
+|----------|-----|--------------|
+| Layers | 6 max | Stop adding layers; output remaining as "not explored" |
+| search_code_source | ≤5 calls | **Stop searching.** Summarize what was found, list unknowns. Do NOT add "just one more" |
+| get_file_content (anchor/range) | ≤5 calls | **Stop extracting.** Use snippets already fetched. Don't chase tangents |
+| find_callers | ≤1 call | Don't re-call; use block_range from results |
+| find_include_graph | ≤1 call | Don't re-call |
 
-This plan costs ~3 searches (~8K tokens) + 1 find_callers (~1K tokens) + ~3 anchors (~400 tokens) = **~9.4K tokens**. The call_trace layer directly reveals the execution pipeline instead of guessing anchors.
+**Real-session lesson**: A UE material pipeline trace used 12 searches / 25 extracts (5x over cap) because "one more look" kept seeming justified. The extra calls added noise (Interchange plugins), not signal. The budget is the signal-to-noise boundary — beyond it, you're reading noise.
 
-## Retrieval procedure
-
-1. **Expand intent** — Generate related terms from the user's request.
-2. **Classify each sub-question** as `discovery`, `call_trace`, or `dependency` (see decision matrix above).
-3. **For discovery** — Call `search_code_source` with keywords + expanded_terms + `scope_filter`.
-   - Simple: `search_code_source(query="GetGBuffer")`
-   - With scope_filter: `search_code_source(query="MySettings", module="MyModule", scope_filter='{"block_type": "class"}')`
-   - With expansion: `search_code_source(query="Material architecture", expanded_terms=["FMaterial", "UMaterialInterface"])`
-4. **For call_trace** — Call `find_callers(symbol, scope=...)` directly. Do NOT attempt anchor guessing for execution flow questions.
-   - `find_callers("Generate", scope="MyModule")` → reveals the execution trigger chain
-   - `find_callers("ExecuteInternal", scope="MyModule")` → reveals all concrete implementations
-5. **Read results** — Call `get_file_content` with **anchor mode** for promising files.
-   - `get_file_content(file_path="...", anchor="class FMyClass : public")` ← generic pattern, never guess base class
-   - Or use `block_range` from search/find_callers results: `get_file_content(start_line=X, end_line=X+50)`
-   - This costs ~125 tokens vs ~45,000 for a full file read
-6. **For dependency** — Call `find_include_graph` for file-level relationships.
-7. **Correct if needed** — Call `log_code_query` only if automatic feedback was wrong.
+**Retry limits**: Each failure mode gets 1 retry max. After retry → output "not found" and move to next layer.
 
 ## FTS5 raw_query syntax
 
@@ -260,56 +171,76 @@ This plan costs ~3 searches (~8K tokens) + 1 find_callers (~1K tokens) + ~3 anch
 | AND | `'"A" AND "B"'` |
 | OR | `'"A" OR "B"'` |
 | NOT | `'"A" NOT "B"'` |
-| Grouping | `'("A" OR "B") AND "C"'` |
 | Column filter | `'file_path : "BasePass"'` |
 
-Columns: `file_path`, `module_name`, `raw_content`. All terms must be 3+ characters. NEAR and prefix (`*`) do not work with trigram tokenizer.
+Columns: `file_path`, `module_name`, `raw_content`. All terms ≥3 chars (trigram). NEAR/prefix not supported.
 
-## Feedback loop
+## Common failure patterns
 
-The system maintains a closed feedback loop automatically:
-- `search_code_source` uses history as ranking signal (not filtering) — prevents confirmation bias
-- `get_file_content` records which files were actually useful (query_note)
-- Future similar searches are ranked higher based on this feedback
-- History signals include 30-day half-life time decay
+| Pattern | Fix |
+|---------|-----|
+| Natural language query → 0 results | Use 2-3 symbol names, each ≥3 chars |
+| Non-existent class name | Search broadly first, anchor on discovered names |
+| Term too short (1-2 chars) | All terms ≥3 chars for trigram FTS5 |
+| No expanded_terms on first search | Always pass class/symbol names |
+| Guessed base class in anchor | `"class XXX : public"` without base |
+| Guessed function name for execution flow | Use `find_callers` instead |
+| Searched .cpp for class declaration | Class is in .h — search with `file_path :` filter |
+| scope_filter was a dict (validation error) | Now accepts dict directly — no escaping needed. Prefer dict form. |
+| module filter returned empty | Drop module param and retry |
+| Repeated failed anchor | After **1 miss** → switch to block_range or different pattern. Do NOT try a 2nd anchor guess |
+| >5 searches with no new signal | Stop. Output what was found and what remains unknown |
+| First search flooded with plugin noise | Always include `module="Runtime"` or `module="Renderer"` to exclude Interchange/Plugin results |
+| expanded_term returned 0 hits | The class name doesn't exist. Drop it, don't keep it. Replace with a discovered name |
+| History pushes stale plugins to top | `history_refined` ranking can amplify noise from past sessions. Use `module` + `scope_filter` to override |
+| `module="Engine"` returns empty for Runtime files | `Engine/Source/Runtime/*` files belong to `module="Runtime"`, NOT `"Engine"`. "Engine" is a directory name, not the MCP module name. Check the file path: `Engine/Source/Runtime/<ModuleName>/` → use that `ModuleName` |
 
-## Output expectations
+## Two search modes: exact symbol vs exploratory
 
-- Candidate file paths and module names with compact snippets
-- For deep analysis, use `get_file_content(anchor=...)` — not full file reads
-- Block type/name from bracket skeleton
-- Line ranges and caller line numbers for further reading
-- `source` field indicating history-accelerated or full-scan results
-- Note when DB indexing is needed
+The filtering strategy depends on whether you're searching for a **known symbol name** or **exploring a concept**.
 
-## Common search failure patterns
+### Mode A: Exact symbol — `module` is everything, skip `scope_filter`
 
-| Pattern | Example | Fix |
-|---|---|---|
-| **Long natural-language query** | `"GPU simulation compute dispatch execution"` → 0 results | Use 2-3 trigram-friendly terms: `"GpuCompute GPU dispatch"` |
-| **Non-existent class name** | Searching for a class you inferred but doesn't exist | First search broadly, then use discovered class names as anchors |
-| **class vs struct mismatch** | `anchor="class FMyData"` → not found (it's a struct) | Try `anchor="struct FMyData"` for data types |
-| **Term too short** | Single/double char terms silently fail | All terms must be ≥3 characters for trigram FTS5 |
-| **Empty expanded_terms** | First search with no history → generic ranking | Always use `expanded_terms` on first search of a new subsystem |
-| **Guessing base class in anchor** | `anchor="class MyComponent : public BaseClass"` → not found (wrong base) | Use `"class MyComponent : public"` without specifying base class |
-| **Guessing function names for execution flow** | `anchor="ExecuteGraphTask"` → not found | Use `find_callers` with `scope` instead. Anchor guessing for execution flow has ~60% failure rate |
-| **Searching .cpp for class declarations** | `get_file_content("Component.cpp", anchor="class MyComponent")` → not found | Class declarations are in `.h` files, `.cpp` has implementations only |
-| **No scope_filter on broad searches** | `query="MySettings"` returns implementations, tests, and declarations mixed | Add `scope_filter='{"block_type":"class"}'` to get only declarations |
-| **Repeated identical failed anchor** | Same anchor tried twice with same result | After one anchor failure, switch strategy: use line-range read, or different anchor pattern |
+When the function/class name is already known, the symbol name itself provides near-perfect selectivity — only a handful of hits exist. The only filter that matters is `module`, and getting it wrong costs a wasted round-trip.
+
+- **`module`**: Critical. Wrong module → 0 results. Derive it from the file path, not the top-level directory name. `Engine/Source/Runtime/Engine/...` → `module="Runtime"`.
+- **`scope_filter`**: Useless. A unique function name already means "a function"; filtering by `block_type` adds zero signal.
+- **`limit`**: Default 20 is more than enough.
+
+### Mode B: Exploratory — `module` + `scope_filter` earn their keep
+
+When searching a broad concept, results can number in the thousands. Here `module` narrows the haystack and `scope_filter` prunes by structural type (class vs function vs macro).
+
+- **`module`**: Critical. Narrows from thousands to hundreds by excluding plugins.
+- **`scope_filter`**: High value. Narrows from hundreds to tens by restricting to the relevant block type.
+- **`raw_query` column filter**: Fallback when scope_filter errors.
+
+### Decision rule
+
+- **Known exact symbol name** → Mode A: `module` only, skip `scope_filter`
+- **Concept/pattern exploration** → Mode B: `module` + `scope_filter`
+- **Searching for a type definition** → Mode B: `scope_filter={"block_type":"class"}` is essential
+
+## History signals: when they help and when they hurt
+
+History boosts ranking of previously-clicked files. This is a **double-edged signal**:
+
+| Scenario | Effect |
+|----------|--------|
+| Re-searching a known subsystem | ✅ Faster hit on already-discovered files |
+| New search in an unexplored area | ✅ Neutral — FTS still dominates |
+| Past session clicked noisy plugin files | ❌ Noisy results persist across sessions — `history_refined` keeps pushing them up |
+
+**Countermeasure**: When `source: "history_refined"` appears on files you don't recognize (e.g., Interchange plugins), those are stale signals. Use `module` and `scope_filter` to aggressively narrow scope and drown them out.
 
 ## Verified token efficiency
 
-From past analysis sessions on large C++ codebases:
+| Approach | Calls | Tokens |
+|----------|-------|--------|
+| Full-file reads (~18 files) | ~18 | ~810,000 |
+| Random unstructured search | ~30 | ~78,000 |
+| Layer-first + bracket (target) | ~16 | ~10,000 |
 
-| Approach | Calls | Tokens | Notes |
-|---|---|---|---|
-| Full-file reads (~18 files) | ~18 | ~810,000 | Slow, context overflow |
-| Random unstructured search | ~30 | ~78,000 | Moderate |
-| **Layer-first + anchor** | ~37 | **~26,000** | **Fast, complete** |
-| **Layer-first + bracket** (projected optimal) | **~16** | **~10,000** | scope_filter + find_callers + generic anchors |
-
-Key findings from efficiency analysis:
-- **34% of tool calls** in a non-bracket session were avoidable failures: wrong base class guesses, wrong function name guesses, fictitious class name searches, duplicate reads
-- **scope_filter** alone reduces search noise by ~3,000 tokens across a typical session
-- **find_callers** directly reveals execution chains in 1 call (~1K tokens) vs 4+ failed anchor attempts
-- **Generic anchor pattern** `"class XXX : public"` has 100% success rate vs 50% for guessed base classes
+- 34% of tool calls in unstructured sessions were avoidable failures
+- scope_filter reduces noise by ~3K tokens/session
+- Generic anchor `"class XXX : public"` has 100% success rate
