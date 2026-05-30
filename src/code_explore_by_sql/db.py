@@ -892,12 +892,54 @@ def _snippet_to_line_numbers(
     return lines
 
 
+def _locate_hit_block(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+    *,
+    bracket_cache: dict[int, list[dict[str, Any]]] | None = None,
+    content_cache: dict[int, str] | None = None,
+) -> dict[str, Any] | None:
+    """Locate the enclosing bracket block for an FTS hit.
+
+    Shared by _cluster_results and _apply_scope_filter.
+    Returns the depth=1 bracket block dict, or None.
+    """
+    import bisect as _bisect
+
+    fid = result["id"]
+    brackets = (bracket_cache or {}).get(fid)
+    if brackets is None:
+        brackets = load_bracket_index(conn, fid, depth=1)
+
+    content = (content_cache or {}).get(fid)
+    if content is None:
+        row = conn.execute(
+            "SELECT raw_content FROM source_files WHERE id = ?", (fid,)
+        ).fetchone()
+        content = row["raw_content"] if row else None
+
+    if not content or not brackets:
+        return None
+
+    hit_lines = _snippet_to_line_numbers(content, result["snippet"])
+    if not hit_lines:
+        return None
+
+    block = find_enclosing_block(brackets, hit_lines[0], max_depth=1)
+    if block is None:
+        opens = [b["open_line"] for b in brackets]
+        idx = _bisect.bisect_right(opens, hit_lines[0])
+        if idx < len(brackets) and brackets[idx]["open_line"] - hit_lines[0] <= 20:
+            block = brackets[idx]
+    return block
+
+
 def _cluster_results(
     conn: sqlite3.Connection, fts_results: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Cluster FTS results by enclosing code block using bracket skeleton.
 
-    Uses snippet-to-line-number mapping to find the precise enclosing block
+    Uses _locate_hit_block to find the precise enclosing block
     for each hit, then merges hits in the same block into one result.
     """
     if not fts_results:
@@ -907,7 +949,7 @@ def _cluster_results(
 
     file_ids = list({r["id"] for r in fts_results})
 
-    # Batch-load raw_content for snippet line number extraction
+    # Batch-load raw_content and bracket indices
     id_list = ",".join(str(fid) for fid in file_ids)
     content_map: dict[int, str] = {}
     for row in conn.execute(
@@ -915,36 +957,17 @@ def _cluster_results(
     ):
         content_map[row["id"]] = row["raw_content"]
 
-    # Batch-load bracket indices for all involved files
     bracket_cache: dict[int, list[dict[str, Any]]] = {}
     for fid in file_ids:
         bracket_cache[fid] = load_bracket_index(conn, fid, depth=1)
 
-    # Group results by enclosing block using precise line numbers
-    import bisect
-
+    # Group results by enclosing block
     clusters: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
 
     for r in fts_results:
-        content = content_map.get(r["id"])
-        brackets = bracket_cache.get(r["id"], [])
-
-        hit_lines = _snippet_to_line_numbers(content, r["snippet"]) if content else []
-
-        block = None
-        if hit_lines and brackets:
-            block = find_enclosing_block(brackets, hit_lines[0], max_depth=1)
-            # Fallback: hit may be on the declaration line before '{'.
-            # Find the nearest block whose open_line follows the hit line.
-            if block is None:
-                opens = [b["open_line"] for b in brackets]
-                idx = bisect.bisect_right(opens, hit_lines[0])
-                if idx < len(brackets):
-                    # Only accept if within a reasonable lookback (20 lines)
-                    candidate = brackets[idx]
-                    if candidate["open_line"] - hit_lines[0] <= 20:
-                        block = candidate
-
+        block = _locate_hit_block(
+            conn, r, bracket_cache=bracket_cache, content_cache=content_map
+        )
         key = (r["id"], block["open_line"]) if block else (r["id"], 0)
         clusters[key].append(r)
 
@@ -1014,7 +1037,8 @@ def search_source_with_feedback(
                 terms.append(t)
 
     # Step 1: Full FTS5 search with expanded limit for ranking headroom
-    all_results = _search_fts(conn, fts_query, module, limit=limit * 5)
+    overfetch = limit * 10 if scope_filter else limit * 5
+    all_results = _search_fts(conn, fts_query, module, limit=overfetch)
 
     # Step 2: History signals (ranking only, not filtering)
     history_scores = _get_history_signals(conn, terms)
@@ -1029,7 +1053,7 @@ def search_source_with_feedback(
 
     all_results.sort(key=lambda r: -r["final_score"])
 
-    # Step 4: Optional scope filtering using bracket_index
+    # Step 4: Optional scope filtering using bracket_index (hit-level)
     if scope_filter:
         _apply_scope_filter(conn, all_results, scope_filter)
 
@@ -1049,7 +1073,12 @@ def _apply_scope_filter(
     results: list[dict[str, Any]],
     scope_filter: dict[str, str],
 ) -> None:
-    """Remove results whose enclosing block doesn't match scope_filter."""
+    """Remove results whose enclosing block doesn't match scope_filter.
+
+    Uses _locate_hit_block for hit-level matching: only filters out results
+    whose FTS hit falls inside a non-matching block, rather than checking
+    if the file contains any matching block (file-level).
+    """
     allowed_types = set()
     if "block_type" in scope_filter:
         allowed_types.add(scope_filter["block_type"])
@@ -1058,25 +1087,16 @@ def _apply_scope_filter(
 
     to_remove = []
     for i, r in enumerate(results):
-        brackets = load_bracket_index(conn, r["id"], depth=1)
-        if not brackets:
-            # No structural data — keep if no strict filtering
+        block = _locate_hit_block(conn, r)
+        if block:
+            type_ok = (not allowed_types) or (block["block_type"] in allowed_types)
+            name_ok = (not target_name) or ((block.get("block_name") or "").lower() == target_name)
+            if not (type_ok and name_ok):
+                to_remove.append(i)
+        else:
+            # No block info — remove if type filtering is active
             if allowed_types:
                 to_remove.append(i)
-            continue
-
-        # Check if any top-level block in this file matches the scope
-        matched = False
-        for b in brackets:
-            if allowed_types and b["block_type"] not in allowed_types:
-                continue
-            if target_name and (b.get("block_name") or "").lower() != target_name:
-                continue
-            matched = True
-            break
-
-        if not matched:
-            to_remove.append(i)
 
     for i in reversed(to_remove):
         results.pop(i)

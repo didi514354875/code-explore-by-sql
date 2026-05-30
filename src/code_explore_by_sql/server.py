@@ -105,6 +105,10 @@ def search_code_source(
             return [{"error": f"FTS5 query error: {exc}", "query": raw_query or query}]
 
 
+MAX_LINE_SPAN = 200
+MAX_CONTEXT_CHARS = 5000
+
+
 @mcp.tool()
 def get_file_content(
     file_path: str,
@@ -123,6 +127,8 @@ def get_file_content(
 
     Automatically records feedback when the file was in recent search results.
     """
+    context_chars = min(context_chars, MAX_CONTEXT_CHARS)
+
     with _conn() as conn:
         if anchor is not None:
             result = get_source_anchored(conn, file_path, anchor, context_chars)
@@ -140,22 +146,35 @@ def get_file_content(
                 "total_chars": result["total_chars"],
                 "content": result["content"],
             }
+
+        # Require anchor or line range — full-file read is disabled
+        if start_line is None and end_line is None:
+            return {"found": False, "file_path": file_path,
+                    "error": "anchor or start_line/end_line required"}
+
         row = get_source_by_path(conn, file_path)
         if row is None:
             return {"found": False, "file_path": file_path}
         content = row["raw_content"]
-        if start_line is not None or end_line is not None:
-            lines = content.splitlines()
-            start = max(1, start_line or 1)
-            end = min(len(lines), end_line or len(lines))
-            content = "\n".join(lines[start - 1 : end])
+
+        lines = content.splitlines()
+        start = max(1, start_line or 1)
+        end = min(len(lines), end_line or len(lines))
+        actual_span = end - start
+        content = "\n".join(lines[start - 1 : end])
+
         record_feedback(conn, file_path)
-        return {
+        result = {
             "found": True,
             "file_path": row["file_path"],
             "module_name": row["module_name"],
             "content": content,
+            "total_lines": len(lines),
         }
+        if actual_span > MAX_LINE_SPAN:
+            result["truncated_warning"] = True
+            result["read_lines"] = f"{start}-{end}"
+        return result
 
 
 @mcp.tool()
