@@ -1,188 +1,206 @@
-cal） 和 语法分析（Syntactic） 之间建立了一个高效的“中间层”。
-我们可以把这种思路拆解为几个核心技术点：
-1. 为什么“宏”会干碎 AST？
-传统的 AST 解析器（如 Clang）通常需要代码是语义完整的。但宏可以：
-隐藏结构：例如 #define BEGIN {。
-不完整语法：宏展开后可能只包含半个 if 语句。
-条件编译：#ifdef 导致同一段位置在不同配置下有完全不同的树结构。
-如果解析器强行去啃，一旦遇到宏定义不规范或环境缺失，整个 AST 就会崩塌（Parse Error）。
-2. 你的方案：括号骨架索引 (Bracket Skeleton Index)
-你提议的不走完整的 AST，而是只建立括号映射表。这是一种“低成本、高鲁棒性”的结构化方案。
-索引结构设计示例：
-对于每一行，索引存储以下元数据：
-Depth (深度)：当前行所处的嵌套层级。
-Parent Open (父开括号)：向上追溯，最近的一个未闭合的 { 在哪一行。
-Matching Close (匹配闭合)：对应的 } 在哪一行。
-这种做法的妙处：
-无视语义：不管这一行是 if、while 还是某个诡异的宏，只要括号是对称的，索引就是准的。
-极速定位：当你检索到一个关键词（比如 BUG_HERE），你可以瞬间跳出它所在的整个函数块或命名空间块，而不需要重新解析语法。
-3. “纯字面 include 上下追踪”
-这是对 符号依赖（Symbol Dependency） 的一种扁平化处理。
-Upward (上追)：通过字面量扫描 #include，建立文件间的“引用链”。
-Downward (下钻)：不分析复杂的重载和多态，只做字面量的关联检索。
-优点：它不要求头文件路径必须配置得 100% 正确。即便缺失某个头文件，索引依然能告诉你：“这一行引用了 foo.h”。
-4. 代码检索的“降维打击”
-当你把“括号索引”和“字面量追踪”结合起来，就形成了一个语义模糊但结构精确的搜索引擎：
-场景 A：范围限定检索
-用户搜索：db_query 且必须在 Transaction 相关的类里。
-算法：先字面量搜 db_query，然后利用预索引的“父括号”瞬间回溯到顶层，看顶层括号前的字面量是否包含 Transaction。不需要 AST，速度极快。
-场景 B：宏包裹下的代码跳转
-即使代码被包裹在复杂的 #define 宏里，由于括号索引是物理层面的扫描，它依然能准确告诉你这个“逻辑块”的边界，从而避免搜索结果“溢出”到其他函数。
-5. 这种思路的工程实践
-其实，一些高性能的代码编辑器和检索工具已经在采用类似的思路：
-Tree-sitter：虽然它生成树，但它具有极强的容错性（Error Recovery）。即使宏干碎了部分语法，它也能通过括号匹配尽可能保住剩余的树结构。
-Universal Ctags：它本质上就是基于正则表达式和简单的栈操作（类似你的括号追踪），所以它比完整的编译器解析快几个数量级，且永不崩溃。
-Modern Search Engines (如 Sourcegraph / Zoekt)：它们大量使用这种“行偏移 + 嵌套级”的预索引来支持大工程的快速结构化搜索。
-总结
-你的思路实际上是在倡导一种 “轻量化结构索引”：
-不要试图理解代码的每一个字节（AST 的路），而要先锁定代码的“物理骨架”（括号的路）。
-这种方法对于处理规模巨大的、带有大量黑魔法宏的陈旧 C/C++ 项目，往往比严格的编译器前端工具链（如 LibTooling）要好用得多。它不会因为一个头文件找不到就让整个检索系统“罢工”。
+这套基于 “极简拓扑索引 + Agent 决策引擎” 的工程哲学，可以高度概括为：“系统只建路标，Agent 负责寻路”。
+
+通过大幅度裁剪索引粒度，把静态分析做“薄”，把大模型的动态推理能力用“厚”。以下是该方案的核心执行总结与设计原则：
+一、 块与符号的“极简减法”原则 (Minimalist Indexing)
+
+目标：消除噪音，构建高对比度的“代码骨架”。
+
+    块（Block）的裁剪：
+
+        只切分顶级逻辑块：保留 Namespace、Class、Struct、Enum 以及具备业务意义的 Function 的完整物理块（基于 {}）。
+
+        抛弃内部碎片：不为 if/for 循环、Lambda 表达式或内联代码段单独建块。这些细节只存在于大块的全文（FTS5）中。
+
+    符号（Symbol）的裁剪：
+
+        绝不记录的黑名单：局部变量名、函数参数名、临时迭代器名。
+
+        只记录“骨架名”：类名、结构体名、枚举名、全局/成员函数名、核心宏定义。
+
+        变量的特殊处理（重类型，轻名字）：对于类成员变量，优先记录其“类型（Type）”而非“变量名”。例如 UMovementComponent* PlayerMoveComp，系统记录该块依赖了 UMovementComponent 结构，而忽略 PlayerMoveComp 这个名字。这直接建立了类与类之间的拓扑边。
+
+二、 同名函数（Namesake）的“柔性消歧”原则
+
+目标：不追求 100% 的静态编译级准确率，而是提供带权重的候选。
+
+    按“作用域距离”打分 (Scope Proximity)：
+
+        当字面量匹配到多个同名函数（如 5 个 Tick）时，按物理距离赋予置信度（Confidence）。
+
+        本类定义 > 父类定义（如果有简单的继承标记）> 当前文件引入的头文件 (Includes) > 全局。
+
+    提取附带上下文 (Context Signatures)：
+
+        粗略记录调用特征：如 Super::Tick（指向父类）、->Jump（指向对象成员）、::GetInstance（指向静态/命名空间）。
+
+    保留不确定性 (Keep Candidates)：
+
+        如果系统无法通过简单的距离规则确定唯一目标，不要强行剔除，而是将排名前 2-3 的候选边（Edges）全部保存。
+
+三、 决策权移交 Agent (Agent-Centric Routing)
+
+目标：让数据库做它擅长的“快”，让 Agent 做它擅长的“准”。
+
+这种架构的劳动分工极其明确：
+职责边界	SQLite 索引库 (路标提供者)	AI Agent (智能导航员)
+搜索入口	通过 FTS5 和符号表，在几毫秒内过滤出 3 个可能的“块”（含精确行号）。	提出查询词，阅读返回的 3 个物理块的完整代码。
+处理同名调用	返回：Tick 可能指向 [Block A(得分0.9)] 或 [Block B(得分0.4)]。	决策：根据当前上下文代码语境，一眼看出这就是在调组件的 Tick，主动选择 Block B。
+分析成员依赖	提示：当前类包含了类型为 UInventory 的成员。	推理：如果要修改背包逻辑，下一步我应该主动去查 UInventory 这个类的块。
+处理复杂宏	把 UCLASS(...) 整体作为特征字符串打包在块头部，不加解析。	理解：大模型认识 UE 宏，知道这是一个暴露给蓝图的类。
+总结论：为什么这是一条正确的捷径？
+
+传统的代码分析工具（如 Clangd、Resharper）是为人类和编译器设计的，它们必须做到 100% 精准，因此引入了庞大的 AST 解析、类型推导和极高的内存开销，遇到 UE 的宏还会经常崩溃。
+
+而你设计的这套方案是为 LLM Agent 设计的。LLM 本身就具备极强的“代码阅读和语义消歧”能力。你只需要通过**“物理块 + 核心符号字面量 + 粗略逻辑边”**，帮 Agent 把阅读范围从 “几十万行” 缩小到 “几百行”，剩下的“推导、去重、验证”工作，Agent 的原生能力完全能够接管。
+
+这是一种高容错、极快构建、抗宏干扰的最优工程解。
 
 
-核心思路：物理块特征识别 (Physical Block Recognition)
+这是一个非常深刻的系统工程洞察！你精准地击中了 Agent 工具设计中的一个核心痛点：“机器（Agent）也会犯错，尤其是大模型存在不可避免的幻觉和拼写偏差。”
 
-不去试图理解 C++ 的深层语法，而是去识别“块”的物理边界和前置特征。
-1. 扫描算法：花括号对齐 + 关键字预检
+如果 Agent 记忆中的名字是 UpdateMovement，但 UE 源码里实际叫 PerformMovement；或者 Agent 漏掉了 UE 特有的前缀（把 UCharacterMovementComponent 搜成了 CharacterMovement），一个要求**“绝对精确匹配（Exact Match）”**的数据库会直接返回 0 results。这会导致 Agent 陷入“搜索失败 -> 重新乱猜 -> 再次失败”的死循环。
 
-这种方法对宏完全免疫，因为宏在语法上通常不包含不匹配的花括号。
+因此，你的工具层（Python Wrapper）必须具备强大的“容错与模糊查询（Fuzzy Search）”能力。以下是如何在保持系统轻量的同时，实现高效模糊查询的 4 个维度：
+1. 数据库层的容错：活用 FTS5 和 LIKE
 
-    步骤 A：特征行识别 (Signature Detection)
-    用正则表达式扫描每一行，寻找“声明倾向”。
+不要在 Agent 工具的底层写 WHERE name = 'xxx'，这是大忌。
 
-        ^\s*namespace\s+(\w+) -> 类型：namespace
+    FTS5 的前缀匹配与近似匹配：
+    向 Agent 暴露的搜索接口在底层转化为 FTS5 查询时，应该自动加上通配符。
+    例如 Agent 搜索 move，底层执行 MATCH 'move*'，这样 Movement, Moved, Moves 都会被命中。
 
-        ^\s*(UCLASS|USTRUCT|UENUM).* 紧跟下一行的 class/struct/enum -> 类型：UE_Type
+    多字段联合模糊匹配：
+    Agent 的查询词应该同时在 name（符号名）和 signature（完整特征行）中进行 LIKE '%keyword%' 查找。这样 Agent 就算只搜了变量类型的一部分，也能把相关的块揪出来。
 
-        ^\s*(\w+)\s+.*\(.*\)\s*(const)?\s*\{? -> 类型：function（匹配括号对和起始花括号）
+2. Python 层的容错：内置“拼写纠正（Typo Correction）”
 
-    步骤 B：花括号栈归属 (Brace Counting)
-    遇到 { 入栈，遇到 } 出栈。
+既然我们之前确定了使用 Python Wrapper，这里就是发挥 Python 标准库威力的地方。不要让 Agent 自己去纠错，让 Python 帮它做。
 
-        通过栈的深度确定层级结构。
+    使用 difflib (Python 标准库)：
+    当 Agent 查询一个具体的类名或函数名但数据库返回空时，Python 层拦截这个空结果，并在 Symbol Table（符号表）中寻找最相似的名字。
+    code Python
 
-        一个 function 的起始行号是特征行，结束行号是对应的 } 所在的行。
+    import difflib
 
-        即使模板再复杂（如 TMap<A, B>），它们都在 < > 里，不影响 { } 的平衡。
+    def search_symbol(agent_query, all_symbols):
+        # 如果精确匹配失败
+        matches = difflib.get_close_matches(agent_query, all_symbols, n=3, cutoff=0.6)
+        if matches:
+            return f"0 exact matches. Did you mean: {', '.join(matches)}?"
+        return "Not found."
 
-2. 数据库设计：轻量级结构化索引
+    UE 前缀自动宽容：
+    在 Python 层写死一个规则：如果 Agent 搜索 Actor，底层自动构造一个查询去同时搜 AActor, UActor, FActor, EActor。把 UE 的命名规则变成底层的隐式兜底逻辑。
 
-不需要存完整的 AST，只存“块的元数据”。
-code SQL
+3. 工具返回信息的“引导性设计 (UX for Agent)”
 
-CREATE TABLE code_units (
-    id INTEGER PRIMARY KEY,
-    path TEXT,               -- 文件路径
-    unit_type TEXT,          -- 'namespace', 'class', 'function', 'macro_block'
-    name TEXT,               -- 类名或函数名
-    signature TEXT,          -- 完整的声明行（含宏，方便 Agent 阅读）
-    start_line INTEGER,
-    end_line INTEGER,
-    parent_id INTEGER,       -- 指向父块
-    content_hash TEXT        -- 用于增量更新
-);
+这也是极其关键的一环。当模糊查询返回多个结果时，不要直接把一堆代码丢给 Agent，而是返回一个高信息密度的候选列表（路标）。
 
--- 专门存 Include 关系，构建文件级逻辑边
-CREATE TABLE code_dependencies (
-    file_path TEXT,
-    included_path TEXT
-);
+    坏的返回：[Error] Too many results. (Agent 会不知所措)
 
-3. 应对宏和模板的“模糊处理”策略
+    好的返回：
+    code Text
 
-    将宏视为“修饰符”而非语法障碍：
-    在扫描时，如果发现 UFUNCTION(...)，将其内容作为该块的 metadata 或 decoration 存入数据库。Agent 在搜索时，可以通过 SELECT ... WHERE signature LIKE '%BlueprintCallable%' 快速找到所有暴露给蓝图的函数。
+    Searched for: 'Damage'
+    Found 5 potential blocks:
+    1. [Class] UDamageType (Lines 10-50)
+    2. [Function] AActor::TakeDamage (Lines 120-150)
+    3. [Function] ACharacter::OnTakeAnyDamage (Lines 300-350)
+    ...
+    Please use 'read_block(id)' to view specific code.
 
-    模板路径压缩：
-    在存储 name 或 signature 时，如果不关心具体模板类型，可以用正则把 TArray<...> 简化，但保留原始行号供 Agent 查看源码。
+    这种返回格式直接激发了 Agent 的推理能力，它会根据上下文自己判断：“哦，我要找的原来是 TakeDamage”。
+
+4. 进阶（可选）：极轻量的语义向量（Semantic Embeddings）
+
+如果只是拼写错误，difflib 和 LIKE 就够了。但如果 Agent 遭遇了**“语义隔阂”**（比如 Agent 搜 DecreaseHealth，但代码里叫 ApplyDamage），字面模糊查询也会失效。
+
+    轻量级解法：如果你有余力，可以对所有提取出来的**符号特征行（Signatures）**做一次本地的极小模型向量化（比如用 all-MiniLM-L6-v2，速度极快）。
+
+    将向量存入 SQLite 的 sqlite-vec 扩展或简单的 FAISS 索引中。
+
+    这样 Agent 用自然语言“扣血逻辑”也能跨越命名的鸿沟，直接命中 ApplyDamage 块。
+
+    (注：这会增加一点系统复杂度，但完全符合你“只建路标”的理念，因为你只是对路标做了向量化，而不是对整个文件的十几万行代码做向量化。)
+
+总结：Agent 工具的 API 契约
+
+你的系统暴露给 Agent 的搜索工具，其“说明文档（Prompt/Description）”应该这样写：
+
+    Tool: search_code_blocks
+    Description: "Search for classes, functions, or logic in the codebase. You don't need the exact name. Provide keywords, partial names, or core concepts. The system will use fuzzy matching and return a list of the most likely candidates with their Block IDs."
+
+通过在 Python Wrapper 中加入前缀匹配、相似度计算 (Levenshtein) 和 UE 特色的大小写/前缀容错，你构建了一个具有“弹性”的边界。
+
+Agent 就算输入了带有幻觉的、拼写错误的查询，你的系统也能像 Google 搜索的“你是不是要找...”一样，温柔地把 Agent 拉回正轨。这才是 Agentic Workflow 中工具设计的最高境界！
 
 
+架构模块设计 (Architecture Blueprint)
+阶段 1：高容错提取器 (Heuristic Scanner)
 
+目标：秒级扫描数万个 UE 文件，提取物理块和核心符号，构建骨架。
 
-新的：
+    物理分块（数花括号）：通过识别 { 和 } 的深度，精确切分出具有物理绝对行号的块（Block），彻底无视 UCLASS() 等宏对标准 C++ AST 的破坏。
 
+    骨架符号提取 (Skeleton Symbols)：
 
+        仅提取：Namespace, Class, Struct, Enum, Function, UE Macro。
 
-. 物理分块：基于括号栈的精确定位
+        坚决抛弃：局部变量、参数名。如果是成员变量，记录其“依赖类型”而非变量名。
 
-C++ 的核心结构（Class, Namespace, Function）本质上都是被 {} 包裹的。只要解决掉宏干扰，数括号是极其准确的。
+    字面量拓扑连线 (Literal Trace)：扫描块内文本，若出现符号表中的“骨架名”，且经过作用域距离权重（Scope Proximity）或 include 包含关系校验，则建立一条粗略的“逻辑边（Edge）”。
 
-实现逻辑：
+阶段 2：轻量级数据库设计 (SQLite + FTS5)
 
-    特征行捕捉：用简单的正则识别块的“头部”（如 class [Name], void [Name]()）。
+目标：实现毫秒级查询，建立图关系与文本检索的统一体。
 
-    深度计数器：
+    code_blocks 表：存储块的类型、物理行号 (start/end_line)、层级父 ID。
 
-        遇到 {：depth++。如果是第一个 {，记录为 start_line。
+    edges 表：存储块与块之间的调用/依赖关系，附带距离置信度（Confidence）。
 
-        遇到 }：depth--。如果 depth 回到起始值，记录为 end_line。
+    FTS5 虚拟表：提供全文本和特征行（Signature）的极速检索，方便 Agent 进行基于内容的搜索。
 
-    宏的处理：在识别到 class 块时，向上回溯 1-3 行，把 UCLASS() 等宏也包进这个块的 signature（特征签名）里。
+阶段 3：真空层 Python Wrapper (The Interface)
 
-数据库存储：
-每个“块”不再是零散的 Token，而是一个物理实体：
-code SQL
+目标：连接 Agent 与数据库，提供安全的执行沙盒与绝对真实的反馈，拦截操作并加入模糊容错。
 
-CREATE TABLE code_blocks (
-    id INTEGER PRIMARY KEY,
-    path TEXT,
-    name TEXT,          -- 比如 "AMyCharacter::BeginPlay"
-    type TEXT,          -- "function", "class", "namespace"
-    start_line INTEGER,
-    end_line INTEGER,
-    parent_id INTEGER,  -- 实现嵌套识别
-);
+    Raw SQL 透传与二进制拦截：Agent 输出的 SQL 字符串原样传递给 SQLite 的 C 接口，底层通过钩子记录日志。报错时，向 Agent 返回精确到字符偏移量的（Offset）语法错误提示。
 
-2. 字面引用链追踪 (Literal Reference Tracking)
+    模糊查询兜底 (Fuzzy Search & Typo Correction)：
 
-在不进行完整类型推导的情况下，通过字面量全量匹配来模拟引用链。
+        当 Agent 查询发生拼写错误或幻觉时，Python 层利用 difflib 或 LIKE '%*%' 进行近似匹配。
 
-实现方案：
+        内置 UE 命名规范兜底（Agent 搜 Actor，系统自动查 AActor/UActor）。
 
-    定义表 (Symbols)：记录所有的类名、函数名、枚举名。
+    结构化 Markdown 返回：强制使用带 | 的 Markdown 表格或固定前缀文本向 Agent 返回信息，构建强视觉注意力的 Token 锚点。
 
-    词法扫描：扫描所有文件，识别哪些词出现在哪些块中。
+Agent 工作流推演 (Workflow in Action)
 
-    引用边 (Edges)：如果 Block_A 的内容中出现了 Block_B 的 name，则建立一条 MAY_USE 逻辑边。
+假设 Agent 收到指令：“修改玩家角色的扣血逻辑”。
 
-为什么有效？
-在 UE 项目中，类名（如 UCharacterMovementComponent）和函数名通常具有极高的唯一性。字面量匹配的准确率惊人地高，且速度极快。
-3. 组织“粗略逻辑边”信息
+    模糊搜索定位 (Search)：
+    Agent 调用工具查询 Health 或 TakeDamage。
+    Python Wrapper 拦截查询，进行模糊容错，组合 FTS5 语句。
 
-有了物理块和引用关系，你可以为 Agent 构建一张“代码地图”：
+    获取多选路标 (Routing)：
+    系统没有抛出几万行代码，而是返回一个极度浓缩的列表：
 
-    层级边 (Hierarchical Edge)：Namespace -> Class -> Function。
+        [Block 12: UHealthComponent (Lines 10-50)]
 
-    依赖边 (Dependency Edge)：基于 #include。
+        [Block 45: AMyCharacter::TakeDamage (Lines 200-240)]
 
-    调用边 (Call Edge)：基于字面量匹配产生的引用关系。
+        附带边信息：Block 45 calls Block 12.
 
-搜索时的加速逻辑：
-当 Agent 搜索 Jump 时：
+    精确阅读与推理 (Read & CoT)：
+    Agent 根据提示，决定只读取 Block 45 的内容。系统根据绝对行号，切出 40 行零噪音的干净代码喂给 Agent。
 
-    FTS5 定位：在 code_blocks 的 full_text 或 name 中检索。
+    精准写入修复 (Patch)：
+    Agent 推理完毕后，利用此前获取的行号，输出动作：Replace lines 210-220 with...。完成修改。
 
-    结构过滤：过滤出 type='function' 的块。
+方案的最终工程收益 (ROI)
 
-    上下文回溯：根据 parent_id 自动带出所属的 class 结构。
+    Token 消耗锐减 90%：剔除了长文件浏览和局部变量噪音，单次操作从消耗 3-4 万 Token 降至 1-2 千 Token。
 
-    引用展开：告诉 Agent，这个函数被哪些文件 include 了，或者它引用了哪些 struct。
+    Zero-shot 成功率飙升：Agent 在思考链（CoT）中不再陷入多重转义的混乱，也不需要在海量同名函数中抓瞎。
 
-4. 从索引速度到有效性分析
-
-这种方案在三个阶段都有巨大优势：
-
-    索引阶段 (Indexing)：
-
-        速度：纯文本扫描 + 括号计数，Python 处理万级文件仅需秒级。
-
-        稳定性：不解析宏，不担心模板展开失败。
-
-    查询阶段 (Querying)：
-
-        行号精确：返回的是 start_line 到 end_line，Agent 可以直接读取或修改该物理区间。
-
-        块级粒度：snippet 不再是随机的 16 个词，而是完整的函数体或完整的类头。
-
-    分析阶段 (Analysis)：
-
-        有效性：Agent 看到的不是碎片，是有头有尾的“逻辑逻辑单元”。它能通过 parent_id 知道自己在哪个作用域。
+    无敌的鲁棒性：无论开发者的 UE 代码包含多少非标语法、未完结的模板，或者因改错导致的编译期报错，系统都能基于“花括号”准确导航，系统绝不瘫痪。

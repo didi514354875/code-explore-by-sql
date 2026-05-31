@@ -2,11 +2,14 @@
 
 Uses a finite state machine to track brace depth while correctly ignoring
 braces inside comments, string literals, character literals, and raw strings.
+
+Provider-agnostic: accepts BracketScannerConfig for customizable delimiters.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from code_explore_by_sql.block_model import BracketBlock
 
 # FSM states
 CODE = 0
@@ -18,11 +21,84 @@ RAW_STRING = 5
 
 
 @dataclass(frozen=True)
-class BracketBlock:
-    open_line: int
-    close_line: int
-    depth: int
-    is_complete: bool
+class BracketScannerConfig:
+    """Configuration for bracket scanning — enables language extension.
+
+    Defaults are for C-family languages (C, C++, HLSL, etc.).
+    """
+    # Opening/closing brace characters
+    open_brace: str = "{"
+    close_brace: str = "}"
+    # Line comment start (e.g., "//" for C++, "#" for Python)
+    line_comment: str = "//"
+    # Block comment start/end (e.g., "/*" / "*/" for C++)
+    block_comment_start: str = "/*"
+    block_comment_end: str = "*/"
+    # String delimiter
+    string_delim: str = '"'
+    # Character literal delimiter
+    char_delim: str = "'"
+    # Escape character
+    escape_char: str = "\\"
+    # Raw string prefix + delimiter (e.g., 'R"' for C++ raw strings)
+    raw_string_prefix: str = 'R"'
+    # Pre-built trigger chars for fast line skip (auto-computed)
+    _trigger_chars: frozenset[str] = field(
+        default_factory=lambda: frozenset('{}"/\'R')
+    )
+
+
+def _compute_trigger_chars(config: BracketScannerConfig) -> frozenset[str]:
+    """Compute the set of characters that can trigger state transitions."""
+    chars: set[str] = set()
+    chars.add(config.open_brace)
+    chars.add(config.close_brace)
+    chars.add(config.string_delim)
+    chars.add(config.char_delim)
+    for c in config.line_comment:
+        chars.add(c)
+    for c in config.block_comment_start:
+        chars.add(c)
+    for c in config.raw_string_prefix:
+        chars.add(c)
+    return frozenset(chars)
+
+
+def compute_parent_ids(blocks: list[BracketBlock]) -> dict[int, int | None]:
+    """Compute parent_id for each block based on nesting.
+
+    Parent = nearest enclosing block with depth = current_depth - 1.
+    Processes blocks in open_line order so parents are seen before children.
+
+    Returns:
+        dict mapping (open_line, depth) -> parent's (open_line, depth) or None.
+    """
+    # Sort by open_line so we encounter parents before children
+    sorted_blocks = sorted(blocks, key=lambda b: b.open_line)
+
+    active: dict[int, BracketBlock] = {}
+    parent_map: dict[tuple[int, int], tuple[int, int] | None] = {}
+
+    for b in sorted_blocks:
+        # Clean up: remove blocks whose close_line is before this block opens
+        for depth in sorted(active, reverse=True):
+            if active[depth].close_line < b.open_line:
+                del active[depth]
+
+        # Parent is the block at depth-1 that's currently active
+        if b.depth > 1 and (b.depth - 1) in active:
+            parent = active[b.depth - 1]
+            parent_map[(b.open_line, b.depth)] = (parent.open_line, parent.depth)
+        else:
+            parent_map[(b.open_line, b.depth)] = None
+
+        # Push onto active stack (replaces any prior block at same depth)
+        active[b.depth] = b
+
+    return parent_map
+
+
+CCScannerConfig = BracketScannerConfig()  # default C-family config
 
 
 def scan_brackets(content: str, lines: list[str] | None = None) -> list[BracketBlock]:

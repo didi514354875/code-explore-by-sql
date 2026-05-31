@@ -1,0 +1,213 @@
+Connecting to unreal.db...
+Starting backfill with workers=1 (single-process to avoid OOM)...
+  backfill starting: 84,696 files, workers=1, provider=unreal
+  bracket scan: 500/84696 (1%) 1430 files/s ETA 59s
+  bracket scan: 1000/84696 (1%) 1353 files/s ETA 62s
+  bracket scan: 1500/84696 (2%) 660 files/s ETA 126s
+  bracket scan: 2000/84696 (2%) 486 files/s ETA 170s
+  bracket scan: 2500/84696 (3%) 467 files/s ETA 176s
+  bracket scan: 3000/84696 (4%) 457 files/s ETA 179s
+  bracket scan: 3500/84696 (4%) 450 files/s ETA 180s
+  bracket scan: 4000/84696 (5%) 379 files/s ETA 213s
+  bracket scan: 4500/84696 (5%) 258 files/s ETA 311s
+  bracket scan: 5000/84696 (6%) 262 files/s ETA 304s
+  bracket scan: 5500/84696 (6%) 276 files/s ETA 287s
+  bracket scan: 6000/84696 (7%) 279 files/s ETA 282s
+  bracket scan: 6500/84696 (8%) 287 files/s ETA 272s
+  bracket scan: 7000/84696 (8%) 287 files/s ETA 271s
+  bracket scan: 7500/84696 (9%) 293 files/s ETA 264s
+  bracket scan: 8000/84696 (9%) 293 files/s ETA 262s
+  bracket scan: 8500/84696 (10%) 279 files/s ETA 273s
+  bracket scan: 9000/84696 (11%) 283 files/s ETA 267s
+  bracket scan: 9500/84696 (11%) 276 files/s ETA 272s
+  bracket scan: 10000/84696 (12%) 270 files/s ETA 276s
+  bracket scan: 10500/84696 (12%) 266 files/s ETA 279s
+  bracket scan: 11000/84696 (13%) 266 files/s ETA 277s
+  bracket scan: 11500/84696 (14%) 275 files/s ETA 266s
+  bracket scan: 12000/84696 (14%) 280 files/s ETA 259s
+  bracket scan: 12500/84696 (15%) 274 files/s ETA 264s
+  bracket scan: 13000/84696 (15%) 276 files/s ETA 260s
+  bracket scan: 13500/84696 (16%) 279 files/s ETA 255s
+  bracket scan: 14000/84696 (17%) 285 files/s ETA 248s
+  bracket scan: 14500/84696 (17%) 285 files/s ETA 246s
+  bracket scan: 15000/84696 (18%) 284 files/s ETA 246s
+  bracket scan: 15500/84696 (18%) 282 files/s ETA 245s
+  bracket scan: 16000/84696 (19%) 285 files/s ETA 241s
+  bracket scan: 16500/84696 (19%) 286 files/s ETA 238s
+  bracket scan: 17000/84696 (20%) 282 files/s ETA 240s
+  bracket scan: 17500/84696 (21%) 284 files/s ETA 236s
+  bracket scan: 18000/84696 (21%) 286 files/s ETA 233s
+  bracket scan: 18500/84696 (22%) 290 files/s ETA 228s
+  bracket scan: 19000/84696 (22%) 294 files/s ETA 223s
+  bracket scan: 19500/84696 (23%) 295 files/s ETA 221s
+  bracket scan: 20000/84696 (24%) 297 files/s ETA 218s
+  bracket scan: 20500/84696 (24%) 291 files/s ETA 221s
+  bracket scan: 21000/84696 (25%) 287 files/s ETA 222s
+  bracket scan: 21500/84696 (25%) 289 files/s ETA 219s
+  bracket scan: 22000/84696 (26%) 289 files/s ETA 217s
+  bracket scan: 22500/84696 (27%) 292 files/s ETA 213s
+  bracket scan: 23000/84696 (27%) 293 files/s ETA 211s
+  bracket scan: 23500/84696 (28%) 293 files/s ETA 209s
+  bracket scan: 24000/84696 (28%) 288 files/s ETA 211s
+  bracket scan: 24500/84696 (29%) 291 files/s ETA 207s
+  bracket scan: 25000/84696 (30%) 292 files/s ETA 205s
+  bracket scan: 25500/84696 (30%) 292 files/s ETA 202s
+  bracket scan: 26000/84696 (31%) 294 files/s ETA 200s
+  bracket scan: 26500/84696 (31%) 297 files/s ETA 196s
+  bracket scan: 27000/84696 (32%) 298 files/s ETA 194s
+  bracket scan: 27500/84696 (32%) 300 files/s ETA 190s
+  bracket scan: 28000/84696 (33%) 302 files/s ETA 188s
+  bracket scan: 28500/84696 (34%) 305 files/s ETA 184s
+  bracket scan: 29000/84696 (34%) 306 files/s ETA 182s
+  bracket scan: 29500/84696 (35%) 307 files/s ETA 180s
+  bracket scan: 30000/84696 (35%) 309 files/s ETA 177s
+  bracket scan: 30500/84696 (36%) 312 files/s ETA 174s
+  bracket scan: 31000/84696 (37%) 314 files/s ETA 171s
+  bracket scan: 31500/84696 (37%) 316 files/s ETA 168s
+  bracket scan: 32000/84696 (38%) 319 files/s ETA 165s
+  bracket scan: 32500/84696 (38%) 322 files/s ETA 162s
+  bracket scan: 33000/84696 (39%) 323 files/s ETA 160s
+  bracket scan: 33500/84696 (40%) 325 files/s ETA 158s
+  bracket scan: 34000/84696 (40%) 325 files/s ETA 156s
+  bracket scan: 34500/84696 (41%) 327 files/s ETA 154s
+  bracket scan: 35000/84696 (41%) 328 files/s ETA 151s
+  bracket scan: 35500/84696 (42%) 331 files/s ETA 149s
+  bracket scan: 36000/84696 (43%) 333 files/s ETA 146s
+  bracket scan: 36500/84696 (43%) 335 files/s ETA 144s
+  bracket scan: 37000/84696 (44%) 338 files/s ETA 141s
+  bracket scan: 37500/84696 (44%) 341 files/s ETA 139s
+  bracket scan: 38000/84696 (45%) 344 files/s ETA 136s
+  bracket scan: 38500/84696 (45%) 346 files/s ETA 134s
+  bracket scan: 39000/84696 (46%) 349 files/s ETA 131s
+  bracket scan: 39500/84696 (47%) 351 files/s ETA 129s
+  bracket scan: 40000/84696 (47%) 354 files/s ETA 126s
+  bracket scan: 40500/84696 (48%) 358 files/s ETA 124s
+  bracket scan: 41000/84696 (48%) 360 files/s ETA 121s
+  bracket scan: 41500/84696 (49%) 363 files/s ETA 119s
+  bracket scan: 42000/84696 (50%) 365 files/s ETA 117s
+  bracket scan: 42500/84696 (50%) 367 files/s ETA 115s
+  bracket scan: 43000/84696 (51%) 370 files/s ETA 113s
+  bracket scan: 43500/84696 (51%) 373 files/s ETA 110s
+  bracket scan: 44000/84696 (52%) 375 files/s ETA 108s
+  bracket scan: 44500/84696 (53%) 378 files/s ETA 106s
+  bracket scan: 45000/84696 (53%) 380 files/s ETA 104s
+  bracket scan: 45500/84696 (54%) 382 files/s ETA 103s
+  bracket scan: 46000/84696 (54%) 385 files/s ETA 101s
+  bracket scan: 46500/84696 (55%) 387 files/s ETA 99s
+  bracket scan: 47000/84696 (55%) 389 files/s ETA 97s
+  bracket scan: 47500/84696 (56%) 387 files/s ETA 96s
+  bracket scan: 48000/84696 (57%) 389 files/s ETA 94s
+  bracket scan: 48500/84696 (57%) 388 files/s ETA 93s
+  bracket scan: 49000/84696 (58%) 388 files/s ETA 92s
+  bracket scan: 49500/84696 (58%) 389 files/s ETA 90s
+  bracket scan: 50000/84696 (59%) 383 files/s ETA 91s
+  bracket scan: 50500/84696 (60%) 383 files/s ETA 89s
+  bracket scan: 51000/84696 (60%) 386 files/s ETA 87s
+  bracket scan: 51500/84696 (61%) 387 files/s ETA 86s
+  bracket scan: 52000/84696 (61%) 386 files/s ETA 85s
+  bracket scan: 52500/84696 (62%) 387 files/s ETA 83s
+  bracket scan: 53000/84696 (63%) 382 files/s ETA 83s
+  bracket scan: 53500/84696 (63%) 384 files/s ETA 81s
+  bracket scan: 54000/84696 (64%) 386 files/s ETA 80s
+  bracket scan: 54500/84696 (64%) 387 files/s ETA 78s
+  bracket scan: 55000/84696 (65%) 387 files/s ETA 77s
+  bracket scan: 55500/84696 (66%) 388 files/s ETA 75s
+  bracket scan: 56000/84696 (66%) 388 files/s ETA 74s
+  bracket scan: 56500/84696 (67%) 389 files/s ETA 72s
+  bracket scan: 57000/84696 (67%) 388 files/s ETA 71s
+  bracket scan: 57500/84696 (68%) 389 files/s ETA 70s
+  bracket scan: 58000/84696 (68%) 390 files/s ETA 68s
+  bracket scan: 58500/84696 (69%) 391 files/s ETA 67s
+  bracket scan: 59000/84696 (70%) 392 files/s ETA 66s
+  bracket scan: 59500/84696 (70%) 393 files/s ETA 64s
+  bracket scan: 60000/84696 (71%) 394 files/s ETA 63s
+  bracket scan: 60500/84696 (71%) 395 files/s ETA 61s
+  bracket scan: 61000/84696 (72%) 396 files/s ETA 60s
+  bracket scan: 61500/84696 (73%) 398 files/s ETA 58s
+  bracket scan: 62000/84696 (73%) 395 files/s ETA 57s
+  bracket scan: 62500/84696 (74%) 395 files/s ETA 56s
+  bracket scan: 63000/84696 (74%) 393 files/s ETA 55s
+  bracket scan: 63500/84696 (75%) 394 files/s ETA 54s
+  bracket scan: 64000/84696 (76%) 394 files/s ETA 53s
+  bracket scan: 64500/84696 (76%) 393 files/s ETA 51s
+  bracket scan: 65000/84696 (77%) 391 files/s ETA 50s
+  bracket scan: 65500/84696 (77%) 392 files/s ETA 49s
+  bracket scan: 66000/84696 (78%) 393 files/s ETA 48s
+  bracket scan: 66500/84696 (79%) 395 files/s ETA 46s
+  bracket scan: 67000/84696 (79%) 396 files/s ETA 45s
+  bracket scan: 67500/84696 (80%) 397 files/s ETA 43s
+  bracket scan: 68000/84696 (80%) 398 files/s ETA 42s
+  bracket scan: 68500/84696 (81%) 399 files/s ETA 41s
+  bracket scan: 69000/84696 (81%) 399 files/s ETA 39s
+  bracket scan: 69500/84696 (82%) 400 files/s ETA 38s
+  bracket scan: 70000/84696 (83%) 401 files/s ETA 37s
+  bracket scan: 70500/84696 (83%) 402 files/s ETA 35s
+  bracket scan: 71000/84696 (84%) 403 files/s ETA 34s
+  bracket scan: 71500/84696 (84%) 403 files/s ETA 33s
+  bracket scan: 72000/84696 (85%) 404 files/s ETA 31s
+  bracket scan: 72500/84696 (86%) 406 files/s ETA 30s
+  bracket scan: 73000/84696 (86%) 407 files/s ETA 29s
+  bracket scan: 73500/84696 (87%) 408 files/s ETA 27s
+  bracket scan: 74000/84696 (87%) 408 files/s ETA 26s
+  bracket scan: 74500/84696 (88%) 409 files/s ETA 25s
+  bracket scan: 75000/84696 (89%) 410 files/s ETA 24s
+  bracket scan: 75500/84696 (89%) 411 files/s ETA 22s
+  bracket scan: 76000/84696 (90%) 412 files/s ETA 21s
+  bracket scan: 76500/84696 (90%) 413 files/s ETA 20s
+  bracket scan: 77000/84696 (91%) 413 files/s ETA 19s
+  bracket scan: 77500/84696 (92%) 414 files/s ETA 17s
+  bracket scan: 78000/84696 (92%) 415 files/s ETA 16s
+  bracket scan: 78500/84696 (93%) 416 files/s ETA 15s
+  bracket scan: 79000/84696 (93%) 416 files/s ETA 14s
+  bracket scan: 79500/84696 (94%) 418 files/s ETA 12s
+  bracket scan: 80000/84696 (94%) 418 files/s ETA 11s
+  bracket scan: 80500/84696 (95%) 418 files/s ETA 10s
+  bracket scan: 81000/84696 (96%) 418 files/s ETA 9s
+  bracket scan: 81500/84696 (96%) 419 files/s ETA 8s
+  bracket scan: 82000/84696 (97%) 419 files/s ETA 6s
+  bracket scan: 82500/84696 (97%) 420 files/s ETA 5s
+  bracket scan: 83000/84696 (98%) 419 files/s ETA 4s
+  bracket scan: 83500/84696 (99%) 419 files/s ETA 3s
+  bracket scan: 84000/84696 (99%) 420 files/s ETA 2s
+  bracket scan: 84500/84696 (100%) 422 files/s ETA 0s
+  bracket scan: 84696/84696 (100%) 422 files/s ETA 0s
+  bracket scan done: 84,696 files, 838,363 blocks in 200.6s
+  bracket indexes built in 0.7s
+  parent_id: computing for 81,903 files...
+  parent_id done: 370,899 links in 4.7s
+  extra_blocks: 215,838 non-brace blocks
+  symbol_references: collecting trackable symbols...
+    references: 823,151 raw symbols -> 524,409 unique names (692,734 defs after filter)
+    references: 1000/81903 (1%) 340,684 refs, 1510 files/s ETA 54s
+    references: 2000/81903 (2%) 1,523,882 refs, 716 files/s ETA 112s
+    references: 3000/81903 (4%) 2,732,038 refs, 600 files/s ETA 132s
+    references: 4000/81903 (5%) 4,813,765 refs, 445 files/s ETA 175s
+    references: 5000/81903 (6%) 6,420,358 refs, 406 files/s ETA 189s
+    references: 6000/81903 (7%) 7,431,261 refs, 417 files/s ETA 182s
+    references: 7000/81903 (9%) 8,481,031 refs, 423 files/s ETA 177s
+    references: 8000/81903 (10%) 9,918,540 refs, 409 files/s ETA 181s
+    references: 9000/81903 (11%) 11,149,222 refs, 405 files/s ETA 180s
+    references: 10000/81903 (12%) 13,303,804 refs, 370 files/s ETA 195s
+    references: 11000/81903 (13%) 14,479,270 refs, 370 files/s ETA 192s
+    references: 12000/81903 (15%) 16,543,115 refs, 346 files/s ETA 202s
+    references: 13000/81903 (16%) 18,015,185 refs, 339 files/s ETA 203s
+    references: 14000/81903 (17%) 19,282,075 refs, 339 files/s ETA 200s
+    references: 15000/81903 (18%) 21,290,279 refs, 324 files/s ETA 207s
+    references: 16000/81903 (20%) 22,686,059 refs, 323 files/s ETA 204s
+    references: 17000/81903 (21%) 24,127,137 refs, 321 files/s ETA 202s
+    references: 18000/81903 (22%) 25,081,931 refs, 325 files/s ETA 197s
+    references: 19000/81903 (23%) 26,206,546 refs, 328 files/s ETA 192s
+    references: 20000/81903 (24%) 28,030,629 refs, 321 files/s ETA 193s
+    references: 21000/81903 (26%) 29,039,484 refs, 324 files/s ETA 188s
+    references: 22000/81903 (27%) 29,813,436 refs, 330 files/s ETA 182s
+    references: 23000/81903 (28%) 31,313,779 refs, 326 files/s ETA 180s
+    references: 24000/81903 (29%) 32,693,030 refs, 322 files/s ETA 180s
+    references: 25000/81903 (31%) 34,279,554 refs, 317 files/s ETA 180s
+    references: 26000/81903 (32%) 35,454,726 refs, 316 files/s ETA 177s
+    references: 27000/81903 (33%) 36,620,275 refs, 315 files/s ETA 174s
+    references: 28000/81903 (34%) 38,256,677 refs, 310 files/s ETA 174s
+    references: 29000/81903 (35%) 39,491,180 refs, 308 files/s ETA 172s
+    references: 30000/81903 (37%) 40,669,158 refs, 307 files/s ETA 169s
+    references: 31000/81903 (38%) 41,345,260 refs, 311 files/s ETA 164s
+    references: 32000/81903 (39%) 42,419,869 refs, 312 files/s ETA 160s
+    references: 33000/81903 (40%) 43,724,061 refs, 310 files/s ETA 158s

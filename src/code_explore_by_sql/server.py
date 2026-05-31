@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
@@ -8,13 +7,19 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import (
     connect,
-    get_directory_structure as get_directory_structure_db,
+    find_enclosing_block,
+    find_symbol_references,
     get_source_anchored,
     get_source_by_path,
     initialize_schema,
+    load_bracket_index,
     record_feedback,
     search_source,
     search_source_with_feedback,
+    _fuzzy_resolve_symbol,
+)
+from .db import (
+    get_directory_structure as get_directory_structure_db,
 )
 
 mcp = FastMCP("code-explore-by-sql")
@@ -38,7 +43,7 @@ def search_code_source(
     module: str | None = None,
     limit: int = 20,
     cluster: bool = False,
-    scope_filter: str | dict | None = None,
+    scope_filter: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Search source code files. Two modes:
 
@@ -62,9 +67,8 @@ def search_code_source(
     cluster: If true, merge multiple hits in the same code block into one result
     with a hit_count field. Useful when a keyword appears many times in one function.
 
-    scope_filter: Optional dict or JSON string with block_type and/or block_name to narrow search.
-    Example (dict): {"block_type": "function", "block_name": "Render"}
-    Example (JSON string): '{"block_type": "class"}'
+    scope_filter: Optional dict with block_type and/or block_name to narrow search.
+    Example: {"block_type": "function", "block_name": "Render"}
     Only returns hits inside matching code blocks.
 
     The system automatically:
@@ -77,21 +81,24 @@ def search_code_source(
     if raw_query is None and query is None:
         return [{"error": "Provide either query or raw_query"}]
 
-    parsed_scope = None
-    if scope_filter:
-        if isinstance(scope_filter, dict):
-            parsed_scope = scope_filter
-        elif isinstance(scope_filter, str):
-            try:
-                parsed_scope = json.loads(scope_filter)
-            except json.JSONDecodeError:
-                return [{"error": "scope_filter must be a valid JSON string or dict"}]
-        else:
-            return [{"error": "scope_filter must be a dict or JSON string, got " + type(scope_filter).__name__}]
-
     with _conn() as conn:
         try:
-            return search_source_with_feedback(
+            # Try fuzzy resolution if query is a simple symbol name
+            fuzzy_result = None
+            if query and not raw_query and ' ' not in query and len(query) >= 3:
+                fuzzy_result = _fuzzy_resolve_symbol(conn, query, limit=5)
+                if fuzzy_result.get('expanded'):
+                    # UE prefix normalization succeeded
+                    query = fuzzy_result['expanded']
+                elif fuzzy_result.get('suggestions') and not fuzzy_result.get('exact'):
+                    # No exact match, return suggestions
+                    return [{
+                        "query": query,
+                        "did_you_mean": fuzzy_result['suggestions'],
+                        "message": f"No exact match for '{query}'. Did you mean one of these?",
+                    }]
+
+            results = search_source_with_feedback(
                 conn,
                 query=query,
                 raw_query=raw_query,
@@ -99,8 +106,15 @@ def search_code_source(
                 module=module,
                 limit=max(1, min(limit, 100)),
                 cluster=cluster,
-                scope_filter=parsed_scope,
+                scope_filter=scope_filter,
             )
+
+            # Add fuzzy metadata if expansion happened
+            if fuzzy_result and fuzzy_result.get('expanded') and results:
+                for r in results:
+                    r['expanded_from'] = query.replace(fuzzy_result['expanded'], '')
+
+            return results
         except Exception as exc:
             return [{"error": f"FTS5 query error: {exc}", "query": raw_query or query}]
 
@@ -196,25 +210,14 @@ def log_code_query(
         if log_row is None:
             return {"status": "no_matching_log"}
         if was_useful is not None or refinement is not None:
-            existing = conn.execute(
-                "SELECT id FROM query_note WHERE query_log_id = ?", (log_row["id"],)
-            ).fetchone()
-            if existing:
-                if was_useful is not None:
-                    conn.execute(
-                        "UPDATE query_note SET was_useful = ? WHERE query_log_id = ?",
-                        (int(was_useful), log_row["id"]),
-                    )
-                if refinement is not None:
-                    conn.execute(
-                        "UPDATE query_note SET refinement = ? WHERE query_log_id = ?",
-                        (refinement, log_row["id"]),
-                    )
-            else:
-                conn.execute(
-                    "INSERT INTO query_note(query_log_id, was_useful, refinement) VALUES (?, ?, ?)",
-                    (log_row["id"], int(was_useful) if was_useful is not None else None, refinement),
-                )
+            conn.execute(
+                """INSERT INTO query_note(query_log_id, was_useful, refinement)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(query_log_id) DO UPDATE SET
+                       was_useful = excluded.was_useful,
+                       refinement = excluded.refinement""",
+                (log_row["id"], int(was_useful) if was_useful is not None else None, refinement),
+            )
             conn.commit()
         return {"status": "ok"}
 
@@ -312,10 +315,20 @@ def find_callers(
     scope: optional module name to limit search scope.
     Returns list of callers with file, enclosing function, and line info.
     """
-    from .db import _fts5_escape, load_bracket_index, find_enclosing_block, get_source_by_path
-
     with _conn() as conn:
-        fts_query = _fts5_escape(symbol)
+        # Try fuzzy resolution first
+        original_symbol = symbol
+        fuzzy_result = _fuzzy_resolve_symbol(conn, symbol, limit=3)
+        if fuzzy_result.get('expanded'):
+            symbol = fuzzy_result['expanded']
+        elif fuzzy_result.get('suggestions') and not fuzzy_result.get('exact'):
+            return {
+                "symbol": original_symbol,
+                "did_you_mean": fuzzy_result['suggestions'],
+                "callers": [],
+                "message": f"No exact match for '{original_symbol}'. Did you mean one of these?",
+            }
+
         results = search_source(conn, symbol, module=scope, limit=50)
 
         callers = []
@@ -352,12 +365,10 @@ def find_callers(
                 if not enclosing:
                     continue
 
-                # Walk up to the depth=1 parent block
-                parent = enclosing
                 # The enclosing block might already be depth=1, or we need
                 # to find which depth=1 block contains this line
                 enclosing_top = None
-                for tb_open, tb in top_blocks.items():
+                for _tb_open, tb in top_blocks.items():
                     if tb["open_line"] <= line_idx <= tb["close_line"]:
                         enclosing_top = tb
                         break
@@ -388,11 +399,49 @@ def find_callers(
                     "caller_line": line_idx,
                 })
 
-        return {
+        result = {
             "symbol": symbol,
             "callers": callers,
             "total": len(callers),
         }
+        if fuzzy_result.get('expanded'):
+            result['expanded_from'] = original_symbol
+        return result
+
+
+@mcp.tool()
+def find_references(symbol: str, limit: int = 100) -> dict[str, Any]:
+    """Find references to a symbol from the pre-computed symbol_references table.
+
+    symbol: the symbol name to find references for (e.g., "UMyClass", "BeginPlay").
+    limit: maximum number of references to return (default 100).
+
+    Returns pre-computed references with file paths and enclosing block info.
+    Falls back to empty list if symbol_references table is not yet populated.
+    """
+    with _conn() as conn:
+        # Try fuzzy resolution first
+        original_symbol = symbol
+        fuzzy_result = _fuzzy_resolve_symbol(conn, symbol, limit=3)
+        if fuzzy_result.get('expanded'):
+            symbol = fuzzy_result['expanded']
+        elif fuzzy_result.get('suggestions') and not fuzzy_result.get('exact'):
+            return {
+                "symbol": original_symbol,
+                "did_you_mean": fuzzy_result['suggestions'],
+                "references": [],
+                "message": f"No exact match for '{original_symbol}'. Did you mean one of these?",
+            }
+
+        refs = find_symbol_references(conn, symbol, limit)
+        result = {
+            "symbol": symbol,
+            "references": refs,
+            "total": len(refs),
+        }
+        if fuzzy_result.get('expanded'):
+            result['expanded_from'] = original_symbol
+        return result
 
 
 @mcp.tool()

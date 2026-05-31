@@ -19,14 +19,15 @@ Efficient source code lookup using the local MCP server.
 | get_file_content (anchor, 500 chars) | 125 | **Always prefer** for single-symbol context |
 | get_file_content (line range, 100 lines) | 900 | Need broader context |
 | get_file_content (full file) | 45,000 | **BANNED** — never read full files |
+| find_references (pre-computed) | 50–500 | **Try first** for symbol lookup — instant SQL query, returns ref_block context |
 | find_callers (specific symbol) | 127–3,000 | Trace call sites, **best anchor locator** |
 | find_callers (common symbol) | ~27,000 | **Use `scope` to limit!** |
 | find_include_graph (depth=1) | 50–2,100 | File dependencies |
 
-## Tools (6)
+## Tools (7)
 
 ### `get_directory_structure()`
-Returns `modules` (name+count), `top_dirs` (path+count), `total_files`, `extensions`.
+Returns `total_files`, `total_modules`, `modules` (name+count, top 30), `top_dirs` (path+count).
 
 1. Merge/dedup semantically identical modules; mark false positives (e.g. "Private", "Public")
 2. Write slim result to `ref/directory-structure.md`
@@ -53,7 +54,7 @@ FTS5 search with history-accelerated ranking (~2,600 tokens/20 results).
 - `module`: filter by module name (from `get_directory_structure()`)
 - `scope_filter`: **optional** post-filter — see scope_filter boundaries below
 - `expanded_terms`: confirmed class/symbol names for history ranking boost (signal enrichment)
-- `cluster`: **default true** — returns block info (see below)
+- `cluster`: **always pass true** — returns block info for free (see below); server default is false
 - Results include `source` (history_refined or fts) and `final_score`
 
 **`cluster=true` returns additional fields** (free anchor info):
@@ -72,8 +73,8 @@ Use `cluster.open_line/close_line` as `get_file_content(start_line, end_line)` a
 
 ### `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
 Read file via anchor (preferred) or line range. Auto-records feedback.
-- anchor="Render", context_chars=500 → ~125 tokens
-- start_line=100, end_line=200 → ~900 tokens
+- anchor="Render", context_chars=500 → ~125 tokens (max 5000)
+- start_line=100, end_line=200 → ~900 tokens (max span 200 lines, warns beyond)
 - **BANNED** without anchor or line range (full file ~45K tokens)
 - If anchor unknown, use search_code_source cluster.open_line/close_line, then use start_line/end_line
 - Default context_chars=500~2000; class declarations usually 1000~2000
@@ -94,12 +95,20 @@ Find callers using bracket skeleton analysis. Returns caller_line, block_type/na
 - **Best anchor locator** — returns exact line numbers and block ranges
 - Always use `scope` for common symbols
 - `scope`: module name — use `get_directory_structure()` or `ref/directory-structure.md` for valid values
+- **Dynamic**: scans full file content at runtime (slower but exhaustive)
+
+### `find_references(symbol, limit?)`
+Pre-computed symbol references from `symbol_references` table.
+- **Fastest lookup** — direct SQL query, no file scanning
+- `find_references("BeginPlay", limit=100)` — returns ref_file_path, ref_line, ref_block_type, ref_block_name
+- Returns empty list if symbol has no tracked references (common names filtered during indexing)
+- **Use before `find_callers`** when you need a quick check; fall back to `find_callers` if results are empty
 
 ## Bracket skeleton
 
 ### scope_filter — optional post-filter
 
-**Accepts dict or JSON string:**
+**Accepts dict only:**
 
 | Field | Valid values |
 |-------|-------------|
@@ -108,16 +117,16 @@ Find callers using bracket skeleton analysis. Returns caller_line, block_type/na
 
 `struct X` and `class X` are both `block_type="class"`.
 
-**How it works:** `scope_filter` is a **post-filter** applied after FTS search. FTS returns `limit*5` results (e.g. 100 for limit=20), then scope_filter checks whether each result file has any matching depth=1 block, removing non-matches. It **cannot** add files that FTS missed — if the target file isn't in the expanded FTS result set (top-100), scope_filter won't help.
+**How it works:** `scope_filter` is a **hit-level post-filter** applied after FTS search. For each FTS hit, it locates the enclosing depth=1 bracket block (via snippet→line mapping + bisect) and removes hits whose enclosing block doesn't match. This is more precise than file-level filtering — a file with both matching and non-matching blocks keeps only the relevant hits. It **cannot** add files that FTS missed.
 
 **When scope_filter is useful vs cluster=true:**
 
 | Scenario | Recommended | Why |
 |----------|------------|-----|
 | Most searches | `cluster=true` (no scope_filter) | cluster provides block info for free, preserves all FTS results |
-| General word + too many irrelevant results | `scope_filter={"block_type":"class"}` | Post-filter narrows FTS results to files containing class blocks |
+| General word + too many irrelevant results | `scope_filter={"block_type":"class"}` | Hit-level filter keeps only hits inside class blocks |
 | Class definition discovery | `raw_query` file_path filter | More reliable than scope_filter |
-| Need only results inside a specific class | `scope_filter={"block_name":"ClassName"}` | Only when FTS already includes the target file |
+| Need only results inside a specific class | `scope_filter={"block_name":"ClassName"}` | Only when FTS already hits inside that class |
 
 **Fallback when scope_filter fails**: Use `raw_query` column filter: `raw_query='(file_path : "MaterialShared") AND "FMaterial"'`
 
@@ -130,14 +139,15 @@ Use anchor from search result metadata:
 
 ## Tool decision matrix
 
-| Sub-problem | Primary tool | Notes |
-|------------|-------------|-------|
-| Known exact symbol | search(`query`, cluster=true) | cluster provides block range for free |
-| Known exact symbol + callers | find_callers(symbol, scope=...) | **Best anchor locator** — returns exact lines |
-| Concept/pattern exploration | search(`query`, cluster=true, module=...) | Observe module_name distribution first |
-| Type definition | search(`raw_query` file_path filter) | `(file_path : "Header.h") AND "ClassName"` |
-| Call chain (who calls X?) | find_callers(symbol, scope=...) | NOT for data flow or class hierarchies |
-| File dependencies | find_include_graph | — |
+| Sub-problem | Primary tool | Fallback | Notes |
+|------------|-------------|----------|-------|
+| Known exact symbol (quick check) | find_references(symbol) | find_callers | Pre-computed, fastest |
+| Known exact symbol + callers | find_callers(symbol, scope=...) | — | **Best anchor locator** — returns exact lines |
+| Known exact class | search(query, cluster=true) | — | cluster provides block range for free |
+| Concept/pattern exploration | search(query, cluster=true, module=...) | — | Observe module_name distribution first |
+| Type definition | search(raw_query file_path filter) | — | `(file_path : "Header.h") AND "ClassName"` |
+| Call chain (who calls X?) | find_references → find_callers | — | Try fast path first |
+| File dependencies | find_include_graph | — | — |
 
 ### module ownership confirmation
 
@@ -265,18 +275,18 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms ≥3 chars (trigra
 | Guessed base class in anchor | `"class XXX : public"` without base |
 | Guessed function name for flow | Use `find_callers` instead |
 | Searched .cpp for class declaration | Class is in .h — search with `file_path :` filter |
-| scope_filter returns 0 | **FTS didn't hit target file** — use `raw_query` file_path filter instead |
+| scope_filter returns 0 | **FTS hit is inside a non-matching block** — broaden scope_filter or use `raw_query` file_path filter instead |
 | module filter returns empty | Drop module param and retry (bare search first to confirm ownership) |
 | Repeated failed anchor | After 1 miss → switch to cluster.open_line/close_line. Do NOT retry anchor |
 | Full file read attempted | **BANNED** — must use anchor or start_line/end_line |
 | >5 searches with no new signal | Stop. Output what was found and what remains unknown |
 | expanded_term returned 0 hits | Class name doesn't exist. Drop it, replace with discovered name |
 | history_refined pushes stale results | Use `module` + `raw_query` file_path to override |
-| scope_filter + query returns empty | scope_filter is a post-filter — FTS result must contain target file. Use `raw_query` file_path or `cluster=true` instead |
+| scope_filter + query returns empty | scope_filter is a hit-level post-filter — FTS hit must be inside a matching block. Use `raw_query` file_path or `cluster=true` instead |
 
 ### scope_filter + query must agree
 
-**Core rule: `scope_filter` is a post-filter on FTS results. It checks if the file has a matching depth=1 block. The FTS query must already return the target file, or scope_filter cannot help.**
+**Core rule: `scope_filter` is a hit-level post-filter on FTS results. It locates each FTS hit's enclosing depth=1 block and keeps only hits inside matching blocks. The FTS query must already return the target hit, or scope_filter cannot help.**
 
 When using scope_filter, keep query to a single precise symbol:
 

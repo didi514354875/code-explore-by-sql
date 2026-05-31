@@ -303,20 +303,20 @@ info = sniff_block(
 check("type=function", info.block_type == "function", f"got {info.block_type}")
 check("name=FRenderer::Render", info.block_name == "FRenderer::Render", f"got {info.block_name}")
 
-# --- Test S8: Control flow ---
-print("\n[Test S8] Control flow (if)")
+# --- Test S8: Control flow (if) — now skipped (unknown) since we don't index control flow ---
+print("\n[Test S8] Control flow (if) — skipped")
 info = sniff_block(["if (bIsEnabled)"], 1, ["if (bIsEnabled)", "{"])
-check("type=control_flow", info.block_type == "control_flow", f"got {info.block_type}")
+check("type=unknown (control flow skipped)", info.block_type == "unknown", f"got {info.block_type}")
 
-# --- Test S9: Control flow (for) ---
-print("\n[Test S9] Control flow (for)")
+# --- Test S9: Control flow (for) — now skipped (unknown) ---
+print("\n[Test S9] Control flow (for) — skipped")
 info = sniff_block(["for (int i = 0; i < Count; i++)"], 1, ["for (int i = 0; i < Count; i++)", "{"])
-check("type=control_flow", info.block_type == "control_flow", f"got {info.block_type}")
+check("type=unknown (control flow skipped)", info.block_type == "unknown", f"got {info.block_type}")
 
 # --- Test S10: Macro define ---
 print("\n[Test S10] #define macro")
 info = sniff_block(["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)"], 1, ["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)", "{"])
-check("type=macro", info.block_type == "macro", f"got {info.block_type}")
+check("type=macro_def", info.block_type == "macro_def", f"got {info.block_type}")
 
 # --- Test S11: UE macro skip (GENERATED_BODY) ---
 print("\n[Test S11] UE macro lines skipped")
