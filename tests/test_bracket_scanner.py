@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import sys
 
-from code_explore_by_sql.bracket_scanner import scan_brackets, BracketBlock
-from code_explore_by_sql.symbol_sniffer import sniff_block, sniff_blocks_for_file, BlockInfo
+from code_explore_by_sql.bracket_scanner import scan_brackets
+from code_explore_by_sql.symbol_sniffer import (
+    sniff_block,
+    sniff_blocks_for_file,
+    sniff_semantic_blocks,
+)
 
 PASS = 0
 FAIL = 0
@@ -315,7 +319,11 @@ check("type=unknown (control flow skipped)", info.block_type == "unknown", f"got
 
 # --- Test S10: Macro define ---
 print("\n[Test S10] #define macro")
-info = sniff_block(["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)"], 1, ["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)", "{"])
+info = sniff_block(
+    ["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)"],
+    1,
+    ["#define IMPLEMENT_MODULE(ModuleClass, ModuleName)", "{"],
+)
 check("type=macro_def", info.block_type == "macro_def", f"got {info.block_type}")
 
 # --- Test S11: UE macro skip (GENERATED_BODY) ---
@@ -341,7 +349,11 @@ info = sniff_block(
      "{"],
 )
 check("type=function", info.block_type == "function", f"got {info.block_type}")
-check("name=FDeferredShadingRenderer::Render", info.block_name == "FDeferredShadingRenderer::Render", f"got {info.block_name}")
+check(
+    "name=FDeferredShadingRenderer::Render",
+    info.block_name == "FDeferredShadingRenderer::Render",
+    f"got {info.block_name}",
+)
 
 # --- Test S13: Unknown block ---
 print("\n[Test S13] Unknown block")
@@ -371,8 +383,6 @@ enum class EMyEnum {
 }  // namespace MyNS
 """.split("\n")
 
-from code_explore_by_sql.bracket_scanner import scan_brackets
-
 blocks = scan_brackets("\n".join(lines))
 top_blocks = [(b.open_line - 1, b.close_line - 1) for b in blocks if b.depth == 1]
 sniffed = sniff_blocks_for_file(lines, top_blocks)
@@ -383,6 +393,54 @@ if sniffed:
     names = [info.block_name for _, info in sniffed]
     check("type is [namespace]", types == ["namespace"], f"got {types}")
     check("name is [MyNS]", names == ["MyNS"], f"got {names}")
+
+# --- Test S15: Class methods stay methods, not duplicate class blocks ---
+print("\n[Test S15] Class method declaration slice")
+lines = """\
+namespace MyNamespace {
+class MyClass {
+public:
+    void MyMethod() {
+        int x = 0;
+    }
+    int GetValue() {
+        return 42;
+    }
+};
+}
+""".split("\n")
+blocks = scan_brackets("\n".join(lines))
+semantic = sniff_semantic_blocks(lines, blocks)
+semantic_pairs = [(info.block_type, info.block_name) for _, info in semantic]
+check("MyClass classified once", semantic_pairs.count(("class", "MyClass")) == 1, f"got {semantic_pairs}")
+check("MyMethod classified as method", ("method", "MyMethod") in semantic_pairs, f"got {semantic_pairs}")
+check("GetValue classified as method", ("method", "GetValue") in semantic_pairs, f"got {semantic_pairs}")
+
+# --- Test S16: C/C++ decorations are normalized ---
+print("\n[Test S16] Attributes, export macros, and calling conventions")
+info = sniff_block(
+    ["__declspec(dllexport) class MYMODULE_API FDecoratedClass : public Base"],
+    1,
+    ["__declspec(dllexport) class MYMODULE_API FDecoratedClass : public Base", "{"],
+)
+check("decorated class type=class", info.block_type == "class", f"got {info.block_type}")
+check("decorated class name", info.block_name == "FDecoratedClass", f"got {info.block_name}")
+
+info = sniff_block(
+    ["void __stdcall FThing::CallMe(int Value)"],
+    1,
+    ["void __stdcall FThing::CallMe(int Value)", "{"],
+)
+check("calling convention function", info.block_type == "function", f"got {info.block_type}")
+check("calling convention function name", info.block_name == "FThing::CallMe", f"got {info.block_name}")
+
+info = sniff_block(
+    ["alignas(16) struct FAligned"],
+    1,
+    ["alignas(16) struct FAligned", "{"],
+)
+check("alignas struct type=class", info.block_type == "class", f"got {info.block_type}")
+check("alignas struct name", info.block_name == "FAligned", f"got {info.block_name}")
 
 
 # ========================================================================

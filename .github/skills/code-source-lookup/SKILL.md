@@ -19,15 +19,14 @@ Efficient source code lookup using the local MCP server.
 | get_file_content (anchor, 500 chars) | 125 | **Always prefer** for single-symbol context |
 | get_file_content (line range, 100 lines) | 900 | Need broader context |
 | get_file_content (full file) | 45,000 | **BANNED** — never read full files |
-| find_references (pre-computed) | 50–500 | **Try first** for symbol lookup — instant SQL query, returns ref_block context |
 | find_callers (specific symbol) | 127–3,000 | Trace call sites, **best anchor locator** |
 | find_callers (common symbol) | ~27,000 | **Use `scope` to limit!** |
 | find_include_graph (depth=1) | 50–2,100 | File dependencies |
 
-## Tools (7)
+## Tools (5)
 
 ### `get_directory_structure()`
-Returns `total_files`, `total_modules`, `modules` (name+count, top 30), `top_dirs` (path+count).
+Returns `modules` (name+count), `top_dirs` (path+count), `total_files`, `extensions`.
 
 1. Merge/dedup semantically identical modules; mark false positives (e.g. "Private", "Public")
 2. Write slim result to `ref/directory-structure.md`
@@ -54,13 +53,17 @@ FTS5 search with history-accelerated ranking (~2,600 tokens/20 results).
 - `module`: filter by module name (from `get_directory_structure()`)
 - `scope_filter`: **optional** post-filter — see scope_filter boundaries below
 - `expanded_terms`: confirmed class/symbol names for history ranking boost (signal enrichment)
-- `cluster`: **always pass true** — returns block info for free (see below); server default is false
+- Results **always include** block metadata (no need for cluster=true to get block info):
+  - `block_type`: "function", "method", "class", "enum", etc.
+  - `block_name`: e.g. "FShaderCache::GetShader"
+  - `block_range`: e.g. "142-198"
+- `cluster=true` additionally merges hits in the same block into one result with `hit_count`
 - Results include `source` (history_refined or fts) and `final_score`
 
-**`cluster=true` returns additional fields** (free anchor info):
+**`cluster=true` returns additional fields** (dedup + hit count):
 ```json
 {
-  "hit_count": 1,
+  "hit_count": 3,
   "cluster": {
     "block_type": "class",
     "block_name": "FVirtualTextureSystem",
@@ -73,11 +76,23 @@ Use `cluster.open_line/close_line` as `get_file_content(start_line, end_line)` a
 
 ### `get_file_content(file_path, start_line?, end_line?, anchor?, context_chars?)`
 Read file via anchor (preferred) or line range. Auto-records feedback.
-- anchor="Render", context_chars=500 → ~125 tokens (max 5000)
-- start_line=100, end_line=200 → ~900 tokens (max span 200 lines, warns beyond)
+- anchor="Render", context_chars=500 → ~125 tokens
+- start_line=100, end_line=200 → ~900 tokens
 - **BANNED** without anchor or line range (full file ~45K tokens)
-- If anchor unknown, use search_code_source cluster.open_line/close_line, then use start_line/end_line
+- If anchor unknown, use search_code_source block_range or find_callers caller_line, then use start_line/end_line
 - Default context_chars=500~2000; class declarations usually 1000~2000
+
+**Returns enclosing_block metadata** for the anchor/start_line position:
+```json
+{
+  "enclosing_block": {
+    "block_type": "function",
+    "block_name": "MyClass::Tick",
+    "block_range": "142-198",
+    "signature": "void MyClass::Tick(float DeltaTime)"
+  }
+}
+```
 
 ### `log_code_query(query_text, was_useful?, refinement?)`
 Record explicit feedback. Auto-feedback is recorded by `get_file_content` anchor lookups, but has blind spots.
@@ -88,27 +103,31 @@ Record explicit feedback. Auto-feedback is recorded by `get_file_content` anchor
 - After a multi-layer exploration, log the final successful query for the key discovery step
 
 ### `find_include_graph(file_path, direction?, depth?)`
-File dependency query. direction: upstream / downstream / both. depth: recursion level.
+File-level #include dependency query. Complements find_callers (symbol-level refs).
+direction: upstream / downstream / both. depth: recursion level.
 
-### `find_callers(symbol, scope?)`
-Find callers using bracket skeleton analysis. Returns caller_line, block_type/name, block_range.
+### `find_callers(symbol, scope?, limit?)`
+**Primary symbol reference tool** — two-phase search:
+
+1. **Phase 1 (symbol_references)**: Query pre-computed reference table. Fast, block-type-aware,
+   context-filtered (only tracks refs inside function/method/class/enum blocks).
+   Result `source="symbol_references"` — **prefer these results**, they are precise.
+2. **Phase 2 (FTS5 fallback)**: Runtime text search + bracket attribution. Only used when
+   symbol has no pre-computed references. Result `source="fts5_fallback"`.
+
+Supports fuzzy symbol resolution — e.g., "Actor" resolves to "AActor".
+
+Each caller returns: `file_path`, `module_name`, `block_type`, `block_name`, `block_range`, `caller_line`.
+
 - **Best anchor locator** — returns exact line numbers and block ranges
-- Always use `scope` for common symbols
+- Always use `scope` for common symbols (limits to a module)
 - `scope`: module name — use `get_directory_structure()` or `ref/directory-structure.md` for valid values
-- **Dynamic**: scans full file content at runtime (slower but exhaustive)
-
-### `find_references(symbol, limit?)`
-Pre-computed symbol references from `symbol_references` table.
-- **Fastest lookup** — direct SQL query, no file scanning
-- `find_references("BeginPlay", limit=100)` — returns ref_file_path, ref_line, ref_block_type, ref_block_name
-- Returns empty list if symbol has no tracked references (common names filtered during indexing)
-- **Use before `find_callers`** when you need a quick check; fall back to `find_callers` if results are empty
 
 ## Bracket skeleton
 
 ### scope_filter — optional post-filter
 
-**Accepts dict only:**
+**Accepts dict or JSON string:**
 
 | Field | Valid values |
 |-------|-------------|
@@ -117,37 +136,37 @@ Pre-computed symbol references from `symbol_references` table.
 
 `struct X` and `class X` are both `block_type="class"`.
 
-**How it works:** `scope_filter` is a **hit-level post-filter** applied after FTS search. For each FTS hit, it locates the enclosing depth=1 bracket block (via snippet→line mapping + bisect) and removes hits whose enclosing block doesn't match. This is more precise than file-level filtering — a file with both matching and non-matching blocks keeps only the relevant hits. It **cannot** add files that FTS missed.
+**How it works:** `scope_filter` is a **post-filter** applied after FTS search. FTS returns `limit*5` results (e.g. 100 for limit=20), then scope_filter checks whether each result file has any matching depth=1 block, removing non-matches. It **cannot** add files that FTS missed — if the target file isn't in the expanded FTS result set (top-100), scope_filter won't help.
 
-**When scope_filter is useful vs cluster=true:**
+**When scope_filter is useful vs default block info:**
 
 | Scenario | Recommended | Why |
 |----------|------------|-----|
-| Most searches | `cluster=true` (no scope_filter) | cluster provides block info for free, preserves all FTS results |
-| General word + too many irrelevant results | `scope_filter={"block_type":"class"}` | Hit-level filter keeps only hits inside class blocks |
+| Most searches | Default (no scope_filter) | Block info is always returned; preserves all FTS results |
+| General word + too many irrelevant results | `scope_filter={"block_type":"class"}` | Post-filter narrows FTS results to files containing class blocks |
 | Class definition discovery | `raw_query` file_path filter | More reliable than scope_filter |
-| Need only results inside a specific class | `scope_filter={"block_name":"ClassName"}` | Only when FTS already hits inside that class |
+| Need only results inside a specific class | `scope_filter={"block_name":"ClassName"}` | Only when FTS already includes the target file |
 
 **Fallback when scope_filter fails**: Use `raw_query` column filter: `raw_query='(file_path : "MaterialShared") AND "FMaterial"'`
 
 ### Anchor construction
 
 Use anchor from search result metadata:
-- `cluster.open_line/close_line` → `get_file_content(start_line=open_line, end_line=close_line)` (preferred)
-- `block_type="class", block_name="MyComponent"` → `anchor="class MyComponent : public"` (never guess base class)
+- `block_range` (e.g. "142-198") → `get_file_content(start_line=142, end_line=198)` (preferred)
+- `cluster.open_line/close_line` (when cluster=true) → same usage
+- `enclosing_block.signature` → `get_file_content(anchor="void MyClass::Tick")`
 - `find_callers` result → `get_file_content(start_line=caller_line-5, end_line=caller_line+30)`
 
 ## Tool decision matrix
 
-| Sub-problem | Primary tool | Fallback | Notes |
-|------------|-------------|----------|-------|
-| Known exact symbol (quick check) | find_references(symbol) | find_callers | Pre-computed, fastest |
-| Known exact symbol + callers | find_callers(symbol, scope=...) | — | **Best anchor locator** — returns exact lines |
-| Known exact class | search(query, cluster=true) | — | cluster provides block range for free |
-| Concept/pattern exploration | search(query, cluster=true, module=...) | — | Observe module_name distribution first |
-| Type definition | search(raw_query file_path filter) | — | `(file_path : "Header.h") AND "ClassName"` |
-| Call chain (who calls X?) | find_references → find_callers | — | Try fast path first |
-| File dependencies | find_include_graph | — | — |
+| Sub-problem | Primary tool | Notes |
+|------------|-------------|-------|
+| Known exact symbol | search(`query`) | block info always included |
+| Known exact symbol + callers | find_callers(symbol, scope=...) | **Best anchor locator** — pre-computed refs with FTS5 fallback |
+| Concept/pattern exploration | search(`query`, module=...) | Observe module_name + block_type distribution first |
+| Type definition | search(`raw_query` file_path filter) | `(file_path : "Header.h") AND "ClassName"` |
+| Call chain (who calls X?) | find_callers(symbol, scope=...) | NOT for data flow or class hierarchies |
+| File dependencies | find_include_graph | — |
 
 ### module ownership confirmation
 
@@ -183,15 +202,17 @@ The pipeline runs **per Architecture Layer**, moving to the next Layer when the 
 
 ```
 Phase 1: LOCATE — find anchors
-  1A. Known exact class → search(query="ClassName", cluster=true)
-      → cluster.{open_line,close_line} = free anchor
+  1A. Known exact class → search(query="ClassName")
+      → block_range = free anchor
   1B. Known symbol to trace → find_callers(symbol, scope=module)
       → caller_line + block_range = line-level anchor
-  1C. Exploratory → search(query="keyword", cluster=true)
-      → observe module_name distribution + cluster block info
+      → source="symbol_references" (pre-computed) or source="fts5_fallback"
+  1C. Exploratory → search(query="keyword")
+      → observe module_name distribution + block_type/block_name
 
 Phase 2: READ — extract anchor content
-  2A. Have cluster.open_line/close_line → get_file_content(start_line, end_line)
+  2A. Have block_range → get_file_content(start_line, end_line)
+      → enclosing_block provides signature + block metadata
   2B. Have anchor word → get_file_content(anchor="class XXX : public")
   2C. Have find_callers caller_line → get_file_content(start_line=caller_line-5, end_line=caller_line+30)
 
@@ -262,7 +283,7 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms ≥3 chars (trigra
 | query + module + expanded_terms | ✓ | All three coexist |
 | raw_query + module | ✓ | Column filter + module |
 | raw_query + module + expanded_terms | ✓ | All three coexist |
-| cluster=true + any search | ✓ | **Default on** — free block info |
+| cluster=true + any search | ✓ | Merges hits in same block, adds hit_count |
 | scope_filter + query | ⚠ | Only when FTS already hits target file |
 | scope_filter + module | ⚠ | May over-narrow |
 
@@ -275,18 +296,18 @@ Columns: `file_path`, `module_name`, `raw_content`. All terms ≥3 chars (trigra
 | Guessed base class in anchor | `"class XXX : public"` without base |
 | Guessed function name for flow | Use `find_callers` instead |
 | Searched .cpp for class declaration | Class is in .h — search with `file_path :` filter |
-| scope_filter returns 0 | **FTS hit is inside a non-matching block** — broaden scope_filter or use `raw_query` file_path filter instead |
+| scope_filter returns 0 | **FTS didn't hit target file** — use `raw_query` file_path filter instead |
 | module filter returns empty | Drop module param and retry (bare search first to confirm ownership) |
-| Repeated failed anchor | After 1 miss → switch to cluster.open_line/close_line. Do NOT retry anchor |
+| Repeated failed anchor | After 1 miss → switch to block_range. Do NOT retry anchor |
 | Full file read attempted | **BANNED** — must use anchor or start_line/end_line |
 | >5 searches with no new signal | Stop. Output what was found and what remains unknown |
 | expanded_term returned 0 hits | Class name doesn't exist. Drop it, replace with discovered name |
 | history_refined pushes stale results | Use `module` + `raw_query` file_path to override |
-| scope_filter + query returns empty | scope_filter is a hit-level post-filter — FTS hit must be inside a matching block. Use `raw_query` file_path or `cluster=true` instead |
+| scope_filter + query returns empty | scope_filter is a post-filter — FTS result must contain target file. Use `raw_query` file_path or default search instead |
 
 ### scope_filter + query must agree
 
-**Core rule: `scope_filter` is a hit-level post-filter on FTS results. It locates each FTS hit's enclosing depth=1 block and keeps only hits inside matching blocks. The FTS query must already return the target hit, or scope_filter cannot help.**
+**Core rule: `scope_filter` is a post-filter on FTS results. It checks if the file has a matching depth=1 block. The FTS query must already return the target file, or scope_filter cannot help.**
 
 When using scope_filter, keep query to a single precise symbol:
 
@@ -295,4 +316,4 @@ When using scope_filter, keep query to a single precise symbol:
 | Find class IVirtualTexture | `query="IVirtualTexture"`, `scope_filter={"block_type":"class"}` | `query="IVirtualTexture Producer"`, `scope_filter={"block_type":"class"}` |
 | Find FMaterial::Render method | `query="Render"`, `scope_filter={"block_type":"function","block_name":"FMaterial"}` | `query="FMaterial Render shader"`, `scope_filter={"block_type":"function"}` |
 
-**Better alternative for most cases:** Use `cluster=true` instead of scope_filter — it returns block info without filtering, preserving all FTS results.
+**Better alternative for most cases:** Use default search (no scope_filter) — block info is always returned without filtering, preserving all FTS results.

@@ -1,9 +1,6 @@
 """Tests for the backfill_structural_index process."""
-import sqlite3
 import sys
-from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -14,6 +11,7 @@ from code_explore_by_sql.db import (
     backfill_structural_index,
     connect,
     initialize_schema,
+    rebuild_structural_index,
     upsert_source_file,
 )
 
@@ -122,7 +120,9 @@ def test_backfill_creates_symbol_name_index(test_db):
         "SELECT name FROM symbol_name_index"
     ).fetchall()
     name_set = {r["name"] for r in names}
-    assert "MyClass" in name_set or "MyMethod" in name_set
+    assert "MyClass" in name_set
+    assert "MyMethod" in name_set
+    assert "GetValue" in name_set
 
 
 def test_backfill_progress_output(test_db, capsys):
@@ -201,3 +201,69 @@ def test_backfill_creates_all_tables(test_db):
         "symbol_name_index",
     }
     assert expected.issubset(table_names), f"Missing tables: {expected - table_names}"
+
+
+def test_incremental_symbol_references_match_full_backfill(test_db):
+    """Incremental rebuild should track nested symbols like full backfill."""
+    backfill_structural_index(test_db, workers=1, provider_name="cc")
+
+    def ref_rows():
+        return [
+            tuple(r)
+            for r in test_db.execute(
+                """
+                SELECT sr.symbol_name, ref_file.file_path, sr.ref_line
+                FROM symbol_references sr
+                JOIN source_files ref_file ON ref_file.id = sr.ref_file_id
+                WHERE ref_file.file_path = 'Engine/Source/Runtime/Core/TestUser.cpp'
+                  AND sr.symbol_name IN ('MyMethod', 'GetValue')
+                ORDER BY sr.symbol_name, sr.ref_line
+                """
+            ).fetchall()
+        ]
+
+    expected = ref_rows()
+    assert {r[0] for r in expected} == {"MyMethod", "GetValue"}
+
+    user_file = test_db.execute(
+        "SELECT id, raw_content FROM source_files WHERE file_path = ?",
+        ("Engine/Source/Runtime/Core/TestUser.cpp",),
+    ).fetchone()
+
+    rebuild_structural_index(
+        test_db,
+        user_file["id"],
+        user_file["raw_content"],
+        provider_name="cc",
+    )
+
+    assert ref_rows() == expected
+
+
+def test_incremental_symbol_references_remove_stale_rows(test_db):
+    """Incremental rebuild should delete old references even when new refs are empty."""
+    backfill_structural_index(test_db, workers=1, provider_name="cc")
+
+    user_file = test_db.execute(
+        "SELECT id FROM source_files WHERE file_path = ?",
+        ("Engine/Source/Runtime/Core/TestUser.cpp",),
+    ).fetchone()
+
+    before = test_db.execute(
+        "SELECT COUNT(*) as c FROM symbol_references WHERE ref_file_id = ?",
+        (user_file["id"],),
+    ).fetchone()["c"]
+    assert before > 0
+
+    rebuild_structural_index(
+        test_db,
+        user_file["id"],
+        "void UseNothing() {\n    int local = 0;\n}\n",
+        provider_name="cc",
+    )
+
+    after = test_db.execute(
+        "SELECT COUNT(*) as c FROM symbol_references WHERE ref_file_id = ?",
+        (user_file["id"],),
+    ).fetchone()["c"]
+    assert after == 0

@@ -11,6 +11,7 @@ Layer 2: Project-specific (via provider) — ue_macro, ue_declare, etc.
 from __future__ import annotations
 
 import re
+
 from code_explore_by_sql.block_model import BlockInfo, BracketBlock, ExtraBlock
 from code_explore_by_sql.providers.base import AbstractBlockProvider
 
@@ -23,8 +24,8 @@ _EXPORT_KEYWORDS = re.compile(
 
 _NAMESPACE_RE = re.compile(r"\bnamespace\s+(\w+)")
 _CLASS_RE = re.compile(
-    r"\b(class|struct)\s+"
-    r"(?:(?:__attribute__\s*\(\([^)]*\)\)|[A-Z][A-Z0-9_]*(?:\s*\([^)]*\))?)\s+)*"
+    r"(?:^|\s)(class|struct)\s+"
+    r"(?:(?:[A-Z][A-Z0-9_]*_API|[A-Z][A-Z0-9_]*(?:\s*\([^)]*\))?)\s+)*"
     r"(\w+)",
 )
 _ENUM_RE = re.compile(r"\benum\s+(?:class\s+)?(\w+)")
@@ -37,6 +38,18 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _TEMPLATE_RE = re.compile(r"\btemplate\s*<[^<>]*>")
 _BLOCK_KW_RE = re.compile(r"\b(class|struct|namespace|enum)\b")
+_ACCESS_SPECIFIER_RE = re.compile(r"^(?:public|private|protected)\s*:\s*(?://.*)?$")
+_PREPROCESSOR_BOUNDARY_RE = re.compile(r"#\s*(?:if|ifdef|ifndef|elif|else|endif)\b")
+_ATTRIBUTE_RE = re.compile(
+    r"\b(?:__declspec|__attribute__|alignas)\s*\([^)]*(?:\)[^)]*)?\)|\[\[[^\]]*\]\]"
+)
+_CALLING_CONV_RE = re.compile(
+    r"\b(?:__cdecl|__stdcall|__fastcall|__thiscall|__vectorcall|WINAPI|CALLBACK|"
+    r"STDMETHODCALLTYPE|FORCEINLINE|FORCENOINLINE|FORCEINLINE_DEBUGGABLE|inline)\b"
+)
+_EXPORT_MACRO_RE = re.compile(r"\b[A-Z][A-Z0-9_]*_API\b")
+_LEADING_DECORATOR_RE = re.compile(r"^(?:[A-Z][A-Z0-9_]*\s*(?:\([^{};]*\))?\s*)+")
+_MACRO_LIKE_BLOCK_RE = re.compile(r"^[A-Z][A-Z0-9_]*\s*(?:\([^{};]*\))?\s*$")
 
 # Member variable type extraction: TypeLetterCamelCase followed by pointer/ref and a name
 _MEMBER_TYPE_RE = re.compile(
@@ -77,7 +90,132 @@ def _strip_template(text: str) -> str:
         text = new
 
 
+def _strip_outer_template_prefix(text: str) -> str:
+    """Remove leading template<...> prefixes without parsing full C++."""
+    stripped = text.strip()
+    while stripped.startswith("template"):
+        m = re.match(r"template\s*<", stripped)
+        if not m:
+            break
+        depth = 1
+        i = m.end()
+        while i < len(stripped) and depth:
+            if stripped[i] == "<":
+                depth += 1
+            elif stripped[i] == ">":
+                depth -= 1
+            i += 1
+        if depth:
+            break
+        stripped = stripped[i:].strip()
+    return stripped
+
+
+def _normalize_declaration(text: str) -> str:
+    """Normalize local C/C++ declaration text for anchored matching.
+
+    This intentionally avoids macro expansion and full parsing. It removes the
+    compiler decorations that commonly appear between keywords, return types,
+    and names while keeping the declaration's syntactic shape intact.
+    """
+    text = _strip_comments(text)
+    text = _strip_outer_template_prefix(text)
+    text = _ATTRIBUTE_RE.sub(" ", text)
+    text = _CALLING_CONV_RE.sub(" ", text)
+    text = _EXPORT_MACRO_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _line_before_open_brace(line: str) -> str:
+    """Return text before the first opening brace on a line."""
+    before, _sep, _after = line.partition("{")
+    return before.rstrip()
+
+
+def _declaration_boundary(clean: str) -> bool:
+    """Return True if upward declaration gathering must stop before this line."""
+    if not clean:
+        return False
+    if clean.endswith(";") or clean.endswith("}") or clean.endswith("):"):
+        return True
+    if _ACCESS_SPECIFIER_RE.match(clean):
+        return True
+    if _PREPROCESSOR_BOUNDARY_RE.match(clean):
+        return True
+    return False
+
+
+def _gather_declaration_slice(
+    lines: list[str],
+    open_line_0: int,
+    skip_line_re: re.Pattern | None = None,
+    max_lookback: int = 24,
+) -> list[str]:
+    """Gather the nearest declaration for the brace at open_line_0.
+
+    The old heuristic scanned for any block keyword in a broad context, which
+    let a parent class declaration leak into a method body. This version stops
+    at C/C++ declaration boundaries and only keeps the local declaration slice.
+    """
+    if open_line_0 < 0 or open_line_0 >= len(lines):
+        return []
+
+    context: list[str] = []
+    open_text = _line_before_open_brace(lines[open_line_0]).strip()
+    if open_text:
+        context.append(open_text)
+
+    paren_balance = open_text.count("(") - open_text.count(")")
+    angle_balance = open_text.count("<") - open_text.count(">")
+
+    if (
+        open_text
+        and paren_balance <= 0
+        and angle_balance <= 0
+        and (
+            re.search(r"\b(?:namespace|class|struct|enum)\b", open_text)
+            or "(" in open_text
+            or _MACRO_LIKE_BLOCK_RE.match(open_text)
+        )
+    ):
+        return context
+
+    for j in range(open_line_0 - 1, max(open_line_0 - max_lookback, -1), -1):
+        stripped = lines[j].strip()
+        if not stripped:
+            if context and paren_balance <= 0 and angle_balance <= 0:
+                break
+            continue
+        if skip_line_re and skip_line_re.match(stripped):
+            continue
+
+        clean = _strip_comments(stripped).strip()
+        if not clean:
+            continue
+        if _declaration_boundary(clean) and paren_balance <= 0 and angle_balance <= 0:
+            break
+
+        context.insert(0, stripped)
+        paren_balance += clean.count("(") - clean.count(")")
+        angle_balance += clean.count("<") - clean.count(">")
+
+        if (
+            paren_balance <= 0
+            and angle_balance <= 0
+            and (
+                re.search(r"\b(?:namespace|class|struct|enum)\b", clean)
+                or re.search(r"\w\s*\([^;{}]*$", clean)
+                or clean.startswith("template")
+            )
+        ):
+            break
+
+    return context
+
+
 def _extract_function_name(signature: str) -> str | None:
+    signature = re.sub(r"\s*::\s*", "::", signature)
     m = _FUNC_NAME_RE.search(signature)
     if m:
         name = m.group(1).strip()
@@ -146,52 +284,61 @@ def _classify_block(
     """Classify a single bracket block. Returns None if unclassifiable."""
     open_0 = block.open_line - 1  # convert to 0-based
 
-    context = _gather_context(lines, open_0, skip_line_re)
+    context = _gather_declaration_slice(lines, open_0, skip_line_re)
     if not context:
         return None
 
     joined = " ".join(context)
     joined_clean = re.sub(r"\s+", " ", joined).strip()
-    joined_clean = _strip_comments(joined_clean)
-    joined_clean = _strip_template(joined_clean)
-    joined_clean = re.sub(r"\s+", " ", joined_clean).strip()
+    joined_clean = _normalize_declaration(joined_clean)
 
     if not joined_clean:
         return None
 
+    classifier_sig = joined_clean
+    function_sig = _strip_template(joined_clean)
+
     # 0. Preprocessor #define
     if any(_DEFINE_RE.match(line) for line in context):
         return BlockInfo("macro_def", None, joined_clean)
+
+    # 0b. Unknown macro-like statement block. Project providers may index
+    # macro definitions separately; avoid inventing a wrong semantic block.
+    if _MACRO_LIKE_BLOCK_RE.match(joined_clean):
+        return None
 
     # 1. extern "C" — treat as namespace-equivalent container
     if _EXTERN_C_RE.search(joined_clean):
         return BlockInfo("namespace", None, joined_clean)
 
     # 2. Namespace
-    m = _NAMESPACE_RE.search(joined_clean)
+    m = re.match(r"(?:inline\s+)?namespace\s+(\w+)?\s*$", classifier_sig)
     if m:
         return BlockInfo("namespace", m.group(1), joined_clean)
 
     # 3. Enum (before class since "enum class" contains "class")
-    m = _ENUM_RE.search(joined_clean)
+    m = re.match(r"enum\s+(?:class\s+)?(\w+)\b", classifier_sig)
     if m:
         return BlockInfo("enum", m.group(1), joined_clean)
 
     # 4. Class / struct
-    m = _CLASS_RE.search(joined_clean)
+    m = _CLASS_RE.match(classifier_sig)
     if m:
         return BlockInfo("class", m.group(2), joined_clean)
 
     # 5. Function / method detection
     # Strip trailing modifiers to expose the closing `)`
-    test_sig = _TRAILING_MODS_RE.sub("", joined_clean).rstrip()
-    if test_sig.endswith(")"):
+    test_sig = _TRAILING_MODS_RE.sub("", function_sig).rstrip()
+    test_sig = re.sub(r"\s+", " ", test_sig).strip()
+    if test_sig.endswith(")") or re.search(r"\)\s*(?:const\s*)?$", test_sig):
         # Check for destructor
         dtor = _DTOR_RE.search(test_sig)
         if dtor:
             return BlockInfo("function", dtor.group(1), joined_clean)
         # Check for control flow (skip)
-        if _CONTROL_FLOW_RE.search(context[-1] if context else ""):
+        if _CONTROL_FLOW_RE.match(test_sig):
+            return None
+        if _MACRO_LIKE_BLOCK_RE.match(test_sig):
             return None
         name = _extract_function_name(test_sig)
         if name:
@@ -352,6 +499,11 @@ def sniff_semantic_blocks(
     results: list[tuple[int, BlockInfo]] = []
 
     for i, block in enumerate(bracket_blocks):
+        # Top-level semantic blocks recursively explore their interiors. If we
+        # also classify every nested brace here, methods are first recorded as
+        # free functions and then recorded again as class methods.
+        if block.depth != 1:
+            continue
         info = _classify_block(lines, block, skip_re)
         if info is None:
             continue
@@ -402,34 +554,41 @@ def sniff_block(
 
     joined = " ".join(context)
     joined_clean = re.sub(r"\s+", " ", joined).strip()
-    joined_clean = _strip_comments(joined_clean)
-    joined_clean = _strip_template(joined_clean)
-    joined_clean = re.sub(r"\s+", " ", joined_clean).strip()
+    joined_clean = _normalize_declaration(joined_clean)
 
     if any(_DEFINE_RE.match(line) for line in context):
         return BlockInfo("macro_def", None, joined_clean)
 
+    if _MACRO_LIKE_BLOCK_RE.match(joined_clean):
+        return BlockInfo("unknown", None, joined_clean)
+
     if _EXTERN_C_RE.search(joined_clean):
         return BlockInfo("namespace", None, joined_clean)
 
-    m = _NAMESPACE_RE.search(joined_clean)
+    classifier_sig = joined_clean
+    function_sig = _strip_template(joined_clean)
+
+    m = re.match(r"(?:inline\s+)?namespace\s+(\w+)?\s*$", classifier_sig)
     if m:
         return BlockInfo("namespace", m.group(1), joined_clean)
 
-    m = _ENUM_RE.search(joined_clean)
+    m = re.match(r"enum\s+(?:class\s+)?(\w+)\b", classifier_sig)
     if m:
         return BlockInfo("enum", m.group(1), joined_clean)
 
-    m = _CLASS_RE.search(joined_clean)
+    m = _CLASS_RE.match(classifier_sig)
     if m:
         return BlockInfo("class", m.group(2), joined_clean)
 
-    test_sig = _TRAILING_MODS_RE.sub("", joined_clean).rstrip()
-    if test_sig.endswith(")"):
+    test_sig = _TRAILING_MODS_RE.sub("", function_sig).rstrip()
+    test_sig = re.sub(r"\s+", " ", test_sig).strip()
+    if test_sig.endswith(")") or re.search(r"\)\s*(?:const\s*)?$", test_sig):
         dtor = _DTOR_RE.search(test_sig)
         if dtor:
             return BlockInfo("function", dtor.group(1), joined_clean)
-        if _CONTROL_FLOW_RE.search(context[-1] if context else ""):
+        if _CONTROL_FLOW_RE.match(test_sig):
+            return BlockInfo("unknown", None, joined_clean)
+        if _MACRO_LIKE_BLOCK_RE.match(test_sig):
             return BlockInfo("unknown", None, joined_clean)
         name = _extract_function_name(test_sig)
         if name:
@@ -447,7 +606,7 @@ def sniff_blocks_for_file(
     results = []
     for open_line, _close_line in top_blocks:
         open_0 = open_line
-        context = _gather_context(lines, open_0, skip_line_re)
+        context = _gather_declaration_slice(lines, open_0, skip_line_re)
         info = sniff_block(context, open_0, lines, skip_line_re=skip_line_re)
         results.append((open_line, info))
     return results

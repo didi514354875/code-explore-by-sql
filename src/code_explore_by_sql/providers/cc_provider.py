@@ -9,6 +9,16 @@ _INCLUDE_RE = re.compile(r'#\s*include\s+[<"]([^>"]+)[>"]')
 
 CC_SOURCE_EXTENSIONS = {".h", ".hpp", ".hh", ".inl", ".cpp", ".cc", ".cxx"}
 
+# Generic words that appear as identifiers everywhere but carry no
+# structural meaning.  For these, only structural references
+# (calls, member access, template usage) are kept.
+CC_NOISE_WORDS: frozenset[str] = frozenset({
+    'set', 'get', 'value', 'name', 'type', 'not', 'check', 'first',
+    'from', 'empty', 'count', 'read', 'write', 'all', 'none',
+    'input', 'output', 'error', 'warning', 'info', 'index',
+    'size', 'data', 'result', 'status', 'begin', 'end',
+})
+
 
 class CCProvider(AbstractBlockProvider):
     """Standard C/C++ provider with #include parsing and no macro filtering."""
@@ -39,3 +49,6 @@ class CCProvider(AbstractBlockProvider):
     def skip_line_re(self) -> re.Pattern | None:
         """Return None — standard C/C++ skips nothing."""
         return None
+
+    def skip_symbol_names(self) -> frozenset[str]:
+        return CC_NOISE_WORDS

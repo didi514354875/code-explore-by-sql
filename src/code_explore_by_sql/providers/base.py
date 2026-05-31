@@ -65,3 +65,13 @@ class AbstractBlockProvider(ABC):
     def classify_macro(self, line: str) -> tuple[str, str] | None:
         """Classify a macro line. Returns (macro_type, params_text) or None."""
         return None
+
+    def skip_symbol_names(self) -> frozenset[str]:
+        """Return symbol names that should be filtered during reference tracking.
+
+        These are overly generic names (e.g. "set", "value", "name") that appear
+        in nearly every file as identifiers but carry no structural meaning.
+        For these, only structural references (calls, member access, templates)
+        are kept; bare identifier occurrences are dropped.
+        """
+        return frozenset()

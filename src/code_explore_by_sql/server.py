@@ -7,6 +7,8 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import (
     connect,
+    exec_sql_query,
+    find_block_for_line,
     find_enclosing_block,
     find_symbol_references,
     get_source_anchored,
@@ -48,6 +50,7 @@ def search_code_source(
     """Search source code files. Two modes:
 
     1. Simple mode (query): literal text match. Use for single keyword or phrase lookups.
+       Supports fuzzy symbol resolution — e.g., "Actor" resolves to "AActor" for UE projects.
     2. Advanced mode (raw_query): raw FTS5 MATCH expression with AND, OR, NOT, column filters,
        and parentheses for grouping. Trigram tokenizer requires 3+ characters per term.
        Examples:
@@ -71,12 +74,17 @@ def search_code_source(
     Example: {"block_type": "function", "block_name": "Render"}
     Only returns hits inside matching code blocks.
 
+    Results are enriched with enclosing block metadata:
+    - block_type: "function", "method", "class", "enum", etc.
+    - block_name: e.g. "FShaderCache::GetShader"
+    - block_range: e.g. "142-198"
+
     The system automatically:
     - Always performs full FTS5 search (no history-based filtering)
     - Uses history signals for ranking (not filtering) to avoid confirmation bias
     - Records each search in query_logs
-    - Results include "source" and "final_score" fields
-    Returns filename + code snippet.
+    - Results include "source", "final_score", and block metadata fields
+    Returns filename + code snippet + block info.
     """
     if raw_query is None and query is None:
         return [{"error": "Provide either query or raw_query"}]
@@ -131,13 +139,19 @@ def get_file_content(
     anchor: str | None = None,
     context_chars: int = 500,
 ) -> dict[str, Any]:
-    """Return full or line-ranged source file content from the indexed database.
+    """Return source file content with enclosing block metadata.
 
     Two extraction modes:
     1. Line range (start_line / end_line): returns lines between the given bounds.
     2. Anchor (anchor): finds the anchor string via instr() and extracts a
-       context_chars-sized window centered on it. Avoids reading the entire file.
-       context_chars defaults to 500, roughly 12-15 lines of code.
+       context_chars-sized window centered on it. context_chars defaults to 500
+       (~12-15 lines of code). One of anchor or start_line/end_line is required.
+
+    Returns enclosing_block metadata for the anchor/start_line position:
+    - block_type: "function", "method", "class", etc.
+    - block_name: e.g. "MyClass::Tick"
+    - block_range: e.g. "142-198"
+    - signature: e.g. "void MyClass::Tick(float DeltaTime)"
 
     Automatically records feedback when the file was in recent search results.
     """
@@ -152,7 +166,17 @@ def get_file_content(
                     return {"found": False, "file_path": file_path}
                 return {"found": False, "file_path": file_path, "anchor_found": False}
             record_feedback(conn, file_path)
-            return {
+
+            # Compute line number from anchor_pos for block lookup
+            file_id = result["id"]
+            row_full = get_source_by_path(conn, file_path)
+            if row_full:
+                anchor_line = row_full["raw_content"][:result["anchor_pos"]].count("\n") + 1
+                enclosing = find_block_for_line(conn, file_id, anchor_line)
+            else:
+                enclosing = None
+
+            ret: dict[str, Any] = {
                 "found": True,
                 "file_path": result["file_path"],
                 "module_name": result["module_name"],
@@ -160,6 +184,9 @@ def get_file_content(
                 "total_chars": result["total_chars"],
                 "content": result["content"],
             }
+            if enclosing:
+                ret["enclosing_block"] = enclosing
+            return ret
 
         # Require anchor or line range — full-file read is disabled
         if start_line is None and end_line is None:
@@ -178,13 +205,18 @@ def get_file_content(
         content = "\n".join(lines[start - 1 : end])
 
         record_feedback(conn, file_path)
-        result = {
+
+        enclosing = find_block_for_line(conn, row["id"], start)
+
+        result: dict[str, Any] = {
             "found": True,
             "file_path": row["file_path"],
             "module_name": row["module_name"],
             "content": content,
             "total_lines": len(lines),
         }
+        if enclosing:
+            result["enclosing_block"] = enclosing
         if actual_span > MAX_LINE_SPAN:
             result["truncated_warning"] = True
             result["read_lines"] = f"{start}-{end}"
@@ -228,11 +260,14 @@ def find_include_graph(
     direction: str = "both",
     depth: int = 1,
 ) -> dict[str, Any]:
-    """Query include dependency relationships for a file.
+    """Query #include dependency relationships for a file.
+
+    Complements find_callers: use find_callers for symbol-level references (who calls what),
+    and find_include_graph for file-level dependencies (who includes whom).
 
     direction: "upstream" (who includes this file), "downstream" (what this file includes), or "both".
     depth: recursion depth (1 = direct dependencies only, 2 = one level deeper, etc.).
-    Returns include graph as edges.
+    Returns include graph as edges with file paths.
     """
     with _conn() as conn:
         row = get_source_by_path(conn, file_path)
@@ -301,22 +336,109 @@ def find_include_graph(
         }
 
 
+def _find_callers_from_fts(
+    conn,
+    symbol: str,
+    scope: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """FTS5 fallback: text search + bracket attribution for callers."""
+    results = search_source(conn, symbol, module=scope, limit=50)
+
+    callers = []
+    seen_blocks = set()
+    symbol_lower = symbol.lower()
+
+    for r in results:
+        brackets_all = load_bracket_index(conn, r["id"])
+        if not brackets_all:
+            continue
+
+        top_blocks = {b["open_line"]: b for b in brackets_all if b["depth"] == 1}
+
+        row = get_source_by_path(conn, r["file_path"])
+        if not row:
+            continue
+        lines = row["raw_content"].splitlines()
+
+        for line_idx, line in enumerate(lines, start=1):
+            if symbol_lower not in line.lower():
+                continue
+
+            stripped = line.lstrip()
+            if stripped.startswith("#include"):
+                continue
+
+            enclosing = find_enclosing_block(brackets_all, line_idx)
+            if not enclosing:
+                continue
+
+            enclosing_top = None
+            for _tb_open, tb in top_blocks.items():
+                if tb["open_line"] <= line_idx <= tb["close_line"]:
+                    enclosing_top = tb
+                    break
+
+            if not enclosing_top:
+                continue
+
+            block_key = (r["id"], enclosing_top["open_line"])
+            if block_key in seen_blocks:
+                continue
+
+            if enclosing_top.get("block_name") and symbol_lower in (enclosing_top["block_name"] or "").lower():
+                sig = enclosing_top.get("signature") or ""
+                if sig and line_idx <= enclosing_top["open_line"] + 2:
+                    continue
+
+            seen_blocks.add(block_key)
+
+            callers.append({
+                "file_path": r["file_path"],
+                "module_name": r["module_name"],
+                "block_type": enclosing_top["block_type"],
+                "block_name": enclosing_top.get("block_name"),
+                "block_range": f"{enclosing_top['open_line']}-{enclosing_top['close_line']}",
+                "caller_line": line_idx,
+            })
+
+            if len(callers) >= limit:
+                return callers
+
+    return callers
+
+
 @mcp.tool()
 def find_callers(
     symbol: str,
     scope: str | None = None,
+    limit: int = 50,
 ) -> dict[str, Any]:
-    """Find callers of a symbol using bracket skeleton + text search.
+    """Find callers/references of a symbol with pre-computed data + FTS5 fallback.
 
-    Searches for the symbol name in all indexed files, then uses bracket_index
-    to locate which function/class each occurrence belongs to by finding the
-    symbol text within block line ranges (not just file-level matching).
+    Two-phase search:
+    1. Query symbol_references table (fast, block-type-aware, pre-computed during index).
+    2. If no pre-computed results, fallback to FTS5 full-text search + bracket attribution.
 
-    scope: optional module name to limit search scope.
-    Returns list of callers with file, enclosing function, and line info.
+    Supports fuzzy symbol resolution — e.g., "Actor" resolves to "AActor".
+
+    symbol: the symbol name to search for (e.g., "FVector", "BeginPlay", "Actor").
+    scope: optional module name to limit search scope (use get_directory_structure to
+           discover valid module names).
+    limit: maximum number of callers to return (default 50).
+
+    Each caller includes:
+    - file_path, module_name
+    - block_type: "function", "method", "class", etc.
+    - block_name: e.g. "FShaderCache::GetShader"
+    - block_range: e.g. "142-198"
+    - caller_line: the line where the symbol is referenced
+
+    Result includes 'source' field: "symbol_references" (pre-computed) or
+    "fts5_fallback" (runtime text search). Prefer symbol_references results
+    as they are block-type-aware and context-filtered.
     """
     with _conn() as conn:
-        # Try fuzzy resolution first
         original_symbol = symbol
         fuzzy_result = _fuzzy_resolve_symbol(conn, symbol, limit=3)
         if fuzzy_result.get('expanded'):
@@ -324,120 +446,50 @@ def find_callers(
         elif fuzzy_result.get('suggestions') and not fuzzy_result.get('exact'):
             return {
                 "symbol": original_symbol,
+                "source": None,
                 "did_you_mean": fuzzy_result['suggestions'],
                 "callers": [],
                 "message": f"No exact match for '{original_symbol}'. Did you mean one of these?",
             }
 
-        results = search_source(conn, symbol, module=scope, limit=50)
-
-        callers = []
-        seen_blocks = set()
-        symbol_lower = symbol.lower()
-
-        for r in results:
-            # Load ALL bracket blocks (not just depth=1) for precise enclosing
-            brackets_all = load_bracket_index(conn, r["id"])
-            if not brackets_all:
-                continue
-
-            # Build a quick lookup: depth=1 blocks by open_line
-            top_blocks = {b["open_line"]: b for b in brackets_all if b["depth"] == 1}
-
-            # Get file content to find exact symbol locations
-            row = get_source_by_path(conn, r["file_path"])
-            if not row:
-                continue
-            lines = row["raw_content"].splitlines()
-
-            # Find all lines containing the symbol (1-based)
-            for line_idx, line in enumerate(lines, start=1):
-                if symbol_lower not in line.lower():
+        # Phase 1: pre-computed symbol_references
+        refs = find_symbol_references(conn, symbol, limit=limit, scope=scope)
+        if refs:
+            callers = []
+            seen = set()
+            for r in refs:
+                key = (r["ref_file_path"], r.get("ref_block_name"), r["ref_line"])
+                if key in seen:
                     continue
-
-                # Skip preprocessor #include and #define lines
-                stripped = line.lstrip()
-                if stripped.startswith("#include"):
-                    continue
-
-                # Find the enclosing block for this line
-                enclosing = find_enclosing_block(brackets_all, line_idx)
-                if not enclosing:
-                    continue
-
-                # The enclosing block might already be depth=1, or we need
-                # to find which depth=1 block contains this line
-                enclosing_top = None
-                for _tb_open, tb in top_blocks.items():
-                    if tb["open_line"] <= line_idx <= tb["close_line"]:
-                        enclosing_top = tb
-                        break
-
-                if not enclosing_top:
-                    continue
-
-                block_key = (r["id"], enclosing_top["open_line"])
-                if block_key in seen_blocks:
-                    continue
-
-                # Skip the definition block (where the symbol is the block name)
-                if enclosing_top.get("block_name") and symbol_lower in (enclosing_top["block_name"] or "").lower():
-                    # Extra check: if the symbol appears on the signature line,
-                    # it's the definition, not a call
-                    sig = enclosing_top.get("signature") or ""
-                    if sig and line_idx <= enclosing_top["open_line"] + 2:
-                        continue
-
-                seen_blocks.add(block_key)
-
+                seen.add(key)
                 callers.append({
-                    "file_path": r["file_path"],
-                    "module_name": r["module_name"],
-                    "block_type": enclosing_top["block_type"],
-                    "block_name": enclosing_top.get("block_name"),
-                    "block_range": f"{enclosing_top['open_line']}-{enclosing_top['close_line']}",
-                    "caller_line": line_idx,
+                    "file_path": r["ref_file_path"],
+                    "module_name": r.get("ref_module_name"),
+                    "block_type": r.get("ref_block_type"),
+                    "block_name": r.get("ref_block_name"),
+                    "block_range": (
+                        f"{r['ref_block_open']}-{r['ref_block_close']}"
+                        if r.get("ref_block_open") else None
+                    ),
+                    "caller_line": r["ref_line"],
                 })
+            result = {
+                "symbol": symbol,
+                "source": "symbol_references",
+                "callers": callers,
+                "total": len(callers),
+            }
+            if fuzzy_result.get('expanded'):
+                result['expanded_from'] = original_symbol
+            return result
 
+        # Phase 2: FTS5 fallback
+        callers = _find_callers_from_fts(conn, symbol, scope, limit)
         result = {
             "symbol": symbol,
+            "source": "fts5_fallback",
             "callers": callers,
             "total": len(callers),
-        }
-        if fuzzy_result.get('expanded'):
-            result['expanded_from'] = original_symbol
-        return result
-
-
-@mcp.tool()
-def find_references(symbol: str, limit: int = 100) -> dict[str, Any]:
-    """Find references to a symbol from the pre-computed symbol_references table.
-
-    symbol: the symbol name to find references for (e.g., "UMyClass", "BeginPlay").
-    limit: maximum number of references to return (default 100).
-
-    Returns pre-computed references with file paths and enclosing block info.
-    Falls back to empty list if symbol_references table is not yet populated.
-    """
-    with _conn() as conn:
-        # Try fuzzy resolution first
-        original_symbol = symbol
-        fuzzy_result = _fuzzy_resolve_symbol(conn, symbol, limit=3)
-        if fuzzy_result.get('expanded'):
-            symbol = fuzzy_result['expanded']
-        elif fuzzy_result.get('suggestions') and not fuzzy_result.get('exact'):
-            return {
-                "symbol": original_symbol,
-                "did_you_mean": fuzzy_result['suggestions'],
-                "references": [],
-                "message": f"No exact match for '{original_symbol}'. Did you mean one of these?",
-            }
-
-        refs = find_symbol_references(conn, symbol, limit)
-        result = {
-            "symbol": symbol,
-            "references": refs,
-            "total": len(refs),
         }
         if fuzzy_result.get('expanded'):
             result['expanded_from'] = original_symbol
@@ -460,6 +512,35 @@ def get_directory_structure() -> dict[str, Any]:
     """
     with _conn() as conn:
         return get_directory_structure_db(conn)
+
+
+# @mcp.tool()
+# def exec_sql(
+#     sql: str,
+#     expanded_terms: list[str] | None = None,
+# ) -> dict[str, Any]:
+#     """Execute a raw SQL SELECT query against the indexed source code database.
+
+#     Tables:
+#       source_files        (id, file_path, module_name, raw_content, content_hash, updated_at)
+#       source_files_fts    FTS5 virtual table on source_files (file_path, module_name, raw_content)
+#       bracket_index       (id, file_id, open_line, close_line, depth, block_type, block_name, signature, is_complete, parent_id, extra_fields)
+#       symbol_references   (id, symbol_name, symbol_type, symbol_file_id, ref_file_id, ref_block_id, ref_line, confidence, context, edge_type)
+#       include_edges       (id, source_file_id, include_path, target_file_id, line_number)
+#       symbol_name_index   (name, source_type, source_id, file_id, block_type, module_name, qualified_name, member_types) WITHOUT ROWID
+#       extra_blocks        (id, file_id, name, block_type, start_line, end_line, params, signature)
+#       member_types        (id, block_id, type_name, line_number)
+#       query_logs          (id, query_text, fts_match, hit_file_ids, hit_count, was_useful, refinement, template_id, created_at)
+#       query_logs_fts      FTS5 virtual table on query_logs (query_text, fts_match)
+#       query_note          (id, query_log_id, adopted_file_id, was_useful, refinement, note, created_at)
+#       query_log_view      VIEW joining query_logs + query_note + source_files
+
+#     Security: Only SELECT/WITH statements. Max 200 result rows.
+#     expanded_terms: keywords for history-based score enrichment. If results contain
+#       file_id or file_path, each row may get a 'history_score' field.
+#     """
+#     with _conn() as conn:
+#         return exec_sql_query(conn, sql, expanded_terms=expanded_terms)
 
 
 def main() -> None:

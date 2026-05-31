@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from .base import IncludeDirective
-from .cc_provider import CCProvider
+from .cc_provider import CCProvider, CC_NOISE_WORDS
 from code_explore_by_sql.block_model import ExtraBlock
 
 UE_SKIP_MACROS = frozenset(
@@ -96,3 +96,14 @@ class UnrealProvider(CCProvider):
                 continue
 
         return blocks
+
+    # UE-specific noise in addition to the C/C++ base set
+    _UE_EXTRA_NOISE: frozenset[str] = frozenset({
+        'Pin', 'Section', 'View', 'Instance', 'Platform',
+        'This', 'Material', 'Class', 'Struct', 'Widget', 'Level',
+        'Normal', 'Width', 'Label', 'Desc', 'Stats', 'Default',
+        'Inc', 'System', 'Interface', 'Entry', 'Actor',
+    })
+
+    def skip_symbol_names(self) -> frozenset[str]:
+        return CC_NOISE_WORDS | self._UE_EXTRA_NOISE

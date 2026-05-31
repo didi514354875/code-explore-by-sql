@@ -1,5 +1,7 @@
 # Directory Structure
 total_files: 84696
+total_modules: 1637
+
 ## Valid modules (top 30)
 - Runtime (18364)
 - Editor (7995)
@@ -28,9 +30,8 @@ total_files: 84696
 - DynamicMesh (246)
 - GameplayCamerasEditor (243)
 - AvalancheMedia (241)
+
 ## False positive modules
-- Private, Public, null (generic directory names)
-## Top directories
-- Engine/Source (34117) — main engine source
-- Engine/Plugins (47949) — plugins
-- Engine/Shaders (1140) — shader files
+- null (2067) — unattributed files
+- Private (984) — directory name leaked as module
+- Public (379) — directory name leaked as module

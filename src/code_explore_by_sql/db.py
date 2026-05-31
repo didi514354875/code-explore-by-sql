@@ -368,9 +368,10 @@ def _scan_file_content(
     extra_block_rows: non-brace blocks (UE macros, #define macros, etc.)
     """
     import json
+
     from code_explore_by_sql.bracket_scanner import scan_brackets
     from code_explore_by_sql.providers import get_provider
-    from code_explore_by_sql.symbol_sniffer import sniff_semantic_blocks, extract_extra_blocks
+    from code_explore_by_sql.symbol_sniffer import extract_extra_blocks, sniff_semantic_blocks
 
     bracket_rows: list[tuple] = []
     include_rows: list[tuple] = []
@@ -641,9 +642,11 @@ def backfill_structural_index(
     conn.commit()
     print(f"  bracket indexes built in {time.time() - t_idx:.1f}s", flush=True)
 
+    reference_file_ids = sorted(file_blocks.keys())
     print(f"  parent_id: computing for {len(file_blocks):,} files...", flush=True)
     t_phase2b = time.time()
     _backfill_parent_ids(conn, file_blocks)
+    del file_blocks
     elapsed_phase2b = time.time() - t_phase2b
     conn.execute("CREATE INDEX idx_bracket_parent ON bracket_index(parent_id)")
     conn.commit()
@@ -664,9 +667,9 @@ def backfill_structural_index(
     print(f"  extra_blocks: {extra_count:,} non-brace blocks", flush=True)
 
     # --- Phase 2c: Generate symbol_references ---
-    print(f"  symbol_references: collecting trackable symbols...", flush=True)
+    print("  symbol_references: collecting trackable symbols...", flush=True)
     t_phase2c = time.time()
-    _backfill_symbol_references(conn, file_blocks, provider, workers=workers)
+    _backfill_symbol_references(conn, provider, workers=workers, file_ids=reference_file_ids)
     elapsed_phase2c = time.time() - t_phase2c
     ref_count = conn.execute("SELECT COUNT(*) as c FROM symbol_references").fetchone()["c"]
     print(f"  symbol_references done: {ref_count:,} refs in {elapsed_phase2c:.1f}s", flush=True)
@@ -686,7 +689,7 @@ def backfill_structural_index(
     print(f"  symbol_references indexes built in {time.time() - t_idx:.1f}s", flush=True)
 
     # --- Phase 2d: Build symbol_name_index (unified symbol table) ---
-    print(f"  symbol_name_index: building unified symbol table...", flush=True)
+    print("  symbol_name_index: building unified symbol table...", flush=True)
     t_phase2d = time.time()
     _build_symbol_name_index(conn)
     elapsed_phase2d = time.time() - t_phase2d
@@ -707,16 +710,17 @@ def _backfill_parent_ids(
     """
     from code_explore_by_sql.bracket_scanner import compute_parent_ids
 
-    all_updates: list[tuple] = []
     file_ids = sorted(file_blocks.keys())
     batch_size = 1000
     total_batches = (len(file_ids) + batch_size - 1) // batch_size
+    total_updates = 0
 
     print(f"    parent_id: {len(file_ids):,} files in {total_batches} batches", flush=True)
 
     for i in range(0, len(file_ids), batch_size):
         batch_file_ids = file_ids[i:i + batch_size]
         placeholders = ",".join("?" * len(batch_file_ids))
+        batch_updates: list[tuple] = []
 
         # Load only this batch of files' bracket rows
         batch_rows = conn.execute(
@@ -753,32 +757,35 @@ def _backfill_parent_ids(
                 parent_key = parent_map.get(key)
                 if parent_key is not None:
                     parent_id = id_lookup.get(parent_key)
-                    all_updates.append((parent_id, child_id))
+                    batch_updates.append((parent_id, child_id))
+
+        if batch_updates:
+            conn.executemany(
+                "UPDATE bracket_index SET parent_id = ? WHERE id = ?",
+                batch_updates,
+            )
+            conn.commit()
+            total_updates += len(batch_updates)
 
         processed = min(i + batch_size, len(file_ids))
         print(f"    parent_id batch: {processed}/{len(file_ids)} ({processed/len(file_ids)*100:.0f}%) "
-              f"{len(all_updates):,} links so far", flush=True)
+              f"{total_updates:,} links so far", flush=True)
 
-    if all_updates:
-        print(f"    parent_id: committing {len(all_updates):,} updates...", flush=True)
-        conn.executemany(
-            "UPDATE bracket_index SET parent_id = ? WHERE id = ?",
-            all_updates,
-        )
-        print(f"    parent_id: {len(all_updates):,} updates committed", flush=True)
+    if total_updates:
+        print(f"    parent_id: {total_updates:,} updates committed", flush=True)
 
 
 def _backfill_symbol_references(
     conn: sqlite3.Connection,
-    file_blocks: dict[int, list],
     provider: Any,
     workers: int = 1,
+    file_ids: list[int] | None = None,
 ) -> None:
     """Generate symbol_references from all indexed files.
 
-    file_blocks: file_id -> list of BracketBlock objects.
     provider: provider instance for skip_line_re.
     workers: number of parallel processes for CPU-bound reference scanning.
+    file_ids: optional list of file IDs to scan. If omitted, derived from bracket_index.
     """
     from code_explore_by_sql.sniffers.reference_tracker import (
         ReferenceTrackerConfig,
@@ -790,6 +797,8 @@ def _backfill_symbol_references(
     config = ReferenceTrackerConfig()
     skip_line_re_fn = getattr(provider, "skip_line_re", None)
     skip_line_re = skip_line_re_fn() if skip_line_re_fn else None
+    skip_names_fn = getattr(provider, "skip_symbol_names", None)
+    skip_names = skip_names_fn() if skip_names_fn else frozenset()
 
     # Step 1: Collect all named symbols (any depth) and pre-filter once
     rows = conn.execute(
@@ -804,8 +813,8 @@ def _backfill_symbol_references(
         if name and len(name) >= config.min_name_length and name not in config.skip_keywords:
             symbol_def_counts[name] += 1
 
-    # Pre-filter AND pre-build target_symbols dict (name -> [sym_dict, ...]) ONCE
-    target_symbols: dict[str, list[dict]] = {}
+    # Pre-filter AND pre-build target_symbols dict (name -> lightweight tuples) ONCE
+    target_symbols: dict[str, list[tuple[str, int, int]]] = {}
     for r in rows:
         name = r["block_name"]
         if not name or len(name) < config.min_name_length:
@@ -814,14 +823,11 @@ def _backfill_symbol_references(
             continue
         if symbol_def_counts[name] > config.max_definition_count:
             continue
-        target_symbols.setdefault(name, []).append({
-            "name": name,
-            "type": r["block_type"],
-            "file_id": r["file_id"],
-            "block_id": r["id"],
-            "open_line": r["open_line"],
-            "close_line": r["close_line"],
-        })
+        target_symbols.setdefault(name, []).append((
+            r["block_type"],
+            r["file_id"],
+            r["open_line"],
+        ))
 
     if not target_symbols:
         print("    references: no trackable symbols found, skipping", flush=True)
@@ -842,7 +848,14 @@ def _backfill_symbol_references(
     )
     total_refs = 0
 
-    file_ids = sorted(file_blocks.keys())
+    if file_ids is None:
+        file_ids = [
+            r["file_id"] for r in conn.execute(
+                "SELECT DISTINCT file_id FROM bracket_index ORDER BY file_id"
+            ).fetchall()
+        ]
+    else:
+        file_ids = sorted(file_ids)
     offset = 0
     batch_size = 1000
     t_refs = time.time()
@@ -853,38 +866,36 @@ def _backfill_symbol_references(
             batch_ids = file_ids[offset:offset + batch_size]
             id_list = ",".join(str(fid) for fid in batch_ids)
 
-            # Batch load file contents + bracket data
+            # Batch load file contents + bracket data (with block_type for filtering)
             content_rows = conn.execute(
                 f"SELECT id, raw_content FROM source_files WHERE id IN ({id_list})"
             ).fetchall()
             bracket_rows = conn.execute(
-                f"SELECT id, file_id, open_line, close_line, depth "
+                f"SELECT id, file_id, open_line, close_line, depth, block_type "
                 f"FROM bracket_index WHERE file_id IN ({id_list}) ORDER BY open_line"
             ).fetchall()
             brackets_by_file: dict[int, list[dict]] = defaultdict(list)
             for br in bracket_rows:
                 brackets_by_file[br["file_id"]].append(dict(br))
-            # Pre-extract arrays for each file
-            arrays_by_file: dict[int, tuple] = {
-                fid: prepare_bracket_arrays(bd)
-                for fid, bd in brackets_by_file.items()
-            }
-
             for row in content_rows:
                 fid = row["id"]
                 lines = row["raw_content"].split("\n")
+                bd = brackets_by_file.get(fid, [])
 
                 refs = track_references_for_file(
                     lines, fid, target_symbols,
                     skip_line_re=skip_line_re, check_set=check_set,
+                    skip_names=skip_names, bracket_data=bd,
                 )
                 if refs:
+                    bracket_arrays = prepare_bracket_arrays(bd)
                     enriched = enrich_ref_block_ids(
-                        refs, arrays_by_file.get(fid, ([], [], [], [])))
+                        refs, bracket_arrays)
                     conn.executemany(_REF_SQL, enriched)
                     total_refs += len(enriched)
 
-            offset += batch_size
+            conn.commit()
+            offset += len(batch_ids)
             elapsed = time.time() - t_refs
             rate = offset / elapsed if elapsed > 0 else 0
             eta = (len(file_ids) - offset) / rate if rate > 0 else 0
@@ -894,55 +905,63 @@ def _backfill_symbol_references(
         # Multi-process path: CPU work in workers, DB writes in main process
         from multiprocessing import Pool
 
-        # Pre-build all tasks upfront so workers stay fed
-        all_tasks: list[tuple] = []
-        for i in range(0, len(file_ids), batch_size):
-            batch_ids = file_ids[i:i + batch_size]
-            id_list = ",".join(str(fid) for fid in batch_ids)
-
-            content_rows = conn.execute(
-                f"SELECT id, raw_content FROM source_files WHERE id IN ({id_list})"
-            ).fetchall()
-            bracket_rows = conn.execute(
-                f"SELECT id, file_id, open_line, close_line, depth "
-                f"FROM bracket_index WHERE file_id IN ({id_list}) ORDER BY open_line"
-            ).fetchall()
-            brackets_by_file_mp: dict[int, list[dict]] = defaultdict(list)
-            for br in bracket_rows:
-                brackets_by_file_mp[br["file_id"]].append(dict(br))
-            arrays_by_file_mp: dict[int, tuple] = {
-                fid: prepare_bracket_arrays(bd)
-                for fid, bd in brackets_by_file_mp.items()
-            }
-
-            for row in content_rows:
-                all_tasks.append((
-                    row["raw_content"].split("\n"), row["id"],
-                    arrays_by_file_mp.get(row["id"], ([], [], [], [])),
-                ))
-
-        pending = len(all_tasks)
         with Pool(
             processes=workers,
             initializer=_ref_worker_init,
-            initargs=(target_symbols, skip_line_re, check_set),
+            initargs=(target_symbols, skip_line_re, check_set, skip_names),
         ) as pool:
             commit_interval = 2000
-            for ref_rows in pool.imap_unordered(_ref_scan_worker, all_tasks, chunksize=64):
-                if ref_rows:
-                    conn.executemany(_REF_SQL, ref_rows)
-                    total_refs += len(ref_rows)
-                pending -= 1
-                if pending % commit_interval == 0:
-                    conn.commit()
-                    done = len(all_tasks) - pending
-                    elapsed = time.time() - t_refs
-                    rate = done / elapsed if elapsed > 0 else 0
-                    eta = (pending / rate) if rate > 0 else 0
-                    print(f"    references: {done}/{len(file_ids)} ({done/len(file_ids)*100:.0f}%) "
-                          f"{total_refs:,} refs, {rate:.0f} files/s ETA {eta:.0f}s", flush=True)
+            done = 0
+            since_commit = 0
+            for i in range(0, len(file_ids), batch_size):
+                batch_ids = file_ids[i:i + batch_size]
+                id_list = ",".join(str(fid) for fid in batch_ids)
+
+                content_rows = conn.execute(
+                    f"SELECT id, raw_content FROM source_files WHERE id IN ({id_list})"
+                ).fetchall()
+                bracket_rows = conn.execute(
+                    f"SELECT id, file_id, open_line, close_line, depth, block_type "
+                    f"FROM bracket_index WHERE file_id IN ({id_list}) ORDER BY open_line"
+                ).fetchall()
+                brackets_by_file_mp: dict[int, list[dict]] = defaultdict(list)
+                for br in bracket_rows:
+                    brackets_by_file_mp[br["file_id"]].append(dict(br))
+                arrays_by_file_mp: dict[int, tuple] = {
+                    fid: prepare_bracket_arrays(bd)
+                    for fid, bd in brackets_by_file_mp.items()
+                }
+                batch_tasks = [
+                    (
+                        row["raw_content"].split("\n"),
+                        row["id"],
+                        arrays_by_file_mp.get(row["id"], ([], [], [], [])),
+                        brackets_by_file_mp.get(row["id"], []),
+                    )
+                    for row in content_rows
+                ]
+
+                for ref_rows in pool.imap_unordered(_ref_scan_worker, batch_tasks, chunksize=64):
+                    if ref_rows:
+                        conn.executemany(_REF_SQL, ref_rows)
+                        total_refs += len(ref_rows)
+                    done += 1
+                    since_commit += 1
+                    if since_commit >= commit_interval:
+                        conn.commit()
+                        since_commit = 0
+                        elapsed = time.time() - t_refs
+                        rate = done / elapsed if elapsed > 0 else 0
+                        eta = ((len(file_ids) - done) / rate) if rate > 0 else 0
+                        print(f"    references: {done}/{len(file_ids)} ({done/len(file_ids)*100:.0f}%) "
+                              f"{total_refs:,} refs, {rate:.0f} files/s ETA {eta:.0f}s", flush=True)
+                conn.commit()
+                elapsed = time.time() - t_refs
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = ((len(file_ids) - done) / rate) if rate > 0 else 0
+                print(f"    references: {done}/{len(file_ids)} ({done/len(file_ids)*100:.0f}%) "
+                      f"{total_refs:,} refs, {rate:.0f} files/s ETA {eta:.0f}s", flush=True)
             conn.commit()
-            done = len(all_tasks)
             elapsed = time.time() - t_refs
             rate = done / elapsed if elapsed > 0 else 0
             print(f"    references: {done}/{len(file_ids)} ({done/len(file_ids)*100:.0f}%) "
@@ -953,6 +972,7 @@ def _backfill_symbol_references(
 _WORKER_TARGET_SYMBOLS: dict | None = None
 _WORKER_SKIP_LINE_RE: re.Pattern | None = None
 _WORKER_CHECK_SET: set | None = None
+_WORKER_SKIP_NAMES: frozenset | None = None
 
 
 def _build_symbol_name_index(conn: sqlite3.Connection) -> None:
@@ -962,11 +982,9 @@ def _build_symbol_name_index(conn: sqlite3.Connection) -> None:
     Populates qualified_name for methods (ClassName::MethodName).
     Extracts member_types from extra_fields JSON for class/struct blocks.
     """
-    import json
-
     # Clear existing data
     conn.execute("DELETE FROM symbol_name_index")
-    print(f"    symbol_name_index: clearing existing data", flush=True)
+    print("    symbol_name_index: clearing existing data", flush=True)
 
     # Insert from bracket_index (brace-delimited blocks)
     # Build qualified names for methods by joining with parent class
@@ -1090,15 +1108,17 @@ def _fuzzy_resolve_symbol(
 
 
 def _ref_worker_init(
-    target_symbols: dict[str, list[dict]],
+    target_symbols: dict[str, list[tuple[str, int, int]]],
     skip_line_re: re.Pattern | None,
     check_set: set[str],
+    skip_names: frozenset[str] | None = None,
 ) -> None:
     """Initialize worker process with shared read-only data (once per worker)."""
-    global _WORKER_TARGET_SYMBOLS, _WORKER_SKIP_LINE_RE, _WORKER_CHECK_SET
+    global _WORKER_TARGET_SYMBOLS, _WORKER_SKIP_LINE_RE, _WORKER_CHECK_SET, _WORKER_SKIP_NAMES
     _WORKER_TARGET_SYMBOLS = target_symbols
     _WORKER_SKIP_LINE_RE = skip_line_re
     _WORKER_CHECK_SET = check_set
+    _WORKER_SKIP_NAMES = skip_names or frozenset()
 
 
 def _ref_scan_worker(args: tuple) -> list[tuple]:
@@ -1108,12 +1128,14 @@ def _ref_scan_worker(args: tuple) -> list[tuple]:
         track_references_for_file,
     )
 
-    lines, fid, bracket_arrays = args
+    lines, fid, bracket_arrays, bracket_data = args
 
     refs = track_references_for_file(
         lines, fid, _WORKER_TARGET_SYMBOLS,
         skip_line_re=_WORKER_SKIP_LINE_RE,
         check_set=_WORKER_CHECK_SET,
+        skip_names=_WORKER_SKIP_NAMES,
+        bracket_data=bracket_data,
     )
     if not refs:
         return []
@@ -1166,6 +1188,7 @@ def get_source_anchored(
     row = conn.execute(
         """
         SELECT
+            id,
             file_path,
             module_name,
             instr(raw_content, ?) AS anchor_pos,
@@ -1259,9 +1282,10 @@ def rebuild_structural_index(
     provider_name: name of the provider to use for include parsing and line filtering.
     """
     import json
-    from code_explore_by_sql.bracket_scanner import scan_brackets, compute_parent_ids
+
+    from code_explore_by_sql.bracket_scanner import compute_parent_ids, scan_brackets
     from code_explore_by_sql.providers import get_provider
-    from code_explore_by_sql.symbol_sniffer import sniff_semantic_blocks, extract_extra_blocks
+    from code_explore_by_sql.symbol_sniffer import extract_extra_blocks, sniff_semantic_blocks
 
     provider = get_provider(provider_name)
 
@@ -1375,10 +1399,17 @@ def _rebuild_file_symbol_references(
 
     config = ReferenceTrackerConfig()
 
-    # Collect all named depth=1 symbols that could be referenced from this file
+    # Delete old references for this file before any early return. This prevents
+    # stale rows when a file is changed to remove all references or all symbols.
+    conn.execute("DELETE FROM symbol_references WHERE ref_file_id = ?", (file_id,))
+
+    # Collect the same symbol universe as full backfill: all named, classified
+    # symbols at any depth. Keeping this in sync with _backfill_symbol_references
+    # avoids full-backfill vs incremental-update reference drift.
     symbol_rows = conn.execute(
         "SELECT id, file_id, block_name, block_type, open_line, close_line "
-        "FROM bracket_index WHERE depth = 1 AND block_name IS NOT NULL"
+        "FROM bracket_index WHERE block_name IS NOT NULL "
+        "AND block_type NOT IN ('unknown', 'control_flow')"
     ).fetchall()
 
     symbol_def_counts: dict[str, int] = {}
@@ -1387,7 +1418,7 @@ def _rebuild_file_symbol_references(
         if name and len(name) >= config.min_name_length and name not in config.skip_keywords:
             symbol_def_counts[name] = symbol_def_counts.get(name, 0) + 1
 
-    target_symbols: dict[str, list[dict]] = {}
+    target_symbols: dict[str, list[tuple[str, int, int]]] = {}
     for r in symbol_rows:
         name = r["block_name"]
         if not name or len(name) < config.min_name_length:
@@ -1396,10 +1427,9 @@ def _rebuild_file_symbol_references(
             continue
         if symbol_def_counts.get(name, 0) > config.max_definition_count:
             continue
-        target_symbols.setdefault(name, []).append({
-            "name": name, "type": r["block_type"], "file_id": r["file_id"],
-            "block_id": r["id"], "open_line": r["open_line"], "close_line": r["close_line"],
-        })
+        target_symbols.setdefault(name, []).append((
+            r["block_type"], r["file_id"], r["open_line"],
+        ))
 
     if not target_symbols:
         return
@@ -1407,20 +1437,22 @@ def _rebuild_file_symbol_references(
     check_set = set(target_symbols)
     skip_line_re_fn = getattr(provider, "skip_line_re", None)
     skip_line_re = skip_line_re_fn() if skip_line_re_fn else None
+    skip_names_fn = getattr(provider, "skip_symbol_names", None)
+    skip_names = skip_names_fn() if skip_names_fn else frozenset()
 
-    # Delete old references for this file
-    conn.execute("DELETE FROM symbol_references WHERE ref_file_id = ?", (file_id,))
+    bracket_rows = conn.execute(
+        "SELECT id, open_line, close_line, depth, block_type "
+        "FROM bracket_index WHERE file_id = ? ORDER BY open_line", (file_id,),
+    ).fetchall()
+    bracket_data = [dict(b) for b in bracket_rows]
 
     refs = track_references_for_file(lines, file_id, target_symbols,
-                                     skip_line_re=skip_line_re, check_set=check_set)
+                                     skip_line_re=skip_line_re, check_set=check_set,
+                                     skip_names=skip_names, bracket_data=bracket_data)
     if not refs:
         return
 
-    bracket_rows = conn.execute(
-        "SELECT id, open_line, close_line, depth "
-        "FROM bracket_index WHERE file_id = ? ORDER BY open_line", (file_id,),
-    ).fetchall()
-    bracket_arrays = prepare_bracket_arrays([dict(b) for b in bracket_rows])
+    bracket_arrays = prepare_bracket_arrays(bracket_data)
     enriched = enrich_ref_block_ids(refs, bracket_arrays)
 
     conn.executemany(
@@ -1545,17 +1577,53 @@ def find_enclosing_block(
     return best
 
 
+def find_block_for_line(
+    conn: sqlite3.Connection,
+    file_id: int,
+    line: int,
+) -> dict[str, Any] | None:
+    """Find the deepest bracket block containing the given line."""
+    rows = conn.execute(
+        """SELECT block_type, block_name, open_line, close_line, signature, depth
+           FROM bracket_index
+           WHERE file_id = ? AND open_line <= ? AND close_line >= ?
+           ORDER BY depth DESC LIMIT 1""",
+        (file_id, line, line),
+    ).fetchall()
+    if rows:
+        r = rows[0]
+        return {
+            "block_type": r["block_type"],
+            "block_name": r["block_name"],
+            "block_range": f"{r['open_line']}-{r['close_line']}",
+            "signature": r["signature"],
+        }
+    return None
+
+
 def find_symbol_references(
     conn: sqlite3.Connection,
     symbol_name: str,
     limit: int = 100,
+    *,
+    scope: str | None = None,
+    skip_self_definition: bool = True,
 ) -> list[dict[str, Any]]:
     """Find references to a symbol from the symbol_references table.
 
     Returns pre-computed references with file paths and enclosing block info.
+    scope: optional module name to filter reference files.
+    skip_self_definition: if True, skip rows where the reference is on the
+        symbol's own definition line (same file, line near the block open_line).
     """
+    params: list[Any] = [symbol_name]
+    scope_clause = ""
+    if scope:
+        scope_clause = " AND ref_file.module_name = ?"
+        params.append(scope)
+
     rows = conn.execute(
-        """
+        f"""
         SELECT
             sr.symbol_name,
             sr.symbol_type,
@@ -1563,21 +1631,40 @@ def find_symbol_references(
             def_file.file_path AS symbol_file_path,
             sr.ref_file_id,
             ref_file.file_path AS ref_file_path,
+            ref_file.module_name AS ref_module_name,
             sr.ref_block_id,
             sr.ref_line,
             br.block_type AS ref_block_type,
-            br.block_name AS ref_block_name
+            br.block_name AS ref_block_name,
+            br.signature AS ref_block_signature,
+            br.open_line AS ref_block_open,
+            br.close_line AS ref_block_close
         FROM symbol_references sr
         JOIN source_files def_file ON def_file.id = sr.symbol_file_id
         JOIN source_files ref_file ON ref_file.id = sr.ref_file_id
         LEFT JOIN bracket_index br ON br.id = sr.ref_block_id
-        WHERE sr.symbol_name = ?
+        WHERE sr.symbol_name = ?{scope_clause}
         ORDER BY sr.ref_file_id, sr.ref_line
         LIMIT ?
         """,
-        (symbol_name, limit),
+        params + [limit],
     ).fetchall()
-    return [dict(r) for r in rows]
+
+    results = [dict(r) for r in rows]
+
+    if skip_self_definition:
+        filtered = []
+        for r in results:
+            if (r["symbol_file_id"] == r["ref_file_id"]
+                    and r["ref_block_name"]
+                    and r["symbol_name"].lower() in (r["ref_block_name"] or "").lower()
+                    and r["ref_block_open"]
+                    and abs(r["ref_line"] - r["ref_block_open"]) <= 2):
+                continue
+            filtered.append(r)
+        results = filtered
+
+    return results
 
 
 def _fts5_escape(query: str) -> str:
@@ -1972,6 +2059,10 @@ def search_source_with_feedback(
 
     results = all_results[:limit]
 
+    # Step 4.5: Enrich results with enclosing block metadata
+    if results:
+        _enrich_with_block_info(conn, results)
+
     # Step 5: Optional clustering
     if cluster and results:
         results = _cluster_results(conn, results)
@@ -1979,6 +2070,37 @@ def search_source_with_feedback(
 
     log_query(conn, query_text, fts_query, [r["id"] for r in results[:limit]])
     return results
+
+
+def _enrich_with_block_info(
+    conn: sqlite3.Connection,
+    results: list[dict[str, Any]],
+) -> None:
+    """Add block_type, block_name, block_range to each search result."""
+    if not results:
+        return
+
+    file_ids = list({r["id"] for r in results})
+    bracket_cache: dict[int, list[dict[str, Any]]] = {}
+    content_cache: dict[int, str] = {}
+
+    for fid in file_ids:
+        bracket_cache[fid] = load_bracket_index(conn, fid, depth=1)
+
+    id_list = ",".join(str(fid) for fid in file_ids)
+    for row in conn.execute(
+        f"SELECT id, raw_content FROM source_files WHERE id IN ({id_list})"
+    ):
+        content_cache[row["id"]] = row["raw_content"]
+
+    for r in results:
+        block = _locate_hit_block(
+            conn, r, bracket_cache=bracket_cache, content_cache=content_cache
+        )
+        if block:
+            r["block_type"] = block["block_type"]
+            r["block_name"] = block.get("block_name")
+            r["block_range"] = f"{block['open_line']}-{block['close_line']}"
 
 
 def _apply_scope_filter(
@@ -2051,6 +2173,95 @@ def record_feedback(conn: sqlite3.Connection, file_path: str, was_useful: bool =
         )
     conn.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Raw SQL passthrough
+# ---------------------------------------------------------------------------
+
+_MAX_SQL_ROWS = 200
+_SELECT_ONLY_RE = re.compile(r"^\s*(?:SELECT|WITH)\s", re.IGNORECASE | re.DOTALL)
+
+
+def exec_sql_query(
+    conn: sqlite3.Connection,
+    sql: str,
+    expanded_terms: list[str] | None = None,
+    max_rows: int = _MAX_SQL_ROWS,
+) -> dict[str, Any]:
+    """Execute a read-only SQL query with optional history enrichment.
+
+    Returns ``{"results": [...], "meta": {row_count, truncated, history_enriched}}``.
+    Only SELECT / WITH statements are allowed.  Results capped at *max_rows*.
+    """
+    if not _SELECT_ONLY_RE.match(sql.strip()):
+        return {"error": "Only SELECT / WITH queries are allowed", "results": [], "meta": {}}
+
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        cursor = conn.execute(sql)
+        rows = cursor.fetchmany(max_rows + 1)
+        truncated = len(rows) > max_rows
+        if truncated:
+            rows = rows[:max_rows]
+        results: list[dict[str, Any]] = [dict(r) for r in rows]
+    except Exception as exc:
+        return {"error": f"SQL error: {exc}", "results": [], "meta": {}}
+    finally:
+        conn.execute("PRAGMA query_only=OFF")
+
+    # --- history enrichment ---------------------------------------------------
+    history_enriched = False
+    if expanded_terms and results:
+        terms = list(expanded_terms)
+        for t in _extract_search_terms(sql):
+            if t not in terms:
+                terms.append(t)
+        terms = list(dict.fromkeys(t for t in terms if len(t) >= 3))
+
+        history_scores = _get_history_signals(conn, terms)
+        if history_scores:
+            has_file_id = any("file_id" in r for r in results)
+            has_file_path = any("file_path" in r for r in results)
+
+            if has_file_id:
+                for r in results:
+                    fid = r.get("file_id")
+                    if fid and fid in history_scores:
+                        r["history_score"] = round(history_scores[fid], 3)
+                        history_enriched = True
+            elif has_file_path:
+                paths = list({r["file_path"] for r in results if r.get("file_path")})
+                if paths:
+                    ph = ",".join("?" * len(paths))
+                    path_map = dict(
+                        conn.execute(
+                            f"SELECT file_path, id FROM source_files WHERE file_path IN ({ph})",
+                            paths,
+                        ).fetchall()
+                    )
+                    for r in results:
+                        fid = path_map.get(r.get("file_path"))
+                        if fid and fid in history_scores:
+                            r["history_score"] = round(history_scores[fid], 3)
+                            history_enriched = True
+
+    # --- log query ------------------------------------------------------------
+    hit_file_ids: list[int] = []
+    for r in results:
+        fid = r.get("file_id") or r.get("id")
+        if isinstance(fid, int):
+            hit_file_ids.append(fid)
+    log_query(conn, sql[:500], None, hit_file_ids)
+
+    return {
+        "results": results,
+        "meta": {
+            "row_count": len(results),
+            "truncated": truncated,
+            "history_enriched": history_enriched,
+        },
+    }
 
 
 def get_directory_structure(conn: sqlite3.Connection) -> dict[str, Any]:
