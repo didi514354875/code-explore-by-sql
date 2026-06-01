@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "code-explore-by-sql": {
+    "code-source-sql": {
       "command": "uv",
-      "args": ["run", "--directory", "/home/yanwei/Documents/myproj/CodeExploreBySQL", "code-explore-by-sql"],
+      "args": ["--directory", "/home/yanwei/Documents/myproj/CodeExploreBySQL", "run", "code-source-sql"],
       "env": {
         "CODE_EXPLORE_DB": "/home/yanwei/Documents/myproj/CodeExploreBySQL/unreal.db"
       }

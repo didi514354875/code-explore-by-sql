@@ -1,16 +1,16 @@
 {
   "servers": {
-    "code-explore-by-sql": {
+    "code-source-sql": {
       "type": "stdio",
       "command": "uv",
       "args": [
         "--directory",
         "/home/yanwei/Documents/myproj/CodeExploreBySQL",
         "run",
-        "code-explore-by-sql"
+        "code-source-sql"
       ],
       "env": {
-        "UNREAL_SOURCE_DB": "/home/yanwei/Documents/myproj/CodeExploreBySQL/unreal.db"
+        "CODE_EXPLORE_DB": "/home/yanwei/Documents/myproj/CodeExploreBySQL/unreal.db"
       }
     }
   }

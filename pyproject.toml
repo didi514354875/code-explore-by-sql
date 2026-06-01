@@ -10,8 +10,16 @@ dependencies = [
 ]
 
 [project.scripts]
-code-explore-by-sql = "code_explore_by_sql.server:main"
-code-explore-by-sql-build-db = "code_explore_by_sql.build_db:main"
+# code-explore-by-sql = "code_explore_by_sql.server:main"
+# code-explore-by-sql-build-db = "code_explore_by_sql.build_db:main"
+code-source-sql = "code_source_sql:main"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    # "src/code_explore_by_sql",
+    "src/code-source-sql",
+    "src/code_source_sql",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
