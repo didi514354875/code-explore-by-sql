@@ -16,12 +16,14 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from db import (
+from .db import (
     connect,
     initialize_schema,
     read_symbol as db_read_symbol,
+    read_file_range as db_read_file_range,
     search_fts as db_search_fts,
     format_symbol_response,
+    format_file_range_response,
     get_directory_structure as db_get_directory_structure,
 )
 
@@ -39,7 +41,7 @@ def _conn():
 
 
 @mcp.tool()
-def read_symbol(qualified_name: str, expand_item: list[str] | None = None) -> str:
+def read_symbol(qualified_name: str, view: str = "full", expand_item: list[str] | None = None) -> str:
     """Read a symbol's source code with [System Hint] header.
 
     The core tool for precise code lookup. Accepts a qualified name
@@ -55,6 +57,11 @@ def read_symbol(qualified_name: str, expand_item: list[str] | None = None) -> st
     - 'Actor' resolves to 'AActor' (UE prefix normalization)
     - 'Jump' matches 'ACharacter::Jump' (partial QN match)
 
+    view: controls output granularity:
+    - "full" (default): complete source code
+    - "signature": only member declarations (functions, variables, enums) — use for large classes
+    - "meta": only [System Hint] header with edges and UE metadata, no code
+
     expand_item: optional signal-enrichment hints. These do not expand or
     filter the query; they only rank multiple matches and annotate matches in
     the [System Hint] header.
@@ -66,7 +73,7 @@ def read_symbol(qualified_name: str, expand_item: list[str] | None = None) -> st
 
         # Return the best match with System Hint
         best = entries[0]
-        result = format_symbol_response(best)
+        result = format_symbol_response(best, view=view)
 
         # If multiple matches, list alternatives
         if len(entries) > 1:
@@ -100,6 +107,39 @@ def search_fts_tool(
         if not results:
             return [{"message": f"No results for '{keyword}'.", "keyword": keyword}]
         return results
+
+
+@mcp.tool()
+def read_file_range(
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    view: str = "full",
+    expand_item: list[str] | None = None,
+) -> str:
+    """Read source code by file path and line range, with [System Hint] metadata.
+
+    Use this when search_fts returns a precise location but read_symbol
+    cannot resolve the correct definition (e.g., returned .cpp implementation
+    instead of .h declaration).
+
+    Returns code with [System Hint] header that includes:
+    - Symbols covered by the line range (from symbol_index)
+    - UE Metadata and edges for those symbols
+    - Module ownership
+
+    view: controls output granularity:
+    - "full" (default): complete source code
+    - "signature": only member declarations — use for browsing large classes
+    - "meta": only [System Hint] header with edges and UE metadata, no code
+
+    expand_item: optional signal-enrichment hints for ranking and annotation.
+    """
+    with _conn() as conn:
+        entry = db_read_file_range(conn, file_path, start_line, end_line, view=view, expand_item=expand_item)
+        if not entry:
+            return f"File '{file_path}' not found in the index."
+        return format_file_range_response(entry, view=view)
 
 
 @mcp.tool()

@@ -20,8 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-from configs import LanguageConfig, FrameworkConfig, ProjectConfig, make_cpp_language, make_csharp_language
-from unreal_rules import make_unreal_framework
+from .configs import LanguageConfig, FrameworkConfig, ProjectConfig, make_cpp_language, make_csharp_language
+from .unreal_rules import make_unreal_framework
 
 EXCLUDE_PARTS = {".git", ".vs", "Binaries", "Build", "DerivedDataCache", "Intermediate", "Saved", "ThirdParty"}
 
@@ -71,7 +71,7 @@ def _get_configs(
     if fw_name == "unreal":
         fw = make_unreal_framework()
     else:
-        from configs import make_generic_framework
+        from .configs import make_generic_framework
         fw = make_generic_framework()
     frameworks[fw_name] = fw
 
@@ -102,8 +102,8 @@ def _process_file(
     fw: FrameworkConfig,
 ) -> tuple[list, list, list]:
     """Process a single file: extract symbols + edges."""
-    from symbol_analyzer import analyze_file
-    from edge_extractor import extract_edges
+    from .symbol_analyzer import analyze_file
+    from .edge_extractor import extract_edges
 
     symbols, extras = analyze_file(lines, file_id, lang, fw)
     edges = extract_edges(symbols, extras, lines, fw, lang.name)
@@ -117,11 +117,11 @@ def build_index(
     limit: int | None = None,
     project: ProjectConfig | None = None,
 ) -> int:
-    from db import connect, initialize_schema, upsert_file, insert_symbols, insert_extra_symbols, insert_edges, commit
+    from .db import connect, initialize_schema, upsert_file, insert_symbols, insert_extra_symbols, insert_edges, commit
 
     if project is None:
         # Default to Unreal project config
-        from configs import make_unreal_project
+        from .configs import make_unreal_project
         fw = make_unreal_framework()
         project = make_unreal_project(framework=fw)
 
@@ -153,7 +153,7 @@ def build_index(
             continue
 
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
-        rel = str(path.relative_to(root))
+        rel = str(path.relative_to(root)).replace("\\", "/")
         module = infer_module_name(path, project.source_marker, project.categories)
 
         file_id = upsert_file(conn, rel, module, content, digest)
@@ -250,10 +250,10 @@ def main() -> None:
     if args.framework == "unreal":
         fw = make_unreal_framework()
     else:
-        from configs import make_generic_framework
+        from .configs import make_generic_framework
         fw = make_generic_framework()
 
-    from configs import make_unreal_project
+    from .configs import make_unreal_project
     project = make_unreal_project(
         framework=fw,
     )

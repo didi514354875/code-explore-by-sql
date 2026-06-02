@@ -16,8 +16,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-from bracket_scanner import BracketBlock
-from configs import LanguageConfig, FrameworkConfig
+from .bracket_scanner import BracketBlock
+from .configs import LanguageConfig, FrameworkConfig
 
 # ── Shared regex constants (comment handling — language-agnostic) ───────
 
@@ -331,7 +331,7 @@ def analyze_file(
     Returns (bracket_symbols, extra_symbols).
     """
     content = "\n".join(lines)
-    from bracket_scanner import scan_brackets, compute_parent_map
+    from .bracket_scanner import scan_brackets, compute_parent_map
 
     blocks = scan_brackets(content)
     if not blocks:

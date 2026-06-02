@@ -17,7 +17,6 @@ code-source-sql = "code_source_sql:main"
 [tool.hatch.build.targets.wheel]
 packages = [
     # "src/code_explore_by_sql",
-    "src/code-source-sql",
     "src/code_source_sql",
 ]
 

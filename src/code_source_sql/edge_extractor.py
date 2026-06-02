@@ -18,8 +18,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from symbol_analyzer import SymbolDef, ExtraSymbol
-from configs import FrameworkConfig
+from .symbol_analyzer import SymbolDef, ExtraSymbol
+from .configs import FrameworkConfig
 
 # Type pattern: UpperCamelCase that's likely a user-defined type
 _TYPE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]+)\b")

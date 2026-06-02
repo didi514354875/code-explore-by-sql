@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from configs import FrameworkConfig
+from .configs import FrameworkConfig
 
 # ── UE decoration macros ──────────────────────────────────────────────────
 

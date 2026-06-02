@@ -1,117 +1,165 @@
-# FShaderType Logical Architecture
+  FShaderType — Shader 类型元数据与功能
 
-`FShaderType` is the central **registration metadata class** in UE's shader type system. It holds static descriptive information needed for compilation, lookup, and instantiation, but not compiled bytecode (that belongs to `FShader` / `FShaderResource`).
+  ▎ 定义：Source/Runtime/RenderCore/Public/Shader.h:1238-1566
 
-## 1. Information Categories (6 Dimensions)
+  设计定位（来自注释）：
 
-From `FShaderType` getter methods (`Engine/Source/Runtime/RenderCore/Public/Shader.h:1238-1566`):
+  ▎ "An object which is used to serialize/deserialize, compile, and cache a particular shader class. A shader type can manage multiple instance of FShader across multiple dimensions such as EShaderPlatform, or permutation id."
 
-| Dimension | Getters | Description |
-|-----------|---------|-------------|
-| **Identity** | `GetName`, `GetFName`, `GetHashedName` | Type name, FName handle, hashed name |
-| **Source Location** | `GetShaderFilename`, `GetHashedShaderFilename`, `GetFunctionName` | .usf file path, entry function name |
-| **Type Classification** | `GetFrequency`, `GetTypeForDynamicCast`, `GetLayout`, `GetTypeSize` | Shader frequency (VS/PS/CS...), RTTI enum, memory layout |
-| **Permutation** | `GetPermutationCount` | Total permutation count (drives ShouldCompilePermutation) |
-| **Parameter Binding** | `GetRootParametersMetadata`, `GetReferencedUniformBuffers` | Root parameter struct, referenced UniformBuffer set |
-| **Runtime Tracking** | `GetNumShaders` | Current active compiled instance count |
+  FShaderType 是 UE 渲染管线中 shader 类型的运行时描述符。每个 C++ shader 类（如 FMyPixelShader）在编译期通过宏（IMPLEMENT_SHADER_TYPE）生成一个全局 FShaderType 实例，作为该类的 工厂 + 注册表条目 + 编译参数模板。
 
-## 2. Class Hierarchy
+  ---
+  一、元数据字段分类
 
-```
-FShaderType (Shader.h:1238)          <- base: 6 dimensions above
-|
-+-- FGlobalShaderType (GlobalShader.h:87)
-|   + ShouldCompilePermutation, ShouldPrecachePermutation
-|   + CompiledShaderInitializerType (compilation initializer)
-|
-+-- FMaterialShaderType (MaterialShaderType.h:95)
-|   + CompiledShaderInitializerType (extends: UniformExpressionSet)
-|
-+-- FMeshMaterialShaderType (MeshMaterialShaderType.h:26)
-|   + CompiledShaderInitializerType (extends: VertexFactoryType)
-|
-+-- FNiagaraShaderType (NiagaraShaderType.h)
-|   + AddUniformBufferIncludesToEnvironment, BeginCompileShaderFromSource
-|
-+-- FOpenColorIOShaderType (OpenColorIOShaderType.h)
-|   + SetupCompileEnvironment (color space conversion params)
-|
-+-- FComputeKernelShaderType (ComputeKernelShaderType.h)
-|   + kernel-specific compilation pipeline
-|
-+-- FNNERuntimeIREEShaderType (NNERuntimeIREEShaderType.h)
-    + NNE inference shader compilation pipeline
-```
+  1. 身份标识（Identity）
 
-### Subclass Extensions
+  ┌──────────────────────────┬───────────────────────────┬────────────────────────────────────┐
+  │           字段           │           类型            │                用途                │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ Name                     │ const TCHAR*              │ shader 类型名称字符串              │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ TypeName                 │ FName                     │ FName 形式的类型名                 │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ HashedName               │ FHashedName               │ 哈希名，用于 O(1) 查找和序列化匹配 │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ SourceFilename           │ const TCHAR*              │ .usf/.ush 源文件路径               │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ HashedSourceFilename     │ FHashedName               │ 源文件哈希名                       │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ FunctionName             │ const TCHAR*              │ 入口函数名（如 Main）              │
+  ├──────────────────────────┼───────────────────────────┼────────────────────────────────────┤
+  │ ShaderTypeForDynamicCast │ EShaderTypeForDynamicCast │ 运行时类型判别枚举                 │
+  └──────────────────────────┴───────────────────────────┴────────────────────────────────────┘
 
-- **FGlobalShaderType**: Global shaders (not bound to material/mesh), adds permutation compilation strategy
-- **FMaterialShaderType**: Material shaders, `CompiledShaderInitializerType` extends with `FUniformExpressionSet`
-- **FMeshMaterialShaderType**: Mesh material shaders, further extends with `FVertexFactoryType` association
+  EShaderTypeForDynamicCast 枚举了 7 种 shader 子类型：
+  - Global — 全局 shader（FGlobalShaderType）
+  - Material — 材质 shader（FMaterialShaderType）
+  - MeshMaterial — 网格材质 shader（FMeshMaterialShaderType）
+  - Niagara — Niagara shader
+  - OCIO — OpenColorIO shader
+  - ComputeKernel — Compute Framework kernel shader
+  - NNERuntimeIREE — NNE IREE shader
 
-## 3. FShaderPipelineType - Pipeline Dimension (Shader.h:1931)
+  这 7 个枚举值通过 GetGlobalShaderType() / GetMaterialShaderType() 等一系列方法实现 零开销 reinterpret_cast 下转型，避免虚函数开销。
 
-Describes **multi-stage shader pipelines**, composing multiple `FShaderType` instances:
+  2. 类型布局与大小
 
-| Info | Method | Meaning |
-|------|--------|---------|
-| Stage composition | `GetStages()` -> `TArray<FShaderType*>` | Shader types for each pipeline stage |
-| Stage capabilities | `HasMeshShader`, `HasGeometry`, `HasPixelShader` | Whether each stage exists |
-| Pipeline classification | `IsGlobalTypePipeline`, `IsMaterialTypePipeline`, `IsMeshMaterialTypePipeline` | Pipeline type domain |
-| Primary entry file | `GetHashedPrimaryShaderFilename` | Primary shader file identifier |
+  ┌────────────┬────────────────────────┬──────────────────────────────────────┐
+  │    字段    │          类型          │                 用途                 │
+  ├────────────┼────────────────────────┼──────────────────────────────────────┤
+  │ TypeLayout │ const FTypeLayoutDesc* │ FShader 派生类的反射布局描述         │
+  ├────────────┼────────────────────────┼──────────────────────────────────────┤
+  │ TypeSize   │ uint32                 │ sizeof(FShaderDerived)，用于内存分配 │
+  └────────────┴────────────────────────┴──────────────────────────────────────┘
 
-## 4. FShader - Runtime Instance (Shader.h:829)
+  3. Shader 阶段
 
-`FShader` is the **compiled runtime instance**, holding FShaderType metadata + compilation artifacts:
+  ┌───────────┬─────────────────────────────────┬─────────────────────────────────────────────────────────┐
+  │   字段    │              类型               │                          用途                           │
+  ├───────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+  │ Frequency │ uint32（存为 EShaderFrequency） │ Shader 频率/阶段：Vertex、Pixel、Compute、RayTracing 等 │
+  └───────────┴─────────────────────────────────┴─────────────────────────────────────────────────────────┘
 
-| Dimension | Method | Content |
-|-----------|--------|---------|
-| Type association | `GetType`, `GetVertexFactoryType` | Corresponding FShaderType / VertexFactoryType |
-| Platform | `GetShaderPlatform`, `GetTarget` | Target platform and compilation target |
-| Compilation stats | `GetNumInstructions`, `GetNumTextureSamplers`, `GetCodeSize` | Instruction count, sampler count, bytecode size |
-| Parameter binding | `GetUniformBufferParameter` (multiple overloads) | UniformBuffer parameter binding lookup |
-| Frozen state | `IsFrozen`, `GetResourceIndex` | Index in shader map and frozen state |
+  4. Permutation（排列组合）
 
-## 5. Compilation Initializer (FShaderCompiledShaderInitializerType, Shader.h:1610)
+  ┌───────────────────────┬───────┬────────────────────────────┐
+  │         字段          │ 类型  │            用途            │
+  ├───────────────────────┼───────┼────────────────────────────┤
+  │ TotalPermutationCount │ int32 │ 该 shader 类的所有排列总数 │
+  └───────────────────────┴───────┴────────────────────────────┘
 
-Bridge from **compilation output to runtime instance**:
+  UE 的 permutation 机制允许一个 shader 类根据编译时 #define 生成多个变体（如开关阴影、不同光照模型），TotalPermutationCount 就是变体总数。
 
-- `FShaderType*` - target shader type
-- `FShaderParameterMap` - parameter mapping table
-- Permutation ID
-- Compiler output (bytecode, reflection data)
-- Shader map hash
-- Subclasses extend this (MaterialShaderType adds UniformExpressionSet, MeshMaterialShaderType adds VertexFactoryType)
+  5. 参数绑定
 
-## 6. Summary Diagram
+  ┌──────────────────────────┬────────────────────────────────────────┬──────────────────────────────────────────┐
+  │           字段           │                  类型                  │                   用途                   │
+  ├──────────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ RootParametersMetadata   │ const FShaderParametersMetadata*       │ 根 shader 参数结构的元数据               │
+  ├──────────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ ReferencedUniformBuffers │ TSet<const FShaderParametersMetadata*> │ 该 shader 引用的所有 Uniform Buffer 集合 │
+  └──────────────────────────┴────────────────────────────────────────┴──────────────────────────────────────────┘
 
-```
-+---------------------------------------------------+
-|                   FShaderType                      |
-|  [Identity]  Name, FName, HashedName              |
-|  [Source]    Filename, FunctionName                |
-|  [Classify]  Frequency, TypeForDynamicCast, Layout |
-|  [Permute]   PermutationCount                      |
-|  [Params]    RootParametersMetadata, RefUBs        |
-|  [Tracking]  NumShaders                            |
-+---------------------------------------------------+
-|  Subclass extensions (Global/Material/MeshMaterial/ |
-|  Niagara/OpenColorIO/Compute/NNE)                  |
-|  + domain-specific CompiledShaderInitializerType   |
-|  + ShouldCompilePermutation / SetupEnvironment     |
-+---------------------------------------------------+
-|            FShaderPipelineType                      |
-|  [Stages]   Stages(TArray<FShaderType*>)           |
-|  [Caps]     HasMeshShader, HasGeometry, HasPixel   |
-+---------------------------------------------------+
-|              FShader (runtime instance)             |
-|  [Artifact]  NumInstructions, CodeSize, Samplers   |
-|  [Platform]  ShaderPlatform, Target, ResourceIdx   |
-|  [Binding]   UniformBufferParameter lookup         |
-+---------------------------------------------------+
-```
+  6. 工厂函数指针（行为元数据）
 
-FShaderType records **"what it is"** (identity, frequency, source location) and **"how to compile"** (permutation count, parameter structure, UniformBuffer dependencies). FShader records **"what was compiled"** (instruction count, bytecode, platform bindings). FShaderPipelineType is the cross-stage orchestration layer, composing multiple FShaderTypes into a complete rendering pipeline.
+  ┌──────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────┬───────────────────────────────────┐
+  │                 函数指针                 │                                    签名                                    │             功能阶段              │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ConstructSerializedRef                   │ FShader* (*)()                                                             │ 从序列化数据构造 shader 实例      │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ConstructCompiledRef                     │ FShader* (*)(const CompiledShaderInitializerType&)                         │ 从编译结果构造 shader 实例        │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ShouldCompilePermutationRef              │ bool (*)(const FShaderPermutationParameters&))                             │ 判断某个 permutation 是否需要编译 │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ShouldPrecachePermutationRef             │ EShaderPermutationPrecacheRequest (*)(...)                                 │ 判断是否预缓存                    │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ GetRayTracingPayloadTypeRef              │ ERayTracingPayloadType (*)(int32)                                          │ 获取 Ray Tracing payload 类型     │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ GetShaderBindingLayoutTypeRef            │ const FShaderBindingLayout* (*)(...)                                       │ 获取 shader binding layout        │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ModifyCompilationEnvironmentRef (editor) │ void (*)(const FShaderPermutationParameters&, FShaderCompilerEnvironment&) │ 修改编译环境（添加 #define 等）   │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ ValidateCompiledResultRef (editor)       │ bool (*)(EShaderPlatform, const FShaderParameterMap&, ...)                 │ 编译后校验                        │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ GetOverrideJobPriorityRef (editor)       │ EShaderCompileJobPriority (*)()                                            │ 自定义编译任务优先级              │
+  ├──────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ GetPermutationIdStringRef (editor)       │ void (*)(int32, FString&, bool)                                            │ 生成 permutation ID 字符串        │
+  └──────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────┘
+
+  7. 全局注册
+
+  ┌────────────────┬───────────────────────────┬───────────────────────────────────────────────┐
+  │      字段      │           类型            │                     用途                      │
+  ├────────────────┼───────────────────────────┼───────────────────────────────────────────────┤
+  │ GlobalListLink │ TLinkedList<FShaderType*> │ 全局链表节点，所有 FShaderType 通过此链表串联 │
+  └────────────────┴───────────────────────────┴───────────────────────────────────────────────┘
+
+  静态方法提供注册表查询：GetShaderTypeByName()、GetShaderTypesByFilename()、GetNameToTypeMap()、GetSortedTypes()。
+
+  ---
+  二、功能维度
+
+  FShaderType 的元数据服务于以下核心功能：
+
+  ┌───────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────┐
+  │         功能          │                                             依赖的元数据                                              │                                    说明                                    │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 序列化/反序列化       │ HashedName, ConstructSerializedRef, TypeSize                                                          │ DDC 和 shader map 通过哈希名匹配类型，反序列化时用工厂创建实例             │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Shader 编译调度       │ SourceFilename, FunctionName, Frequency, ShouldCompilePermutationRef, ModifyCompilationEnvironmentRef │ 编译器需要知道从哪个文件、哪个入口函数、哪个阶段编译，以及需要哪些 #define │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Permutation 管理      │ TotalPermutationCount, ShouldCompilePermutationRef, ShouldPrecachePermutationRef                      │ 遍历排列空间，过滤掉不需要编译的变体                                       │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Shader 缓存（DDC）    │ SourceHash, HashedName, GetShaderStableKeyParts                                                       │ 以源文件哈希 + permutation ID 作为缓存键                                   │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 运行时类型识别        │ EShaderTypeForDynamicCast, 一组 GetXxxType() 方法                                                     │ 无虚函数的 O(1) 下转型，区分 Global/Material/MeshMaterial 等               │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 参数绑定与校验        │ RootParametersMetadata, ReferencedUniformBuffers, ValidateCompiledResultRef                           │ 编译时校验参数映射、运行时绑定 uniform buffer                              │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Ray Tracing 集成      │ GetRayTracingPayloadTypeRef                                                                           │ 为 RT shader 指定 payload 类型                                             │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Shader Binding Layout │ GetShaderBindingLayoutTypeRef                                                                         │ 描述 root signature / binding layout                                       │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 编辑器工具            │ ValidateCompiledResultRef, GetOverrideJobPriorityRef, GetPermutationIdStringRef                       │ 编译结果校验、优先级调度、调试信息                                         │
+  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ 全局注册表            │ GlobalListLink, GetNameToTypeMap()                                                                    │ 所有 shader 类型在启动时注册到全局链表和哈希表                             │
+  └───────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  三、继承体系
+
+  FShaderType (基类)
+  ├── FGlobalShaderType          — 不依赖材质的全局 shader
+  ├── FMaterialShaderType        — 依赖材质但不用顶点工厂
+  ├── FMeshMaterialShaderType    — 依赖材质 + 顶点工厂
+  ├── FNiagaraShaderType         — Niagara 系统 shader
+  ├── FOpenColorIOShaderType     — OpenColorIO shader
+  ├── FComputeKernelShaderType   — Compute Framework kernel
+  └── FNNERuntimeIREEShaderType  — NNE IREE 推理 shader
+
+  每个子类通过 EShaderTypeForDynamicCast 枚举值在基类中实现零虚函数开销的类型识别。
+
+  总结：FShaderType 是 UE shader 编译管线的核心注册器——它把一个 C++ shader 类的"所有编译期信息"打包成一个运行时对象，使得引擎可以在不依赖 RTTI 的情况下完成 shader 的发现、编译、缓存、序列化和按需实例化。
 
 
 

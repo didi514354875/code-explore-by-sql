@@ -204,3 +204,93 @@ Agent 工作流推演 (Workflow in Action)
     Zero-shot 成功率飙升：Agent 在思考链（CoT）中不再陷入多重转义的混乱，也不需要在海量同名函数中抓瞎。
 
     无敌的鲁棒性：无论开发者的 UE 代码包含多少非标语法、未完结的模板，或者因改错导致的编译期报错，系统都能基于“花括号”准确导航，系统绝不瘫痪。
+
+
+
+
+
+
+
+
+
+
+      职责定义
+
+  Search_FTS     → 锚定器（Anchor）：告诉你"在哪里"
+  Read_Symbol    → 精读器（Read）：  告诉你"是什么"（需要 qualified name）
+  Read_File_Range→ 兜底精读器：      告诉你"是什么"（需要 file + line）
+
+  唯一管线
+
+                      有 qualified name？
+                           │
+                      ┌────┴────┐
+                      Yes       No
+                      │         │
+                      ▼         ▼
+                Read_Symbol   Search_FTS  ← 唯一入口：发现 file/line/owner
+                      │         │
+                      │    拿到 qualified name？
+                      │         │
+                      │    ┌────┴────┐
+                      │    Yes       No
+                      │    │         │
+                      │    ▼         ▼
+                      │  Read_Symbol Read_File_Range ← 直接用 file+line 读
+                      │    │              │
+                      └────┴──────┬───────┘
+                                 │
+                            命中且正确？
+                                 │
+                            ┌────┴────┐
+                            Yes       No（偏靶/不完整）
+                            │         │
+                            ▼         ▼
+                           完成   Read_File_Range ← 用已知的 file+line 兜底
+
+  简化成一句话：
+
+  ▎ Search_FTS 锚定位置，Read_Symbol 精确定位读，Read_File_Range 是 Read_Symbol 读不出来的兜底。
+
+  这次搜索为什么绕了
+
+  对照这个管线，偏差在第二步：
+
+  实际走的路：
+
+    Search_FTS("class FShaderType")          ← 锚定：Shader.h:1238 ✓
+         │
+         ▼
+    Read_Symbol("FShaderType")               ← 精读：偏靶到 .cpp ✗
+         │
+         │  ← 此时应走 Read_File_Range("Shader.h", 1238, 1566)
+         │    因为锚定已经拿到了 file+line，直接兜底读
+         │
+         ▼
+    Search_FTS("FShaderType::FShaderType")   ← 重新锚定：多此一举 ✗
+         │
+         ▼
+    Search_FTS("FShaderType(")               ← 又锚定一次：空跑 ✗
+         │
+         ▼
+    Read_File_Range × 3                      ← 最终还是用了兜底工具
+
+  应该走的路：
+
+    Search_FTS("class FShaderType")          ← 锚定：Shader.h:1238 ✓
+         │
+         ▼
+    Read_Symbol("FShaderType")               ← 精读：偏靶到 .cpp ✗
+         │
+         ▼
+    Read_File_Range("Shader.h", 1238, 1566)  ← 兜底：用锚定拿到的 file+line
+         │                                    ← 1 call，结束
+         ▼
+        完成
+
+  两条铁律
+
+  1. 锚定只做一次 — Search_FTS 返回了 file+line 之后，不要再 Search 第二次。信息已经够了。
+  2. Read_Symbol 偏靶时，不是回到锚定阶段，而是直接降级到 Read_File_Range — 因为锚定阶段的 file+line 已经在手。
+
+  这两条在 SKILL.md 里其实有写（"Read_File_Range 是 fallback"），但没有强调 偏靶后不要重新锚定 这个关键判断。这是应该补进去的。

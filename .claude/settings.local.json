@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=src python *)",
+      "mcp__code-source-sql__read_symbol",
+      "mcp__code-source-sql__search_fts_tool",
+      "mcp__code-source-sql__read_file_range"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "code-source-sql"
+  ]
+}

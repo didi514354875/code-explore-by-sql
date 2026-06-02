@@ -1,12 +1,9 @@
-"""Entry shim: adds code-source-sql directory to sys.path and delegates to server.main()."""
-import sys
-from pathlib import Path
+"""UE Semantic Search — plan.md implementation.
 
-_pkg = Path(__file__).parent.parent / "code-source-sql"
-sys.path.insert(0, str(_pkg))
+Three-table architecture:
+  file_content (FTS5) -> symbol_index (QN + UE meta) -> strict_edges (4 types)
+"""
 
-from server import main as _main  # noqa: E402
+from .server import main
 
-
-def main() -> None:
-    _main()
+__all__ = ["main"]

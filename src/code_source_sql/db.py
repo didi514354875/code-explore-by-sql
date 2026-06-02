@@ -13,8 +13,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from symbol_analyzer import SymbolDef, ExtraSymbol
-from edge_extractor import StrictEdge
+from .symbol_analyzer import SymbolDef, ExtraSymbol
+from .edge_extractor import StrictEdge
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -352,7 +352,104 @@ _EDGE_PRIORITY = {
 _MAX_EDGES = 5
 
 
-def format_symbol_response(entry: dict[str, Any]) -> str:
+def _format_edges(edges: list[dict[str, str]]) -> str:
+    sorted_edges = sorted(edges, key=lambda e: _EDGE_PRIORITY.get(e["type"], 99))
+    shown = []
+    for e in sorted_edges[:_MAX_EDGES]:
+        etype = e["type"]
+        target = e["target"]
+        label = {"rpc_routing": "RPC", "inheritance": "Base", "static_call": "Call"}.get(etype, "Dep")
+        shown.append(f"{label}:{target}")
+    result = f"[Rel] {' | '.join(shown)}"
+    if len(edges) > _MAX_EDGES:
+        result += f"\n[Rel] ...+{len(edges) - _MAX_EDGES} more"
+    return result
+
+
+def _apply_view(code: str, view: str) -> str:
+    if view == "full":
+        return code
+    if view == "meta":
+        return ""
+    if view == "signature":
+        # Strategy: detect function bodies by tracking brace blocks that follow
+        # a line containing '(' and ')'. Everything inside such blocks is skipped.
+        # Class/struct/enum member declarations (lines with ';') are always kept.
+        lines = code.split("\n")
+        kept: list[str] = []
+        # Stack: True = inside function body, False = inside class/struct/enum body
+        body_stack: list[bool] = []
+        in_func_body = False
+
+        for line in lines:
+            stripped = line.strip()
+            current_is_func = in_func_body
+
+            # Detect opening brace
+            open_count = stripped.count("{")
+            close_count = stripped.count("}")
+            net = open_count - close_count
+
+            # Always keep structural keywords
+            if any(kw in stripped for kw in ("class ", "struct ", "enum ", "namespace ")):
+                kept.append(line)
+                if open_count > 0:
+                    for _ in range(open_count):
+                        body_stack.append(False)
+                    in_func_body = any(body_stack) if body_stack else False
+                continue
+            # Access specifiers — always keep
+            if stripped in ("public:", "protected:", "private:"):
+                kept.append(line)
+                continue
+            # Closing braces
+            if close_count > 0 and not open_count:
+                for _ in range(close_count):
+                    if body_stack:
+                        body_stack.pop()
+                in_func_body = any(body_stack) if body_stack else False
+                kept.append(line)
+                continue
+            # Lines with semicolons are declarations — keep if not inside function body
+            if ";" in stripped and not current_is_func:
+                kept.append(line)
+                continue
+            # Lines with parentheses and not inside function body — function signatures
+            if "(" in stripped and ")" in stripped and not current_is_func:
+                kept.append(line)
+                # If this line also opens a brace, it's a function definition body
+                if open_count > 0:
+                    for _ in range(open_count):
+                        body_stack.append(True)
+                    in_func_body = any(body_stack) if body_stack else False
+                continue
+            # virtual / static / override / FORCEINLINE
+            if any(kw in stripped for kw in ("virtual ", "static ", "override", "FORCEINLINE")):
+                kept.append(line)
+                if open_count > 0:
+                    for _ in range(open_count):
+                        body_stack.append(True)
+                    in_func_body = any(body_stack) if body_stack else False
+                continue
+            # Opening brace on its own line — inherits the context from previous line
+            if stripped == "{" or (open_count > 0 and stripped.startswith("{")):
+                for _ in range(open_count):
+                    body_stack.append(current_is_func)
+                in_func_body = any(body_stack) if body_stack else False
+                if not current_is_func:
+                    kept.append(line)
+                continue
+            # Lines inside function body — skip
+            # Lines with mixed { and } on same line (e.g., lambda, initializer)
+            if open_count > 0:
+                for _ in range(open_count):
+                    body_stack.append(current_is_func or "(" in stripped)
+                in_func_body = any(body_stack) if body_stack else False
+        return "\n".join(kept)
+    return code
+
+
+def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
     """Format a symbol entry with [System Hint] header per plan.md."""
     lines = []
     lines.append(f"[Hint] {entry['qualified_name']} | {entry['file_path']}")
@@ -377,31 +474,19 @@ def format_symbol_response(entry: dict[str, Any]) -> str:
     # Static Relations — prioritized, limited to top 5
     edges = entry.get("edges", [])
     if edges:
-        sorted_edges = sorted(edges, key=lambda e: _EDGE_PRIORITY.get(e["type"], 99))
-        shown = []
-        for e in sorted_edges[:_MAX_EDGES]:
-            etype = e["type"]
-            target = e["target"]
-            if etype == "rpc_routing":
-                label = "RPC"
-            elif etype == "inheritance":
-                label = "Base"
-            elif etype == "static_call":
-                label = "Call"
-            else:
-                label = "Dep"
-            shown.append(f"{label}:{target}")
-        lines.append(f"[Rel] {' | '.join(shown)}")
-        if len(edges) > _MAX_EDGES:
-            lines.append(f"[Rel] ...+{len(edges) - _MAX_EDGES} more")
+        lines.append(_format_edges(edges))
 
     # Inheritance base (fallback if not in edges)
     base = entry.get("inheritance_base")
     if base and not any(e["type"] == "inheritance" for e in edges if e["target"] == base):
         lines.append(f"[Rel] Base:{base}")
 
+    if view == "meta":
+        return "\n".join(lines)
+
+    code = _apply_view(entry["code"], view)
     lines.append("---")
-    lines.append(entry["code"])
+    lines.append(code)
     return "\n".join(lines)
 
 
@@ -555,3 +640,156 @@ def get_directory_structure(conn: sqlite3.Connection) -> dict[str, Any]:
         "total_modules": total_modules,
         "modules": modules,
     }
+
+
+# ── Read_File_Range query ─────────────────────────────────────────────
+
+def _find_intersecting_symbols(
+    conn: sqlite3.Connection, file_id: int, start_line: int, end_line: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT id, qualified_name, block_type, start_line, end_line, ue_meta,
+                  parent_class, signature, inheritance_base
+           FROM symbol_index
+           WHERE file_id = ? AND start_line <= ? AND end_line >= ?
+           ORDER BY (end_line - start_line) ASC""",
+        (file_id, end_line, start_line),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _collect_edges_for_symbols(
+    conn: sqlite3.Connection, qualified_names: list[str],
+) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    edges: list[dict[str, str]] = []
+    for qn in qualified_names:
+        for e in conn.execute(
+            "SELECT target_qn, edge_type FROM strict_edges WHERE source_qn = ? ORDER BY edge_type, target_qn",
+            (qn,),
+        ).fetchall():
+            key = (e["target_qn"], e["edge_type"])
+            if key not in seen:
+                seen.add(key)
+                edges.append({"target": e["target_qn"], "type": e["edge_type"]})
+    return edges
+
+
+def read_file_range(
+    conn: sqlite3.Connection,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    view: str = "full",
+    expand_item: list[str] | None = None,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT file_id, module_name, content FROM file_content WHERE file_path = ?",
+        (file_path,),
+    ).fetchone()
+    if not row:
+        return None
+
+    lines = row["content"].split("\n")
+    code = "\n".join(lines[start_line - 1 : end_line])
+
+    file_id = row["file_id"]
+    symbols = _find_intersecting_symbols(conn, file_id, start_line, end_line)
+
+    all_edges: list[dict[str, str]] = []
+    ue_meta_all: dict[str, list[str]] = {}
+    for sym in symbols:
+        qn = sym["qualified_name"]
+        sym_edges = _collect_edges_for_symbols(conn, [qn])
+        all_edges.extend(sym_edges)
+        if sym["ue_meta"]:
+            ue_meta_all.update(json.loads(sym["ue_meta"]))
+
+    # Deduplicate edges
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, str]] = []
+    for e in all_edges:
+        key = (e["target"], e["type"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+
+    # Signal enrichment
+    expand_item = _normalize_expand_item(expand_item)
+    signal_text = "\n".join([
+        file_path,
+        row["module_name"] or "",
+        " ".join(s["qualified_name"] for s in symbols),
+        " ".join(e["target"] for e in deduped),
+        code,
+    ])
+    expand_item_hits = _signal_hits(signal_text, expand_item)
+
+    return {
+        "file_path": file_path,
+        "module_name": row["module_name"],
+        "start_line": start_line,
+        "end_line": end_line,
+        "code": code,
+        "symbols": symbols,
+        "edges": deduped,
+        "ue_meta": ue_meta_all or None,
+        "expand_item_hits": expand_item_hits,
+    }
+
+
+def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str:
+    lines: list[str] = []
+    lines.append(f"[Hint] {entry['file_path']}:{entry['start_line']}-{entry['end_line']}")
+
+    # Module
+    if entry.get("module_name"):
+        lines.append(f"[Module] {entry['module_name']}")
+
+    # Symbols covered by this range
+    symbols = entry.get("symbols", [])
+    if symbols:
+        sym_strs = []
+        for s in symbols[:8]:
+            sym_strs.append(f"{s['qualified_name']} ({s['block_type']}) {s['start_line']}-{s['end_line']}")
+        lines.append(f"[Symbol] {' | '.join(sym_strs)}")
+        if len(symbols) > 8:
+            lines.append(f"[Symbol] ...+{len(symbols) - 8} more")
+
+    # UE Metadata
+    ue_meta = entry.get("ue_meta")
+    if ue_meta:
+        parts = []
+        for macro, params in ue_meta.items():
+            params_str = ",".join(params)
+            parts.append(f"{macro}({params_str})")
+            if any(p in ("Server", "Client", "NetMulticast", "BlueprintNativeEvent") for p in params):
+                parts.append("->_Implementation")
+            if any(p == "WithValidation" for p in params):
+                parts.append("->_Validate")
+        lines.append(f"[Meta] {' '.join(parts)}")
+
+    # Signal enrichment
+    expand_item_hits = entry.get("expand_item_hits") or []
+    if expand_item_hits:
+        lines.append(f"[Signal] matched: {', '.join(expand_item_hits)}")
+
+    # Edges (merged from all symbols, up to 10)
+    edges = entry.get("edges", [])
+    if edges:
+        sorted_edges = sorted(edges, key=lambda e: _EDGE_PRIORITY.get(e["type"], 99))[:10]
+        shown = []
+        for e in sorted_edges:
+            label = {"rpc_routing": "RPC", "inheritance": "Base", "static_call": "Call"}.get(e["type"], "Dep")
+            shown.append(f"{label}:{e['target']}")
+        lines.append(f"[Rel] {' | '.join(shown)}")
+        if len(edges) > 10:
+            lines.append(f"[Rel] ...+{len(edges) - 10} more")
+
+    if view == "meta":
+        return "\n".join(lines)
+
+    code = _apply_view(entry["code"], view)
+    lines.append("---")
+    lines.append(code)
+    return "\n".join(lines)
