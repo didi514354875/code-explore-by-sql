@@ -5,7 +5,11 @@
       "mcp__code-source-sql__read_symbol",
       "mcp__code-source-sql__search_fts_tool",
       "mcp__code-source-sql__read_file_range",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(uv run *)",
+      "Bash(echo \"EXIT CODE: $?\")",
+      "Bash(CODE_SOURCE_DB=/root/myproject/CodeExploreBySQL/unreal.db uv --directory /root/myproject/CodeExploreBySQL run code-source-sql)",
+      "Bash(echo \"EXIT: $?\")"
     ]
   },
   "enableAllProjectMcpServers": true,

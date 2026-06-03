@@ -2,7 +2,7 @@
 
 Tables:
   file_content     — raw source files with FTS5 trigram index
-  symbol_index     — qualified names with UE metadata, line ranges
+  symbol_index     — qualified names with decoration metadata, line ranges
   strict_edges     — deterministic edges only (inheritance, type_dependency, static_call, rpc_routing)
 """
 
@@ -15,6 +15,26 @@ from typing import Any
 
 from .symbol_analyzer import SymbolDef, ExtraSymbol
 from .edge_extractor import StrictEdge
+
+
+def _resolve_lang_fw(language: str) -> tuple[Any, Any]:
+    """Resolve a language name string to (LanguageConfig, FrameworkConfig).
+
+    Mirrors the build-time dispatch logic:
+    - cpp → Unreal framework
+    - csharp → generic framework
+    """
+    from .configs import make_cpp_language, make_csharp_language, make_generic_framework
+    from .unreal_rules import make_unreal_framework
+    if language == "csharp":
+        return make_csharp_language(), make_generic_framework()
+    return make_cpp_language(), make_unreal_framework()
+
+
+def _get_lang_for(language: str) -> Any:
+    """Resolve a language name string to a LanguageConfig instance."""
+    lang, _ = _resolve_lang_fw(language)
+    return lang
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -73,7 +93,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             file_id INTEGER NOT NULL REFERENCES file_content(file_id) ON DELETE CASCADE,
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
-            ue_meta TEXT,
+            decoration_meta TEXT,
             parent_class TEXT,
             signature TEXT,
             inheritance_base TEXT,
@@ -106,6 +126,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         pass  # Column already exists
     try:
         conn.execute("ALTER TABLE strict_edges ADD COLUMN language TEXT NOT NULL DEFAULT 'cpp'")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE symbol_index RENAME COLUMN ue_meta TO decoration_meta")
     except Exception:
         pass
 
@@ -146,13 +170,13 @@ def insert_symbols(conn: sqlite3.Connection, symbols: list[SymbolDef]) -> None:
     conn.executemany(
         """INSERT INTO symbol_index
            (qualified_name, block_type, file_id, start_line, end_line,
-            ue_meta, parent_class, signature, inheritance_base, language)
+            decoration_meta, parent_class, signature, inheritance_base, language)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 s.qualified_name, s.block_type, s.file_id,
                 s.start_line, s.end_line,
-                json.dumps(s.ue_meta) if s.ue_meta else None,
+                json.dumps(s.decoration_meta) if s.decoration_meta else None,
                 s.parent_class,
                 s.signature,
                 s.inheritance_base,
@@ -238,24 +262,25 @@ def read_symbol(
         (qualified_name,),
     ).fetchall()
 
-    # 2. UE prefix resolution: Actor -> AActor, UActor, FActor...
+    # 2. Type prefix resolution: Actor -> AActor, UActor, FActor...
     #    Try if no exact results, or if exact results are only namespace/weak matches
     _weak_types = frozenset({"namespace", "macro_def"})
     need_prefix = not rows or all(r["block_type"] in _weak_types for r in rows)
     if need_prefix:
-        for prefix in ("A", "U", "F", "E", "I", "T"):
-            candidate = prefix + qualified_name
-            prefix_rows = conn.execute(
-                """SELECT si.*, fc.file_path, fc.module_name, fc.content
-                   FROM symbol_index si
-                   JOIN file_content fc ON fc.file_id = si.file_id
-                   WHERE si.qualified_name = ?
-                   ORDER BY si.file_id, si.start_line""",
-                (candidate,),
-            ).fetchall()
-            if prefix_rows:
-                rows = prefix_rows
-                break
+        _, fw_resolve = _resolve_lang_fw("cpp")
+        if fw_resolve.resolve_type_prefixes:
+            for candidate in fw_resolve.resolve_type_prefixes(qualified_name):
+                prefix_rows = conn.execute(
+                    """SELECT si.*, fc.file_path, fc.module_name, fc.content
+                       FROM symbol_index si
+                       JOIN file_content fc ON fc.file_id = si.file_id
+                       WHERE si.qualified_name = ?
+                       ORDER BY si.file_id, si.start_line""",
+                    (candidate,),
+                ).fetchall()
+                if prefix_rows:
+                    rows = prefix_rows
+                    break
 
     # 3. Partial match: contains the name (e.g., "Jump" matches "ACharacter::Jump")
     if not rows:
@@ -300,7 +325,7 @@ def read_symbol(
             (qn,),
         ).fetchall()
 
-        ue_meta = json.loads(r["ue_meta"]) if r["ue_meta"] else None
+        decoration_meta = json.loads(r["decoration_meta"]) if r["decoration_meta"] else None
 
         signal_text = "\n".join(
             [
@@ -310,7 +335,7 @@ def read_symbol(
                 r["signature"] or "",
                 r["parent_class"] or "",
                 r["inheritance_base"] or "",
-                json.dumps(ue_meta) if ue_meta else "",
+                json.dumps(decoration_meta) if decoration_meta else "",
                 " ".join(e["target_qn"] for e in edges),
                 " ".join(e["source_qn"] for e in reverse_edges),
                 code,
@@ -327,7 +352,7 @@ def read_symbol(
             "start_line": start,
             "end_line": end,
             "code": code,
-            "ue_meta": ue_meta,
+            "decoration_meta": decoration_meta,
             "signature": r["signature"],
             "parent_class": r["parent_class"],
             "inheritance_base": r["inheritance_base"],
@@ -366,6 +391,17 @@ def _format_edges(edges: list[dict[str, str]]) -> str:
     return result
 
 
+def _format_meta_display(meta: dict | None, fw: Any) -> list[str]:
+    """Format decoration metadata into display parts for [Meta] line."""
+    if not meta:
+        return []
+    # Use framework callback if available
+    if fw.format_meta_display is not None:
+        return fw.format_meta_display(meta)
+    # Generic fallback: format without framework-specific routing info
+    return [f"{macro}({','.join(params)})" for macro, params in meta.items()]
+
+
 def _apply_view(
     code: str,
     view: str,
@@ -373,6 +409,8 @@ def _apply_view(
     block_type: str | None = None,
     qualified_name: str | None = None,
     child_symbols: list[dict] | None = None,
+    lang: Any | None = None,
+    fw: Any | None = None,
 ) -> str:
     from .code_block_summary import apply_view
     return apply_view(
@@ -380,25 +418,21 @@ def _apply_view(
         block_type=block_type,
         qualified_name=qualified_name,
         child_symbols=child_symbols,
+        lang=lang,
+        fw=fw,
     )
 
 
 def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
     """Format a symbol entry with [System Hint] header per plan.md."""
+    lang, fw = _resolve_lang_fw(entry.get("language", "cpp"))
     lines = []
     lines.append(f"[Hint] {entry['qualified_name']} | {entry['file_path']}")
 
-    # UE Metadata (compact, single line)
-    if entry["ue_meta"]:
-        parts = []
-        for macro, params in entry["ue_meta"].items():
-            params_str = ",".join(params)
-            parts.append(f"{macro}({params_str})")
-            if any(p in ("Server", "Client", "NetMulticast", "BlueprintNativeEvent") for p in params):
-                parts.append("->_Implementation")
-            if any(p == "WithValidation" for p in params):
-                parts.append("->_Validate")
-        lines.append(f"[Meta] {' '.join(parts)}")
+    # Decoration Metadata (compact, single line)
+    meta_parts = _format_meta_display(entry.get("decoration_meta"), fw)
+    if meta_parts:
+        lines.append(f"[Meta] {' '.join(meta_parts)}")
 
     # Signal enrichment metadata (compact)
     expand_item_hits = entry.get("expand_item_hits") or []
@@ -422,6 +456,8 @@ def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
         entry["code"], view,
         block_type=entry.get("block_type"),
         qualified_name=entry.get("qualified_name"),
+        lang=lang,
+        fw=fw,
     )
     lines.append("---")
     lines.append(code)
@@ -586,7 +622,7 @@ def _find_intersecting_symbols(
     conn: sqlite3.Connection, file_id: int, start_line: int, end_line: int,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT id, qualified_name, block_type, start_line, end_line, ue_meta,
+        """SELECT id, qualified_name, block_type, start_line, end_line, decoration_meta,
                   parent_class, signature, inheritance_base
            FROM symbol_index
            WHERE file_id = ? AND start_line <= ? AND end_line >= ?
@@ -635,13 +671,13 @@ def read_file_range(
     symbols = _find_intersecting_symbols(conn, file_id, start_line, end_line)
 
     all_edges: list[dict[str, str]] = []
-    ue_meta_all: dict[str, list[str]] = {}
+    decoration_meta_all: dict[str, list[str]] = {}
     for sym in symbols:
         qn = sym["qualified_name"]
         sym_edges = _collect_edges_for_symbols(conn, [qn])
         all_edges.extend(sym_edges)
-        if sym["ue_meta"]:
-            ue_meta_all.update(json.loads(sym["ue_meta"]))
+        if sym["decoration_meta"]:
+            decoration_meta_all.update(json.loads(sym["decoration_meta"]))
 
     # Deduplicate edges
     seen: set[tuple[str, str]] = set()
@@ -671,7 +707,7 @@ def read_file_range(
         "code": code,
         "symbols": symbols,
         "edges": deduped,
-        "ue_meta": ue_meta_all or None,
+        "decoration_meta": decoration_meta_all or None,
         "expand_item_hits": expand_item_hits,
     }
 
@@ -680,12 +716,16 @@ def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str
     lines: list[str] = []
     lines.append(f"[Hint] {entry['file_path']}:{entry['start_line']}-{entry['end_line']}")
 
+    # Determine language from symbols (use first symbol's language)
+    symbols = entry.get("symbols", [])
+    file_language = symbols[0].get("language", "cpp") if symbols else "cpp"
+    lang, fw = _resolve_lang_fw(file_language)
+
     # Module
     if entry.get("module_name"):
         lines.append(f"[Module] {entry['module_name']}")
 
     # Symbols covered by this range
-    symbols = entry.get("symbols", [])
     if symbols:
         sym_strs = []
         for s in symbols[:8]:
@@ -694,18 +734,10 @@ def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str
         if len(symbols) > 8:
             lines.append(f"[Symbol] ...+{len(symbols) - 8} more")
 
-    # UE Metadata
-    ue_meta = entry.get("ue_meta")
-    if ue_meta:
-        parts = []
-        for macro, params in ue_meta.items():
-            params_str = ",".join(params)
-            parts.append(f"{macro}({params_str})")
-            if any(p in ("Server", "Client", "NetMulticast", "BlueprintNativeEvent") for p in params):
-                parts.append("->_Implementation")
-            if any(p == "WithValidation" for p in params):
-                parts.append("->_Validate")
-        lines.append(f"[Meta] {' '.join(parts)}")
+    # Decoration Metadata
+    meta_parts = _format_meta_display(entry.get("decoration_meta"), fw)
+    if meta_parts:
+        lines.append(f"[Meta] {' '.join(meta_parts)}")
 
     # Signal enrichment
     expand_item_hits = entry.get("expand_item_hits") or []
@@ -732,6 +764,8 @@ def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str
         entry["code"], view,
         block_type=single_block_type,
         child_symbols=symbols if len(symbols) > 1 else None,
+        lang=lang,
+        fw=fw,
     )
     lines.append("---")
     lines.append(code)

@@ -1,10 +1,10 @@
-"""Symbol analyzer — block classification with QN normalization and UE macro awareness.
+"""Symbol analyzer — block classification with QN normalization and framework decoration awareness.
 
 Implements plan.md rules:
-- Black list: skip control flow, UE noise macros, basic types
+- Black list: skip control flow, framework noise macros, basic types
 - QN normalization: always ClassName::MethodName
-- UE macro sniffing: look upward 1-3 lines for UCLASS/UFUNCTION/etc.
-- UE metadata extraction for rpc_routing edges
+- Framework decoration macro sniffing: look upward 1-3 lines for decoration macros
+- Decoration metadata extraction for framework-specific edges
 - Support for delegate_def, macro_def block types
 
 Refactored to accept LanguageConfig + FrameworkConfig instead of hardcoded constants.
@@ -33,9 +33,9 @@ class SymbolDef:
     qualified_name: str
     block_type: str        # class, method, enum, delegate_def, macro_def, function
     file_id: int
-    start_line: int        # 1-based, includes UE macro lines above
+    start_line: int        # 1-based, includes decoration macro lines above
     end_line: int          # 1-based
-    ue_meta: dict | None = None   # e.g. {"UFUNCTION": ["Server", "Reliable"]}
+    decoration_meta: dict | None = None   # e.g. {"UFUNCTION": ["Server", "Reliable"]}
     parent_class: str | None = None  # for methods, the containing class name
     signature: str | None = None
     inheritance_base: str | None = None  # for class/struct, the base class name
@@ -44,7 +44,7 @@ class SymbolDef:
 
 @dataclass
 class ExtraSymbol:
-    """A symbol defined outside braces (UE delegates, #define macros)."""
+    """A symbol defined outside braces (framework delegates, #define macros)."""
     qualified_name: str
     block_type: str        # delegate_def, macro_def
     file_id: int
@@ -82,14 +82,17 @@ def _normalize_decl(text: str, lang: LanguageConfig) -> str:
     return text
 
 
-def _extract_func_name(sig: str, func_name_re: re.Pattern, export_macro_re: re.Pattern) -> str | None:
-    sig = re.sub(r"\s*::\s*", "::", sig)
+def _extract_func_name(
+    sig: str, func_name_re: re.Pattern, export_macro_re: re.Pattern,
+    scope_operator: str = "::",
+) -> str | None:
+    sig = re.sub(rf"\s*{re.escape(scope_operator)}\s*", scope_operator, sig)
     m = func_name_re.search(sig)
     if m:
         name = m.group(1).strip()
         parts = name.split()
         parts = [p for p in parts if not export_macro_re.match(p)]
-        return "::".join(p.strip() for p in " ".join(parts).split("::")) or None
+        return "::".join(p.strip() for p in " ".join(parts).split(scope_operator)) or None
     return None
 
 
@@ -136,7 +139,7 @@ def _gather_declaration(
         and not open_text.startswith(":")
         and not open_text.startswith(",")
         and (
-            re.search(r"\b(?:namespace|class|struct|enum)\b", open_text)
+            (lang.block_keyword_re and lang.block_keyword_re.search(open_text))
             or "(" in open_text
             or lang.macro_like_re.match(open_text)
         )
@@ -173,7 +176,7 @@ def _gather_declaration(
             and paren_balance <= 0
             and angle_balance <= 0
             and (
-                re.search(r"\b(?:namespace|class|struct|enum)\b", clean)
+                (lang.block_keyword_re and lang.block_keyword_re.search(clean))
                 or re.search(r"\w\s*\([^;{}]*$", clean)
                 or clean.startswith("template")
             )
@@ -250,7 +253,10 @@ def _classify_block(
         return ("namespace", None, None, joined_clean, None)
 
     # Namespace
-    ns_match = re.match(r"(?:inline\s+)?namespace\s+(\w+)?\s*$", classifier_sig)
+    if lang.namespace_sig_re:
+        ns_match = lang.namespace_sig_re.match(classifier_sig)
+    else:
+        ns_match = None
     if ns_match:
         ns_name = ns_match.group(1)
         return ("namespace", ns_name, ns_name, joined_clean, None)
@@ -270,7 +276,7 @@ def _classify_block(
         return ("class", name, name, joined_clean, base)
 
     # Lambda — skip (check before function detection)
-    if re.search(r"\[.*\]\s*[\(]", joined_clean):
+    if lang.lambda_re and lang.lambda_re.search(joined_clean):
         return ("", None, None, None, None)
 
     # operator new/delete/etc. — skip
@@ -278,12 +284,13 @@ def _classify_block(
         return ("", None, None, None, None)
 
     # Strip constructor initializer list: Foo(params) : member(val), ... -> Foo(params)
-    init_match = re.search(r"\)\s*:", function_sig)
-    if init_match:
-        function_sig = function_sig[:init_match.start() + 1]
-    init_match2 = re.search(r"\)\s*:", classifier_sig)
-    if init_match2:
-        classifier_sig = classifier_sig[:init_match2.start() + 1]
+    if lang.init_list_re:
+        init_match = lang.init_list_re.search(function_sig)
+        if init_match:
+            function_sig = function_sig[:init_match.start() + 1]
+        init_match2 = lang.init_list_re.search(classifier_sig)
+        if init_match2:
+            classifier_sig = classifier_sig[:init_match2.start() + 1]
 
     # Function / method detection
     test_sig = lang.trailing_mods_re.sub("", function_sig).rstrip()
@@ -303,7 +310,10 @@ def _classify_block(
         if lang.macro_like_re.match(test_sig):
             return ("", None, None, None, None)
 
-        raw_name = _extract_func_name(test_sig, lang.func_name_re, lang.export_macro_re)
+        raw_name = _extract_func_name(
+            test_sig, lang.func_name_re, lang.export_macro_re,
+            scope_operator=lang.scope_operator,
+        )
         if raw_name:
             func_part = raw_name.split("::")[-1]
             if func_part in lang.control_flow_names:
@@ -333,7 +343,11 @@ def analyze_file(
     content = "\n".join(lines)
     from .bracket_scanner import scan_brackets, compute_parent_map
 
-    blocks = scan_brackets(content)
+    blocks = scan_brackets(
+        content,
+        verbatim_string_prefix=lang.verbatim_string_prefix,
+        raw_string_char=lang.raw_string_char,
+    )
     if not blocks:
         return [], extract_extra_symbols(lines, file_id, lang, fw)
 
@@ -394,7 +408,7 @@ def analyze_file(
             file_id=file_id,
             start_line=actual_start,
             end_line=block.close_line,
-            ue_meta=deco_meta,
+            decoration_meta=deco_meta,
             parent_class=parent_class,
             signature=sig,
             inheritance_base=base,
@@ -417,31 +431,21 @@ def extract_extra_symbols(
     for i, line in enumerate(lines, start=1):
         stripped = line.strip()
 
-        # Framework declaration macros (e.g., UE DECLARE_DELEGATE)
-        if fw.declare_macro_re:
+        # Framework declaration macros (e.g., DECLARE_DELEGATE)
+        if fw.declare_macro_re and fw.parse_delegate_name:
             m = fw.declare_macro_re.match(stripped)
             if m and "delegate_def" in fw.extra_symbol_types:
-                macro_name = m.group(1)
-                paren_start = stripped.find("(")
-                if paren_start >= 0:
-                    inner = stripped[paren_start + 1:].strip()
-                    first_comma = inner.find(",")
-                    first_paren = inner.find(")")
-                    end = min(
-                        first_comma if first_comma >= 0 else len(inner),
-                        first_paren if first_paren >= 0 else len(inner),
-                    )
-                    delegate_name = inner[:end].strip().rstrip(")")
-                    if delegate_name and delegate_name[0].isupper():
-                        results.append(ExtraSymbol(
-                            qualified_name=delegate_name,
-                            block_type="delegate_def",
-                            file_id=file_id,
-                            start_line=i,
-                            end_line=i,
-                            signature=stripped,
-                            language=lang.name,
-                        ))
+                delegate_name = fw.parse_delegate_name(stripped)
+                if delegate_name:
+                    results.append(ExtraSymbol(
+                        qualified_name=delegate_name,
+                        block_type="delegate_def",
+                        file_id=file_id,
+                        start_line=i,
+                        end_line=i,
+                        signature=stripped,
+                        language=lang.name,
+                    ))
                 continue
 
         # #define macros (C/C++ only)
@@ -449,7 +453,7 @@ def extract_extra_symbols(
             dm = re.match(r"#\s*define\s+(\w+)(\([^)]*\))?\s*(.*)", stripped)
             if dm:
                 name = dm.group(1)
-                if name.startswith("_") or name.startswith("GENERATED_"):
+                if fw.macro_name_filter and fw.macro_name_filter(name):
                     continue
                 results.append(ExtraSymbol(
                     qualified_name=name,
