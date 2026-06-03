@@ -916,3 +916,398 @@
 
   ---
   这就是完整的 Unreal Shader 编译链路图谱。从触发点到 GlobalBeginCompileShader 的数据填充，再到最终提交编译的全过程都已经覆盖。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    Unreal Shader CompileJobs 完整分析
+
+  基于读取的代码，我为你整理了 Shader CompileJobs 的完整架构：
+
+  ---
+  1. 编译作业类层次结构
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │                        FShaderCommonCompileJob (基类)                                  │
+  │                        ShaderCompilerJobTypes.h:177-300                               │
+  │  ─────────────────────────────────────────────────────────────────────────────────│
+  │  通用字段:                                                                        │
+  │  ├── NextLink/PrevLink              │ 链表节点（用于管理）                          │
+  │  ├── PendingShaderMap             │ 所属的 ShaderMap                              │
+  │  ├── NumRefs/Hash/Id              │ 引用计数、Hash、ID                            │
+  │  ├── Type                          │ Single 或 Pipeline                            │
+  │  ├── Priority/PendingPriority     │ 优先级                                        │
+  │  ├── CurrentWorker                 │ 当前 Worker 类型                              │
+  │  ├── bFinalized/bSucceeded         │ 完成状态                                      │
+  │  ├── bErrorsAreLikelyToBeCode      │ 错误是否是代码问题                            │
+  │  ├── bReleased                     │ 是否已释放                                    │
+  │  ├── bInputHashSet                 │ InputHash 是否已设置                          │
+  │  ├── bIsDefaultMaterial            │ 是否为默认材质                                │
+  │  ├── bIsGlobalShader               │ 是否为 Global Shader                          │
+  │  ├── bBypassCache                  │ 是否绕过缓存                                  │
+  │  ├── InputHash                     │ 输入 Hash（用于缓存查找）                     │
+  │  ├── TimeAddedToPendingQueue       │ 时间戳：加入队列                              │
+  │  ├── TimeAssignedToExecution       │ 时间戳：分配执行                              │
+  │  ├── TimeExecutionCompleted        │ 时间戳：执行完成                              │
+  │  ├── JobCacheRef                   │ JobCache 引用                                │
+  │  ├── JobStatusPtr                  │ 状态指针                                      │
+  │  └── RequestOwner                  │ DDC/Distributed Build 请求所有者               │
+  │                                                                                      │
+  │  虚方法:                                                                            │
+  │  ├── GetInputHash()               │ 获取输入 Hash                                  │
+  │  ├── SerializeOutput()             │ 序列化输出（用于缓存）                        │
+  │  ├── AppendDebugName()            │ 生成调试名称                                  │
+  │  ├── AppendDiagnostics()          │ 生成诊断信息                                  │
+  │  ├── OnComplete()                 │ 编译完成回调（已弃用）                        │
+  │  └── OnComplete(Ctx)              │ 编译完成回调（新版本）                       │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+              ┌───────────────────────┴───────────────────────┐
+              │                                             │
+              ▼                                             ▼
+  ┌─────────────────────────────────────────┐  ┌─────────────────────────────────────────┐
+  │    FShaderCompileJob (Single)            │  │  FShaderPipelineCompileJob (Pipeline)    │
+  │    ShaderCompilerJobTypes.h:333-372     │  │  ShaderCompilerJobTypes.h:399-435       │
+  ├─────────────────────────────────────────┤  ├─────────────────────────────────────────┤
+  │  Key: FShaderCompileJobKey               │  │  Key: FShaderPipelineCompileJobKey      │
+  │  │   ├─ ShaderType                       │  │  │   ├─ ShaderPipeline                  │
+  │  │   ├─ VFType                           │  │  │   ├─ VFType                         │
+  │  │   └─ PermutationId                   │  │  │   └─ PermutationId                  │
+  │  │                                      │  │  │                                     │
+  │  Input: FShaderCompilerInput             │  │  StageJobs: TArray<FShaderCompileJob*>│
+  │  PreprocessOutput: FShaderPreprocessOutput│  │  │  每个阶段对应一个 Single Job         │
+  │  SecondaryPreprocessOutput               │  │  │                                     │
+  │  Output: FShaderCompilerOutput           │  │  方法:                                │
+  │  SecondaryOutput                         │  │  ├─ GetInputHash()                   │
+  │  ShaderParameters                        │  │  ├─ SerializeOutput()               │
+  │  SharingPipelines                        │  │  ├─ AppendDebugName()                │
+  │  │   └─ Map<VF*, Array<Pipeline*>>       │  │  ├─ AppendDiagnostics()            │
+  │  │       (共享此 shader 的 pipelines)    │  │  └─ OnComplete(Ctx)                 │
+  │                                        │  │                                     │
+  │  方法:                                  │  └─────────────────────────────────────────┘
+  │  ├─ GetSingleShaderJob() [this]         │
+  │  ├─ GetShaderPipelineJob() [null]       │
+  │  ├─ SerializeWorkerInput()              │
+  │  ├─ SerializeWorkerOutput()             │
+  │  ├─ SerializeArtifact()                 │
+  │  └─ GetFinalSourceView()               │
+  └─────────────────────────────────────────┘
+
+  ---
+  2. 编译作业的键（Job Keys）
+
+  FShaderCompileJobKey (Single Shader)
+
+  struct FShaderCompileJobKey
+  {
+      const FShaderType* ShaderType;      // 要编译的 shader 类型
+      const FVertexFactoryType* VFType;   // VertexFactory 类型（Material shader 为空）
+      int32 PermutationId;                // Permutation ID
+
+      // Hash 计算
+      uint32 MakeHash(uint32 Id) const {
+          return HashCombine(HashCombine(HashCombine(GetTypeHash(Id),
+                                                GetTypeHash(VFType)),
+                                                GetTypeHash(ShaderType)),
+                                        GetTypeHash(PermutationId));
+      }
+  };
+
+  FShaderPipelineCompileJobKey (Pipeline Shader)
+
+  struct FShaderPipelineCompileJobKey
+  {
+      const FShaderPipelineType* ShaderPipeline;  // Pipeline 类型
+      const FVertexFactoryType* VFType;           // VertexFactory 类型
+      int32 PermutationId;                        // Permutation ID
+
+      // Hash 计算（类似，但基于 ShaderPipeline）
+  };
+
+  ---
+  3. 编译输入：FShaderCompilerInput
+
+  ShaderCompilerCore.h:209-352
+
+  struct FShaderCompilerInput {
+      // === 目标信息 ===
+      FShaderTarget Target;           // (Frequency, Platform)
+      FName ShaderFormat;            // 如 D3D, Metal, Vulkan
+      FName CompressionFormat;       // 如 Oodle, Zlib
+      FName ShaderPlatformName;      // 平台名称
+      FName PreferredShaderCodeFormat; // DXIL vs DXBC
+
+      // === 源代码信息 ===
+      FString VirtualSourceFilePath; // .usf 文件路径
+      FString EntryPointName;        // HLSL 入口函数名
+      FString ShaderName;            // Shader 名称
+
+      // === 平台能力 ===
+      uint32 SupportedHardwareMask;  // 硬件掩码
+
+      // === 调试信息 ===
+      EShaderDebugInfoFlags DebugInfoFlags;
+      TArray<FString> RequiredSymbols;
+      TArray<FString> UsedOutputs;        // Pipeline 使用的输出
+      FString DumpDebugInfoRootPath;      // 调试输出根目录
+      FString DumpDebugInfoPath;          // 调试输出路径
+      FString DebugGroupName;             // 调试组名（材质名/Global）
+      FString DebugExtension;             // 调试扩展名
+      FString DebugDescription;           // 配置描述
+
+      // === 缓存相关 ===
+      FShaderCompilerInputHash Hash;     // 输入 Hash（缓存键）
+
+      // === 编译环境 ===
+      FShaderCompilerEnvironment Environment;            // 局部环境
+      TRefCountPtr<FSharedShaderCompilerEnvironment> SharedEnvironment; // 共享环境
+
+      // === Uniform Buffer ===
+      const FShaderParametersMetadata* RootParametersStructure;
+
+      // === 额外设置 ===
+      FExtraShaderCompilerSettings ExtraSettings;
+
+      // === 压缩 ===
+      FOodleDataCompression::ECompressor OodleCompressor;
+      FOodleDataCompression::ECompressionLevel OodleLevel;
+
+      // === 标志位 ===
+      bool bCompilingForShaderPipeline;  // 是否为 pipeline 编译
+      bool bIncludeUsedOutputs;          // 是否包含已使用的输出
+      bool bBindlessEnabled;             // 是否启用 bindless
+
+      // === 工具方法 ===
+      bool DumpDebugInfoEnabled() const;
+      bool NeedsOriginalShaderSource() const;
+      FString GenerateShaderName() const;
+      FString GenerateDebugInfo() const;
+      void GatherSharedInputs(...);
+      void SerializeSharedInputs(...);
+  };
+
+  ---
+  4. 编译输出：FShaderCompilerOutput
+
+  ShaderCompilerCore.h:491-640
+
+  struct FShaderCompilerOutput {
+      // === 编译结果 ===
+      FShaderParameterMap ParameterMap;     // Parameter 映射
+      TArray<FShaderCompilerError> Errors;  // 错误列表
+      FShaderTarget Target;                 // 目标平台
+      FShaderCode ShaderCode;               // 编译后的代码（字节码）
+      FSHAHash OutputHash;                 // 输出 Hash
+      FShaderCompilerInputHash ValidateInputHash; // 验证输入 Hash
+
+      // === 统计信息 ===
+      uint32 NumInstructions;              // 指令数
+      uint32 NumTextureSamplers;           // 纹理采样器数
+      double CompileTime;                  // 编译耗时
+      double PreprocessTime;               // 预处理耗时
+      bool bSucceeded;                     // 是否成功
+      bool bSupportsQueryingUsedAttributes;
+      bool bSerializingForCache;
+
+      // === 验证数据 ===
+      TArray<FShaderCodeValidationStride> ParametersStrideToValidate;
+      TArray<FShaderCodeValidationType> ParametersSRVTypeToValidate;
+      TArray<FShaderCodeValidationType> ParametersUAVTypeToValidate;
+      TArray<FShaderCodeValidationUBSize> ParametersUBSizeToValidate;
+
+      // === 诊断数据 ===
+      TArray<FShaderDiagnosticData> ShaderDiagnosticDatas;
+
+      // === 修改后的源代码（可选） ===
+      FString ModifiedShaderSource;
+      FString ModifiedEntryPointName;
+
+      // === 统计信息 ===
+      TArray<FGenericShaderStat> ShaderStatistics;
+
+      // === 方法 ===
+      void GenerateOutputHash();            // 生成输出 Hash
+      void CompressOutput(...);             // 压缩输出
+      void SerializeShaderCodeValidation();
+      void SerializeShaderDiagnosticData();
+      void AddStatistic<...>(...);
+
+      // === 序列化 ===
+      friend FArchive& operator<<(FArchive& Ar, FShaderCompilerOutput& Output);
+  };
+
+  ---
+  5. 编译作业状态机
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │                       EShaderCompileJobStatus (作业状态)                               │
+  │                       ShaderCompilerJobTypes.h:91-131                                 │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  状态转换:
+  [Unset] ──▶ [Ready] ──▶ [PendingDDC] ──▶ [Queued] ──▶ [PendingLocalExecution]
+                │              │                │               │
+                │              │                │               │
+                │              ▼                ▼               ▼
+                │        [CompleteFoundInDDC] [CompleteFoundInCache] [CompleteLocalExecution]
+                │              │                │               │
+                │              └────────────────┴───────────────┘
+                │
+                └─▶ [Skipped] / [Cancelled] / [PendingDistributedExecution]
+                                              │
+                                              └─▶ [CompleteDistributedExecution]
+
+  WasCompilationSkipped() 判断:
+  ├─ GetIsDuplicate() == true
+  ├─ Status == Skipped
+  ├─ Status == CompleteFoundInCache
+  └─ Status == CompleteFoundInDDC
+
+  ---
+  6. 编译作业的生命周期
+
+  创建阶段:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  BeginCompileShader() / BeginCompileShaderPipeline()                                  │
+  │  │                                                                                 │
+  │  ├─ 创建 FShaderCompileJob (Single) 或 FShaderPipelineCompileJob (Pipeline)         │
+  │  │                                                                                 │
+  │  ├─ 设置 Key (ShaderType/VFType/PermutationId 或 Pipeline/VFType/PermutationId)     │
+  │  │                                                                                 │
+  │  ├─ 设置 bIsGlobalShader / bIsDefaultMaterial / bBypassCache                        │
+  │  │                                                                                 │
+  │  ├─ GlobalBeginCompileShader() 填充 Input                                          │
+  │  │   ├─ 基础信息 (Target, SourceFilename, EntryPointName)                          │
+  │  │   ├─ 平台宏定义 (PIXELSHADER, FORWARD_SHADING, SUBSTRATE_ENABLED...)           │
+  │  │   ├─ 编译器 Flags (CFLAG_Debug, CFLAG_HLSL2021, CFLAG_ForceDXC...)             │
+  │  │   └─ Uniform Buffer Includes                                                    │
+  │  │                                                                                 │
+  │  └─ 调用 UpdateInputHash() 生成 InputHash                                          │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  提交阶段:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  GShaderCompilingManager::SubmitJobs()                                               │
+  │  │                                                                                 │
+  │  ├─ 检查 JobCache 是否已有相同 InputHash 的 Job                                    │
+  │  │                                                                                 │
+  │  ├─ 如果存在且不是 pipeline → 设置 IsDuplicate=true, 复用 JobCacheRef             │
+  │  │                                                                                 │
+  │  ├─ 否则:                                                                          │
+  │  │   ├─ 设置状态为 PendingDDC 或 Queued                                          │
+  │  │   ├─ 添加到 PendingShaderMap                                                  │
+  │  │   └─ 发送给 Worker (本地或分布式)                                              │
+  │  │                                                                                 │
+  │  └─ 对于 Pipeline:                                                                │
+  │      ├─ 如果 bShouldOptimizeUnusedOutputs=true → 创建 Pipeline Job + 多个 Stage   │
+  │      └─ 否 → 复用已有 Single Job, 设置 SharingPipelines                           │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  执行阶段:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  ShaderCompileWorker (SCW) 进程                                                    │
+  │  │                                                                                 │
+  │  ├─ 反序列化 Input                                                                │
+  │  │                                                                                 │
+  │  ├─ 调用 ShaderFormat::CompileShader()                                            │
+  │  │   ├─ 预处理 (PreprocessShader)                                                  │
+  │  │   ├─ 调用编译器 (FXC/DXC/Metal/glslang)                                       │
+  │  │   ├─ 后处理 (生成参数映射、优化等)                                             │
+  │  │   └─ 填充 Output                                                               │
+  │  │                                                                                 │
+  │  └─ 序列化 Output 返回                                                            │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  完成阶段:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  ProcessCompilationResults() / ProcessSingleJob()                                  │
+  │  │                                                                                 │
+  │  ├─ 检查 bSucceeded                                                               │
+  │  │                                                                                 │
+  │  ├─ 调用 FShaderType::FinishCompileShader() 创建 FShader 对象                   │
+  │  │                                                                                 │
+  │  ├─ 将 FShader 添加到 ShaderMap                                                  │
+  │  │                                                                                 │
+  │  ├─ 调用 Job->OnComplete(Ctx)                                                     │
+  │  │                                                                                 │
+  │  ├─ 更新 JobCache                                                               │
+  │  │                                                                                 │
+  │  └─ 释放 Job                                                                     │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  7. Pipeline Job 的特殊处理
+
+  Pipeline Job 结构:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  FShaderPipelineCompileJob                                                           │
+  │  ├─ Key: FShaderPipelineCompileJobKey                                               │
+  │  │   ├─ ShaderPipeline (如 StandardVelocityPipeline)                                │
+  │  │   └─ VFType (MeshMaterial 时有值)                                               │
+  │  │                                                                                 │
+  │  └─ StageJobs: TArray<TRefCountPtr<FShaderCompileJob>>                             │
+  │      └─ 每个 Stage 对应一个 Single Job                                            │
+  │          ├─ Stage 0 (如 Pixel Shader)                                               │
+  │          ├─ Stage 1 (如 Vertex Shader)                                              │
+  │          └─ ...                                                                     │
+  │                                                                                 │
+  │  编译流程:                                                                       │
+  │  1. BeginCompileShaderPipeline() 创建 Pipeline Job                                 │
+  │  2. 为每个 Stage 创建 Single Job                                                   │
+  │  3. 每个 Stage Job 包含该 Stage 的 Input/Output                                    │
+  │  4. Pipeline Job 只是容器,实际编译在 Stage Jobs 中执行                            │
+  │  5. OnComplete 时合并所有 Stage 的 FShader                                        │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  共享 Pipeline 模式:
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │  bShouldOptimizeUnusedOutputs = false                                             │
+  │  │                                                                                 │
+  │  ├─ Single Job 先编译                                                             │
+  │  │                                                                                 │
+  │  ├─ Pipeline 引用该 Job:                                                         │
+  │  │   Job->SharingPipelines.Add(VFType, Pipeline)                                 │
+  │  │                                                                                 │
+  │  └─ 运行时通过 Pipeline 字段区分使用                                             │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  8. 编译作业类型对比表
+
+  ┌──────────────┬─────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+  │     维度     │     FShaderCompileJob (Single)      │                 FShaderPipelineCompileJob (Pipeline)                 │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Key          │ FShaderCompileJobKey                │ FShaderPipelineCompileJobKey                                         │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Key 包含     │ ShaderType + VFType + PermutationId │ ShaderPipeline + VFType + PermutationId                              │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Input/Output │ 单个 shader 的 Input/Output         │ 容器，无独立 Input/Output                                            │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ StageJobs    │ 无                                  │ 多个 Stage 的 FShaderCompileJob                                      │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ 编译单元     │ 单个 Shader Stage                   │ 多个 Stage (VS+PS, VS+GS+PS 等)                                      │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ 优化策略     │ 独立优化                            │ 跨 Stage 优化 interpolator（如果 bShouldOptimizeUnusedOutputs=true） │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ OnComplete   │ 创建单个 FShader                    │ 创建多个 FShader 并组合成 FShaderPipeline                            │
+  ├──────────────┼─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ 用途         │ 大多数 shader                       │ 后处理 pass、Velocity pass 等                                        │
+  └──────────────┴─────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
+  ---
+  这就是 Unreal Shader CompileJobs 的完整架构。核心概念是：编译作业是携带 Input 和 Output 的可缓存工作单元，通过 Key 进行去重，通过 JobCache 共享，通过 Pipeline 容器组合多个 Stage。
