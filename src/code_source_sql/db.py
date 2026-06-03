@@ -366,87 +366,21 @@ def _format_edges(edges: list[dict[str, str]]) -> str:
     return result
 
 
-def _apply_view(code: str, view: str) -> str:
-    if view == "full":
-        return code
-    if view == "meta":
-        return ""
-    if view == "signature":
-        # Strategy: detect function bodies by tracking brace blocks that follow
-        # a line containing '(' and ')'. Everything inside such blocks is skipped.
-        # Class/struct/enum member declarations (lines with ';') are always kept.
-        lines = code.split("\n")
-        kept: list[str] = []
-        # Stack: True = inside function body, False = inside class/struct/enum body
-        body_stack: list[bool] = []
-        in_func_body = False
-
-        for line in lines:
-            stripped = line.strip()
-            current_is_func = in_func_body
-
-            # Detect opening brace
-            open_count = stripped.count("{")
-            close_count = stripped.count("}")
-            net = open_count - close_count
-
-            # Always keep structural keywords
-            if any(kw in stripped for kw in ("class ", "struct ", "enum ", "namespace ")):
-                kept.append(line)
-                if open_count > 0:
-                    for _ in range(open_count):
-                        body_stack.append(False)
-                    in_func_body = any(body_stack) if body_stack else False
-                continue
-            # Access specifiers — always keep
-            if stripped in ("public:", "protected:", "private:"):
-                kept.append(line)
-                continue
-            # Closing braces
-            if close_count > 0 and not open_count:
-                for _ in range(close_count):
-                    if body_stack:
-                        body_stack.pop()
-                in_func_body = any(body_stack) if body_stack else False
-                kept.append(line)
-                continue
-            # Lines with semicolons are declarations — keep if not inside function body
-            if ";" in stripped and not current_is_func:
-                kept.append(line)
-                continue
-            # Lines with parentheses and not inside function body — function signatures
-            if "(" in stripped and ")" in stripped and not current_is_func:
-                kept.append(line)
-                # If this line also opens a brace, it's a function definition body
-                if open_count > 0:
-                    for _ in range(open_count):
-                        body_stack.append(True)
-                    in_func_body = any(body_stack) if body_stack else False
-                continue
-            # virtual / static / override / FORCEINLINE
-            if any(kw in stripped for kw in ("virtual ", "static ", "override", "FORCEINLINE")):
-                kept.append(line)
-                if open_count > 0:
-                    for _ in range(open_count):
-                        body_stack.append(True)
-                    in_func_body = any(body_stack) if body_stack else False
-                continue
-            # Opening brace on its own line — inherits the context from previous line
-            if stripped == "{" or (open_count > 0 and stripped.startswith("{")):
-                for _ in range(open_count):
-                    body_stack.append(current_is_func)
-                in_func_body = any(body_stack) if body_stack else False
-                if not current_is_func:
-                    kept.append(line)
-                continue
-            # Lines inside function body — skip
-            # Lines with mixed { and } on same line (e.g., lambda, initializer)
-            if open_count > 0:
-                for _ in range(open_count):
-                    body_stack.append(current_is_func or "(" in stripped)
-                in_func_body = any(body_stack) if body_stack else False
-        return "\n".join(kept)
-    return code
+def _apply_view(
+    code: str,
+    view: str,
+    *,
+    block_type: str | None = None,
+    qualified_name: str | None = None,
+    child_symbols: list[dict] | None = None,
+) -> str:
+    from .code_block_summary import apply_view
+    return apply_view(
+        code, view,
+        block_type=block_type,
+        qualified_name=qualified_name,
+        child_symbols=child_symbols,
+    )
 
 
 def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
@@ -484,7 +418,11 @@ def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
     if view == "meta":
         return "\n".join(lines)
 
-    code = _apply_view(entry["code"], view)
+    code = _apply_view(
+        entry["code"], view,
+        block_type=entry.get("block_type"),
+        qualified_name=entry.get("qualified_name"),
+    )
     lines.append("---")
     lines.append(code)
     return "\n".join(lines)
@@ -789,7 +727,12 @@ def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str
     if view == "meta":
         return "\n".join(lines)
 
-    code = _apply_view(entry["code"], view)
+    single_block_type = symbols[0]["block_type"] if len(symbols) == 1 else None
+    code = _apply_view(
+        entry["code"], view,
+        block_type=single_block_type,
+        child_symbols=symbols if len(symbols) > 1 else None,
+    )
     lines.append("---")
     lines.append(code)
     return "\n".join(lines)

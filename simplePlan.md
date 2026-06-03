@@ -294,3 +294,119 @@ Agent 工作流推演 (Workflow in Action)
   2. Read_Symbol 偏靶时，不是回到锚定阶段，而是直接降级到 Read_File_Range — 因为锚定阶段的 file+line 已经在手。
 
   这两条在 SKILL.md 里其实有写（"Read_File_Range 是 fallback"），但没有强调 偏靶后不要重新锚定 这个关键判断。这是应该补进去的。
+
+
+
+    Plan: Refactor _apply_view into Structured Code Block Summary System
+
+     Context
+
+     The signature view in db.py:__apply_view (lines 369-449) is an ad-hoc brace-tracking state machine that guesses code structure from raw text. It duplicates work already done better by bracket_scanner.py (FSM with comment/string/raw-string awareness) and symbol_analyzer.py (block classification with UE macro
+     support). The goal is to replace this with a proper summary system that reuses existing algorithms and provides three targeted strategies:
+
+     1. Class/struct → member function signatures + member variable declarations
+     2. Long macro definitions → function/member declarations inside the macro
+     3. Long function bodies → local variables, control flow summaries, return statements
+
+     Approach
+
+     New file: src/code_source_sql/code_block_summary.py
+
+     A standalone module that imports bracket_scanner and symbol_analyzer helpers. No DB dependency for the core logic — uses scan_brackets + compute_parent_map for structural analysis when DB child symbols aren't available.
+
+     Core functions
+
+     apply_view(code, view, *, block_type=None, child_symbols=None, ...)
+       → dispatches to strategy based on block_type
+
+     summarize_class_block(code, *, child_symbols=None)
+       → DB path: iterate child_symbols, keep signatures + member vars
+       → Fallback: scan_brackets → keep depth-1 declarations
+
+     summarize_macro_block(code)
+       → scan_brackets → keep declaration lines at depth 1
+
+     summarize_function_body(code)
+       → extract local vars (regex), control flow (for/while/if/switch), return statements
+
+     Block type → strategy mapping
+
+     ┌───────────────────────────────┬────────────────────────────────────────────────────────┐
+     │ block_type from symbol_index  │                        Strategy                        │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ class                         │ summarize_class_block                                  │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ method, function              │ summarize_function_body                                │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ macro_def                     │ summarize_macro_block                                  │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ enum                          │ keep all lines (enums are declarations)                │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ namespace                     │ summarize_class_block (same logic: child declarations) │
+     ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+     │ multiple symbols (file range) │ iterate per-symbol                                     │
+     └───────────────────────────────┴────────────────────────────────────────────────────────┘
+
+     Changes to existing files
+
+     db.py — _apply_view (line 369):
+     - Add keyword-only params: block_type, qualified_name, child_symbols, etc.
+     - Delegate to code_block_summary.apply_view()
+
+     db.py — format_symbol_response (line 487):
+     - Pass block_type, qualified_name, start_line, end_line from entry dict
+
+     db.py — format_file_range_response (line 792):
+     - Pass child_symbols=entry.get("symbols") and single-symbol block_type when applicable
+
+     Function body summary details
+
+     For summarize_function_body:
+     1. Keep the function signature (lines before first {)
+     2. Extract local variable declarations: (const|static)? Type[*&] Name [= expr];
+     3. Extract control flow with truncated conditions (≤80 chars):
+       - for (Type var : container) — show iterator and container
+       - if (condition), while (condition), switch (expr)
+     4. Keep return statements (truncated to 60 chars)
+     5. Append // N lines summarized footer
+
+     Key reuse of existing algorithms
+
+     ┌───────────────────────────┬───────────────────────────────────────────────────────┐
+     │           Need            │                    Existing source                    │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Brace structure           │ bracket_scanner.scan_brackets()                       │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Nesting/parentage         │ bracket_scanner.compute_parent_map()                  │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Declaration text before { │ symbol_analyzer._gather_declaration()                 │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Block classification      │ symbol_analyzer._classify_block()                     │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ UE decoration macros      │ symbol_analyzer._sniff_decoration_above()             │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Type detection regex      │ edge_extractor._TYPE_RE                               │
+     ├───────────────────────────┼───────────────────────────────────────────────────────┤
+     │ Language configs          │ configs.make_cpp_language(), make_generic_framework() │
+     └───────────────────────────┴───────────────────────────────────────────────────────┘
+
+     Line number handling
+
+     scan_brackets on the code substring returns 1-based lines relative to that substring. All summary functions work with relative line numbers. No mixing with absolute file line numbers from the DB.
+
+     Performance optimization
+
+     When child_symbols from DB is available (the common path for read_symbol), skip scan_brackets entirely and use pre-classified symbol data directly. Only fall back to text analysis when no DB context is available.
+
+     Files to modify
+
+     1. Create src/code_source_sql/code_block_summary.py — new summary module (~200 lines)
+     2. Edit src/code_source_sql/db.py — refactor _apply_view signature + callers (lines 369-449, 487, 792)
+
+     Verification
+
+     1. Run read_symbol("SomeClass", view="signature") on a known class — should show member signatures without bodies
+     2. Run read_symbol("SomeClass::Method", view="signature") on a long function — should show local vars + control flow summary
+     3. Run read_file_range(path, start, end, view="signature") — should handle multi-symbol ranges
+     4. Run search_fts_tool to find a macro, then read_symbol with view="signature" — should show macro declarations
+     5. Test with C# files to verify cross-language support

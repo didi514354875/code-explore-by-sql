@@ -8,3 +8,4 @@ __pycache__/
 *.db-wal
 .env
 .DS_Store
+.mcp.json

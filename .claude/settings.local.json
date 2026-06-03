@@ -4,7 +4,8 @@
       "Bash(PYTHONPATH=src python *)",
       "mcp__code-source-sql__read_symbol",
       "mcp__code-source-sql__search_fts_tool",
-      "mcp__code-source-sql__read_file_range"
+      "mcp__code-source-sql__read_file_range",
+      "Bash(python *)"
     ]
   },
   "enableAllProjectMcpServers": true,
