@@ -3,6 +3,9 @@
 Reuses bracket_scanner for structural analysis and symbol_analyzer
 helpers for declaration extraction. When DB child symbols are available,
 skips text scanning and uses pre-classified symbol data directly.
+
+All regex patterns are sourced from LanguageConfig and FrameworkConfig
+rather than hardcoded.
 """
 
 from __future__ import annotations
@@ -11,42 +14,8 @@ import re
 from typing import Any
 
 from .bracket_scanner import BracketBlock, compute_parent_map, scan_brackets
-from .configs import FrameworkConfig, LanguageConfig, make_cpp_language, make_generic_framework
+from .configs import FrameworkConfig, LanguageConfig
 from .symbol_analyzer import _gather_declaration, _classify_block
-
-# ── Defaults for text-only fallback path ─────────────────────────────────
-
-_default_lang = make_cpp_language()
-_default_fw = make_generic_framework()
-
-# ── Regex patterns for function body summary ─────────────────────────────
-
-_LOCAL_VAR_RE = re.compile(
-    r"^\s*"
-    r"(?:(?:const|static|mutable|constexpr|volatile)\s+)?"
-    r"([A-Za-z_]\w*(?:\s*::\s*\w+)*(?:\s*<[^>]*>)?(?:\s*[*&]+)?)\s+"
-    r"([A-Za-z_]\w*)"
-    r"\s*(?:=[^;]*|)\s*;"
-)
-
-_RANGE_FOR_RE = re.compile(
-    r"for\s*\(\s*(?:const\s+)?(\w+(?:\s*<[^>]*>)?)\s*[*&]?\s+(\w+)\s*:\s*(\w+)"
-)
-
-_CONTROL_FLOW_RES = [
-    (re.compile(r"^\s*for\s*\((.{1,80})\)\s*\{?\s*$"), "for"),
-    (re.compile(r"^\s*while\s*\((.{1,80})\)\s*\{?\s*$"), "while"),
-    (re.compile(r"^\s*(?:else\s+)?if\s*\((.{1,80})\)\s*\{?\s*$"), "if"),
-    (re.compile(r"^\s*switch\s*\((.{1,40})\)\s*\{?\s*$"), "switch"),
-]
-
-_RETURN_RE = re.compile(r"^\s*return\s+(.{1,60});")
-
-# Access specifiers (C++)
-_ACCESS_SPEC_RE = re.compile(r"^\s*(?:public|private|protected)\s*:\s*(?://.*)?$")
-
-# UE decoration macros to keep in class summary
-_UE_MACRO_RE = re.compile(r"^\s*(UFUNCTION|UPROPERTY|UCLASS|USTRUCT|UPARAM|UMETA)\b")
 
 # ── Dispatcher ───────────────────────────────────────────────────────────
 
@@ -63,6 +32,8 @@ def apply_view(
     block_type: str | None = None,
     qualified_name: str | None = None,
     child_symbols: list[dict[str, Any]] | None = None,
+    lang: LanguageConfig | None = None,
+    fw: FrameworkConfig | None = None,
 ) -> str:
     if view == "full":
         return code
@@ -74,19 +45,27 @@ def apply_view(
     if not code or not code.strip():
         return code
 
-    strategy = _pick_strategy(block_type, code)
+    # For signature view, ensure we have a language config
+    if lang is None:
+        from .configs import make_cpp_language
+        lang = make_cpp_language()
+    if fw is None:
+        from .configs import make_generic_framework
+        fw = make_generic_framework()
+
+    strategy = _pick_strategy(block_type, code, lang)
 
     if strategy == "class":
-        return summarize_class_block(code, child_symbols=child_symbols)
+        return summarize_class_block(code, child_symbols=child_symbols, lang=lang, fw=fw)
     if strategy == "function":
-        return summarize_function_body(code)
+        return summarize_function_body(code, lang=lang)
     if strategy == "macro":
-        return summarize_macro_block(code)
+        return summarize_macro_block(code, lang=lang, fw=fw)
 
     return code
 
 
-def _pick_strategy(block_type: str | None, code: str) -> str:
+def _pick_strategy(block_type: str | None, code: str, lang: LanguageConfig) -> str:
     if block_type:
         if block_type in _CLASS_TYPES:
             return "class"
@@ -97,11 +76,13 @@ def _pick_strategy(block_type: str | None, code: str) -> str:
         if block_type in _DECL_TYPES:
             return "declaration"
 
+    block_kw_re = lang.block_keyword_re or re.compile(r"\b(?:class|struct)\b")
+
     for line in code.split("\n"):
         s = line.strip()
         if not s or s.startswith("//") or s.startswith("/*"):
             continue
-        if re.search(r"\b(?:class|struct)\b", s):
+        if block_kw_re.search(s):
             return "class"
         if s.startswith("#") and "define" in s:
             return "macro"
@@ -122,13 +103,15 @@ def summarize_class_block(
     fw: FrameworkConfig | None = None,
 ) -> str:
     if child_symbols is not None:
-        return _class_summary_from_symbols(code, child_symbols)
-    return _class_summary_from_text(code, lang or _default_lang, fw or _default_fw)
+        return _class_summary_from_symbols(code, child_symbols, lang, fw)
+    return _class_summary_from_text(code, lang, fw)
 
 
 def _class_summary_from_symbols(
     code: str,
     child_symbols: list[dict[str, Any]],
+    lang: LanguageConfig,
+    fw: FrameworkConfig,
 ) -> str:
     lines = code.split("\n")
     total = len(lines)
@@ -137,16 +120,20 @@ def _class_summary_from_symbols(
     for sym in child_symbols:
         child_by_start[sym["start_line"]] = sym
 
+    # Get config-driven patterns
+    access_spec_names = lang.access_spec_names
+    deco_macro_re = fw.decoration_macro_re
+
     kept: list[str] = []
 
     for i, line in enumerate(lines, start=1):
         stripped = line.strip()
 
-        if stripped in ("public:", "protected:", "private:"):
+        if stripped in access_spec_names:
             kept.append(line)
             continue
 
-        if _UE_MACRO_RE.match(stripped):
+        if deco_macro_re and deco_macro_re.match(stripped):
             kept.append(line)
             continue
 
@@ -215,12 +202,20 @@ def _class_summary_from_text(
     lang: LanguageConfig,
     fw: FrameworkConfig,
 ) -> str:
-    blocks = scan_brackets(code)
+    blocks = scan_brackets(
+        code,
+        verbatim_string_prefix=lang.verbatim_string_prefix,
+        raw_string_char=lang.raw_string_char,
+    )
     if not blocks:
         return code
 
     parent_map = compute_parent_map(blocks)
     lines = code.split("\n")
+
+    # Get config-driven patterns
+    access_spec_names = lang.access_spec_names
+    deco_macro_re = fw.decoration_macro_re
 
     outermost = min(blocks, key=lambda b: b.depth)
     outer_depth = outermost.depth
@@ -252,11 +247,11 @@ def _class_summary_from_text(
             kept.append(line)
             continue
 
-        if stripped in ("public:", "protected:", "private:"):
+        if stripped in access_spec_names:
             kept.append(line)
             continue
 
-        if _UE_MACRO_RE.match(stripped):
+        if deco_macro_re and deco_macro_re.match(stripped):
             kept.append(line)
             continue
 
@@ -283,8 +278,16 @@ def _class_summary_from_text(
 
 # ── Strategy 2: Macro definitions ───────────────────────────────────────
 
-def summarize_macro_block(code: str) -> str:
-    blocks = scan_brackets(code)
+def summarize_macro_block(
+    code: str,
+    lang: LanguageConfig,
+    fw: FrameworkConfig,
+) -> str:
+    blocks = scan_brackets(
+        code,
+        verbatim_string_prefix=lang.verbatim_string_prefix,
+        raw_string_char=lang.raw_string_char,
+    )
     if not blocks:
         return _macro_fallback(code)
 
@@ -326,7 +329,7 @@ def summarize_macro_block(code: str) -> str:
         if i in child_lines:
             for blk in child_blocks:
                 if blk.open_line == i:
-                    decl_lines = _gather_declaration(lines, i - 1, _default_lang, _default_fw)
+                    decl_lines = _gather_declaration(lines, i - 1, lang, fw)
                     if decl_lines:
                         decl = " ".join(decl_lines).rstrip()
                         brace_pos = decl.find("{")
@@ -359,7 +362,10 @@ def _macro_fallback(code: str) -> str:
 
 # ── Strategy 3: Function body ───────────────────────────────────────────
 
-def summarize_function_body(code: str) -> str:
+def summarize_function_body(
+    code: str,
+    lang: LanguageConfig,
+) -> str:
     lines = code.split("\n")
 
     brace_idx = _find_first_open_brace(lines)
@@ -377,12 +383,33 @@ def summarize_function_body(code: str) -> str:
     if not body_stripped or body_stripped == "}":
         return code
 
+    # Build language-aware regexes from config
+    scope_op_escaped = re.escape(lang.scope_operator)
+    local_var_re = re.compile(
+        r"^\s*"
+        rf"(?:(?:{lang.local_var_modifiers})\s+)?"
+        rf"([A-Za-z_]\w*(?:\s*{scope_op_escaped}\s*\w+)*(?:\s*<[^>]*>)?(?:\s*[*&]+)?)\s+"
+        r"([A-Za-z_]\w*)"
+        r"\s*(?:=[^;]*|)\s*;"
+    )
+
+    range_for_re = lang.range_for_re
+
+    control_flow_res = [
+        (re.compile(r"^\s*for\s*\((.{1,80})\)\s*\{?\s*$"), "for"),
+        (re.compile(r"^\s*while\s*\((.{1,80})\)\s*\{?\s*$"), "while"),
+        (re.compile(r"^\s*(?:else\s+)?if\s*\((.{1,80})\)\s*\{?\s*$"), "if"),
+        (re.compile(r"^\s*switch\s*\((.{1,40})\)\s*\{?\s*$"), "switch"),
+    ]
+
+    return_re = re.compile(r"^\s*return\s+(.{1,60});")
+
     for line in body_lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("//") or stripped in ("{", "}", "{})", "};"):
             continue
 
-        m = _LOCAL_VAR_RE.match(stripped)
+        m = local_var_re.match(stripped)
         if m:
             vtype = m.group(1).strip()
             vname = m.group(2)
@@ -396,14 +423,15 @@ def summarize_function_body(code: str) -> str:
                 summary_lines.append(f"  {vtype} {vname};")
             continue
 
-        rf = _RANGE_FOR_RE.search(stripped)
-        if rf:
-            vtype, vname, container = rf.group(1), rf.group(2), rf.group(3)
-            summary_lines.append(f"  for ({vtype} {vname} : {container}) {{ ... }}")
-            continue
+        if range_for_re:
+            rf = range_for_re.search(stripped)
+            if rf:
+                vtype, vname, container = rf.group(1), rf.group(2), rf.group(3)
+                summary_lines.append(f"  for ({vtype} {vname} : {container}) {{ ... }}")
+                continue
 
         matched_flow = False
-        for pat, kw in _CONTROL_FLOW_RES:
+        for pat, kw in control_flow_res:
             m = pat.match(line)
             if m:
                 cond = m.group(1).strip()
@@ -415,7 +443,7 @@ def summarize_function_body(code: str) -> str:
         if matched_flow:
             continue
 
-        rm = _RETURN_RE.match(stripped)
+        rm = return_re.match(stripped)
         if rm:
             retval = rm.group(1).strip()
             if len(retval) > 60:

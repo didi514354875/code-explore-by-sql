@@ -9,7 +9,9 @@
       "Bash(uv run *)",
       "Bash(echo \"EXIT CODE: $?\")",
       "Bash(CODE_SOURCE_DB=/root/myproject/CodeExploreBySQL/unreal.db uv --directory /root/myproject/CodeExploreBySQL run code-source-sql)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python3 *)",
+      "Bash(grep -E \"\\\\.\\(md|toml|json|txt|cfg|ini|yaml|yml\\)$|Makefile\")"
     ]
   },
   "enableAllProjectMcpServers": true,

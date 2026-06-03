@@ -1,12 +1,14 @@
-"""Bracket skeleton scanner — lightweight structural indexing for C/C++ source.
+"""Bracket skeleton scanner — lightweight structural indexing for brace-based source.
 
 FSM tracks brace depth while correctly ignoring braces inside comments,
-string literals, character literals, and raw strings.
+string literals, character literals, raw strings, and verbatim strings.
+Supports C/C++ and C# syntax via optional LanguageConfig parameter.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 # FSM states
 _CODE = 0
@@ -15,8 +17,9 @@ _BLOCK_COMMENT = 2
 _STRING = 3
 _CHAR_LITERAL = 4
 _RAW_STRING = 5
+_VERBATIM_STRING = 6
 
-_TRIGGER_CHARS = frozenset('{}"/\'R')
+_TRIGGER_CHARS_BASE = frozenset('{}"/\'R@')
 
 
 @dataclass(frozen=True)
@@ -27,19 +30,38 @@ class BracketBlock:
     is_complete: bool
 
 
-def scan_brackets(content: str) -> list[BracketBlock]:
-    """Scan content and return matched brace pairs with depth info."""
+def scan_brackets(
+    content: str,
+    verbatim_string_prefix: str | None = None,
+    raw_string_char: str | None = None,
+) -> list[BracketBlock]:
+    """Scan content and return matched brace pairs with depth info.
+
+    Args:
+        content: Source code text to scan.
+        verbatim_string_prefix: If set (e.g. '@' for C#), enables verbatim
+            string handling. Braces inside verbatim strings are ignored.
+        raw_string_char: If set (e.g. 'R' for C++), enables raw string
+            literal handling. Braces inside raw strings are ignored.
+    """
     depth = 0
     stack: list[tuple[int, int]] = []  # (open_line, open_depth)
     blocks: list[BracketBlock] = []
     state = _CODE
     raw_delim = ""
+    _base = frozenset('{}"/\'')
+    extras = set()
+    if raw_string_char:
+        extras.add(raw_string_char)
+    if verbatim_string_prefix:
+        extras.add(verbatim_string_prefix)
+    trigger_chars = _base | frozenset(extras)
 
     lines = content.split("\n")
     last_line = len(lines)
 
     for line_idx, line in enumerate(lines, start=1):
-        if state == _CODE and not any(c in line for c in _TRIGGER_CHARS):
+        if state == _CODE and not any(c in line for c in trigger_chars):
             continue
 
         i = 0
@@ -57,13 +79,18 @@ def scan_brackets(content: str) -> list[BracketBlock]:
                     state = _BLOCK_COMMENT
                     i += 2
                     continue
-                if ch == "R" and next_ch == '"':
+                if raw_string_char and ch == raw_string_char and next_ch == '"':
                     delim_end = line.find("(", i + 2)
                     if delim_end != -1:
                         raw_delim = line[i + 2 : delim_end]
                         state = _RAW_STRING
                         i = delim_end + 1
                         continue
+                # Verbatim string: @"..." (C#) — doubles "" are escaped quotes
+                if verbatim_string_prefix and ch == verbatim_string_prefix and next_ch == '"':
+                    state = _VERBATIM_STRING
+                    i += 2
+                    continue
                 if ch == '"':
                     state = _STRING
                     i += 1
@@ -123,6 +150,18 @@ def scan_brackets(content: str) -> list[BracketBlock]:
                     i = pos + len(end_marker)
                     continue
                 break
+
+            elif state == _VERBATIM_STRING:
+                # In verbatim strings, "" is an escaped quote, " alone ends the string
+                if ch == '"':
+                    if next_ch == '"':
+                        i += 2  # skip escaped quote
+                        continue
+                    else:
+                        state = _CODE
+                        i += 1
+                        continue
+                i += 1
 
         if state == _LINE_COMMENT:
             state = _CODE

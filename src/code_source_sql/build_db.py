@@ -64,16 +64,22 @@ def infer_module_name(path: Path, source_marker: str = "Source", categories: set
 def _get_configs(
     project: ProjectConfig,
 ) -> dict[str, tuple[LanguageConfig, FrameworkConfig]]:
-    """Build a mapping from language name -> (LanguageConfig, FrameworkConfig)."""
-    # Build framework
-    frameworks: dict[str, FrameworkConfig] = {}
+    """Build a mapping from file extension -> (LanguageConfig, FrameworkConfig).
+
+    Framework selection is per-language:
+    - C++ files in an Unreal project get the Unreal framework (UCLASS, UFUNCTION, etc.)
+    - C# files in an Unreal project get the generic framework (no UE C++ rules)
+    - All files in a generic project get the generic framework
+    """
+    from .configs import make_generic_framework
+
+    # Build framework(s)
     fw_name = project.framework_name
     if fw_name == "unreal":
-        fw = make_unreal_framework()
+        fw_unreal = make_unreal_framework()
     else:
-        from .configs import make_generic_framework
-        fw = make_generic_framework()
-    frameworks[fw_name] = fw
+        fw_unreal = None
+    fw_generic = make_generic_framework()
 
     # Build languages
     lang_names = set(project.extension_to_language.values())
@@ -87,9 +93,14 @@ def _get_configs(
             raise ValueError(f"Unknown language: {ln}")
 
     # Map extension -> (lang, fw)
+    # C# files always use generic framework even in Unreal projects,
+    # since UE C++ rules (UFUNCTION, UCLASS, etc.) don't apply to C#.
     result: dict[str, tuple[LanguageConfig, FrameworkConfig]] = {}
     for ext, ln in project.extension_to_language.items():
-        result[ext] = (langs[ln], fw)
+        if fw_unreal and ln == "cpp":
+            result[ext] = (langs[ln], fw_unreal)
+        else:
+            result[ext] = (langs[ln], fw_generic)
 
     return result
 
@@ -106,7 +117,7 @@ def _process_file(
     from .edge_extractor import extract_edges
 
     symbols, extras = analyze_file(lines, file_id, lang, fw)
-    edges = extract_edges(symbols, extras, lines, fw, lang.name)
+    edges = extract_edges(symbols, extras, lines, fw, lang)
 
     return symbols, extras, edges
 
@@ -161,7 +172,8 @@ def build_index(
 
         # Dispatch by file extension
         ext = path.suffix.lower()
-        lang, fw_for_file = ext_configs.get(ext, ext_configs.get(".cpp", (make_cpp_language(), make_unreal_framework())))
+        from .configs import make_generic_framework
+        lang, fw_for_file = ext_configs.get(ext, (make_cpp_language(), make_generic_framework()))
 
         sym_rows, extra_rows, edge_rows = _process_file(file_id, content, lines, lang, fw_for_file)
 
