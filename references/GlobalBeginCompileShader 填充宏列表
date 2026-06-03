@@ -1,0 +1,711 @@
+ GlobalBeginCompileShader 宏定义完整清单
+
+  1. Shader Frequency 宏（Shader 阶段标识）
+
+  文件位置： ShaderCompiler.cpp:3335-3349
+
+  SET_SHADER_DEFINE(Input.Environment, PIXELSHADER,     Target.Frequency == SF_Pixel);
+  SET_SHADER_DEFINE(Input.Environment, VERTEXSHADER,    Target.Frequency == SF_Vertex);
+  SET_SHADER_DEFINE(Input.Environment, MESHSHADER,      Target.Frequency == SF_Mesh);
+  SET_SHADER_DEFINE(Input.Environment, AMPLIFICATIONSHADER, Target.Frequency == SF_Amplification);
+  SET_SHADER_DEFINE(Input.Environment, GEOMETRYSHADER,  Target.Frequency == SF_Geometry);
+  SET_SHADER_DEFINE(Input.Environment, COMPUTESHADER,   Target.Frequency == SF_Compute);
+  SET_SHADER_DEFINE(Input.Environment, RAYCALLABLESHADER, Target.Frequency == SF_RayCallable);
+  SET_SHADER_DEFINE(Input.Environment, RAYHITGROUPSHADER, Target.Frequency == SF_RayHitGroup);
+  SET_SHADER_DEFINE(Input.Environment, RAYGENSHADER,    Target.Frequency == SF_RayGen);
+  SET_SHADER_DEFINE(Input.Environment, RAYMISSSHADER,   Target.Frequency == SF_RayMiss);
+  SET_SHADER_DEFINE(Input.Environment, WORKGRAPHROOTSHADER, Target.Frequency == SF_WorkGraphRoot);
+  SET_SHADER_DEFINE(Input.Environment, WORKGRAPHCOMPUTESHADER, Target.Frequency == SF_WorkGraphComputeNode);
+
+  功能： 标识当前编译的是哪个 Shader Stage，用于在 .usf 文件中做条件编译
+
+  ---
+  2. Shading Path 宏（渲染路径）
+
+  文件位置： ShaderCompiler.cpp:3351-3392
+
+  SET_SHADER_DEFINE(Input.Environment, FORWARD_SHADING_FORCES_SKYLIGHT_CUBEMAPS_BLENDING,
+      ForwardShadingForcesSkyLightCubemapBlending(ShaderPlatform) ? 1 : 0);
+
+  // Forward/Deferred 判断
+  const bool bUsingMobileRenderer = FSceneInterface::GetShadingPath(GetMaxSupportedFeatureLevel(ShaderPlatform)) == EShadingPath::Mobile;
+
+  if (FSceneInterface::GetShadingPath(GetMaxSupportedFeatureLevel(ShaderPlatform)) == EShadingPath::Deferred) {
+      SET_SHADER_DEFINE(Input.Environment, SHADING_PATH_DEFERRED, 1);
+  }
+
+  if (bUsingMobileRenderer) {
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, SHADING_PATH_MOBILE, true);
+
+      const bool bMobileDeferredShading = IsMobileDeferredShadingEnabled((EShaderPlatform)Target.Platform);
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, MOBILE_DEFERRED_SHADING, bMobileDeferredShading);
+
+      const bool bAllowFramebufferFetch = MobileAllowFramebufferFetch((EShaderPlatform)Target.Platform);
+      SET_SHADER_DEFINE(Input.Environment, ALLOW_FRAMEBUFFER_FETCH, bAllowFramebufferFetch);
+
+      if (bMobileDeferredShading) {
+          const bool bGLESDeferredShading = (Target.Platform == SP_OPENGL_ES3_1_ANDROID && bAllowFramebufferFetch);
+          SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, USE_GLES_FBF_DEFERRED, bGLESDeferredShading);
+          SET_SHADER_DEFINE(Input.Environment, MOBILE_EXTENDED_GBUFFER, MobileUsesExtenedGBuffer((EShaderPlatform)Target.Platform) ? 1 : 0);
+          SET_SHADER_DEFINE(Input.Environment, MOBILE_SUPPORTS_SM5_MATERIAL_NODES, MobileSupportsSM5MaterialNodes((EShaderPlatform)Target.Platform) ? 1 : 0);
+      }
+      else {
+          // Mobile Forward
+          static const auto CVarEnableIESProfilesMobileForward = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.Mobile.Forward.EnableIESProfiles"));
+          const int32 IESProfilesEnabled = CVarEnableIESProfilesMobileForward ? CVarEnableIESProfilesMobileForward->GetValueOnAnyThread() : 0;
+          SET_SHADER_DEFINE(Input.Environment, USE_IES_PROFILE, IESProfilesEnabled);
+      }
+
+      SET_SHADER_DEFINE(Input.Environment, USE_SCENE_DEPTH_AUX, MobileRequiresSceneDepthAux(ShaderPlatform) ? 1 : 0);
+  }
+
+  功能： 区分 Deferred/Forward/Mobile 渲染路径，控制 GBuffer、FramebufferFetch 等功能
+
+  ---
+  3. 编译器配置宏
+
+  文件位置： ShaderCompiler.cpp:3394-3410
+
+  // 编译器版本: HLSL 2021
+  uint32 EnablesHLSL2021ByDefault = FDataDrivenShaderPlatformInfo::GetEnablesHLSL2021ByDefault(EShaderPlatform(Target.Platform));
+  bool bInlineRayTracing = Input.Environment.CompilerFlags.Contains(CFLAG_InlineRayTracing);
+  if((EnablesHLSL2021ByDefault == uint32(1) && DebugGroupName == TEXT("Global")) ||
+      EnablesHLSL2021ByDefault == uint32(2) ||
+      Target.Frequency == SF_RayGen ||
+      Target.Frequency == SF_RayHitGroup ||
+      bInlineRayTracing)
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_HLSL2021);
+  }
+
+  // 编译器定义
+  SET_SHADER_DEFINE(Input.Environment, COMPILER_DEFINE, TEXT("#define"));  // #define 不被预处理剥离
+
+  // 调试模式
+  {
+      const bool bForceOptimization = Input.Environment.CompilerFlags.Contains(CFLAG_ForceOptimization);
+
+      if (!bForceOptimization && !ShouldOptimizeShaders(ShaderFormatName))
+      {
+          Input.Environment.CompilerFlags.Add(CFLAG_Debug);  // 非优化编译
+      }
+  }
+
+  功能： 启用 HLSL 2021、控制编译器优化级别
+
+  ---
+  4. VR/Stereo 宏
+
+  文件位置： ShaderCompiler.cpp:3415-3470
+
+  // 判断是否需要 Instanced Stereo 修改
+  static bool ShaderFrequencyNeedsInstancedStereoMods(const FShaderType* ShaderType)
+  {
+      return !(IsRayTracingShaderFrequency(ShaderType->GetFrequency()));
+  }
+
+  if (ShaderFrequencyNeedsInstancedStereoMods(ShaderType))
+  {
+      const UE::StereoRenderUtils::FStereoShaderAspects Aspects(ShaderPlatform);
+
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, INSTANCED_STEREO, Aspects.IsInstancedStereoEnabled());
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, MULTI_VIEW, Aspects.IsInstancedMultiViewportEnabled());
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, MOBILE_MULTI_VIEW, Aspects.IsMobileMultiViewEnabled());
+
+      // 平台不支持 ISR 但启用了时，输出警告
+      static const auto CVarInstancedStereo = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("vr.InstancedStereo"));
+      const bool bIsInstancedStereoEnabledInSettings = CVarInstancedStereo ? (CVarInstancedStereo->GetValueOnAnyThread() != 0) : false;
+      // ... 警告逻辑
+  }
+  else
+  {
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, INSTANCED_STEREO, false);
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, MULTI_VIEW, 0);
+      SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, MOBILE_MULTI_VIEW, false);
+  }
+
+  功能： VR/立体渲染支持（Instanced Stereo、Multi-View、Mobile Multi-View）
+
+  ---
+  5. Mobile 平台特定宏
+
+  文件位置： ShaderCompiler.cpp:3475-3515
+
+  // Mobile Deferred Shading
+  static FShaderPlatformCachedIniValue<bool> EnableCullBeforeFetchIniValue(TEXT("r.CullBeforeFetch"));
+  if (EnableCullBeforeFetchIniValue.Get((EShaderPlatform)Target.Platform) == 1)
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_CullBeforeFetch);
+  }
+
+  static FShaderPlatformCachedIniValue<bool> EnableWarpCullingIniValue(TEXT("r.WarpCulling"));
+  if (EnableWarpCullingIniValue.Get((EShaderPlatform)Target.Platform) == 1)
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_WarpCulling);
+  }
+
+  // Android SPIR-V 反射
+  if (ShaderPlatform == SP_VULKAN_ES3_1_ANDROID || ShaderPlatform == SP_VULKAN_SM5_ANDROID)
+  {
+      bool bIsStripReflect = true;
+      GConfig->GetBool(TEXT("/Script/AndroidRuntimeSettings.AndroidRuntimeSettings"), TEXT("bStripShaderReflection"), bIsStripReflect, GEngineIni);
+      if (!bIsStripReflect)
+      {
+          Input.Environment.SetCompileArgument(TEXT("STRIP_REFLECT_ANDROID"), false);
+      }
+  }
+
+  功能： Mobile 平台的优化（Early Z Culling、Warp Culling、Android SPIR-V 反射剥离）
+
+  ---
+  6. 材质特性宏
+
+  文件位置： ShaderCompiler.cpp:3520-3585
+
+  // 光源类型
+  if (RenderRectLightsAsSpotLights(GetMaxSupportedFeatureLevel(ShaderPlatform)))
+  {
+      SET_SHADER_DEFINE(Input.Environment, RECT_LIGHT_AS_SPOTLIGHT, 1);
+  }
+
+  // 调试/验证
+  static FShaderPlatformCachedIniValue<bool> ForceSpirvDebugInfoCVar(TEXT("r.ShaderCompiler.ForceSpirvDebugInfo"));
+  if (ForceSpirvDebugInfoCVar.Get((EShaderPlatform)Target.Platform))
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_ForceSpirvDebugInfo);
+  }
+
+  // Tile Offset 数据
+  static const auto CVarViewHasTileOffsetData = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.ViewHasTileOffsetData"));
+  const bool bViewHasTileOffsetData = CVarViewHasTileOffsetData->GetValueOnAnyThread() != 0;
+  SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, VIEW_HAS_TILEOFFSET_DATA, bViewHasTileOffsetData);
+
+  static const auto CVarPrimitiveHasTileOffsetData = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.PrimitiveHasTileOffsetData"));
+  const bool bPrimitiveHasTileOffsetData = CVarPrimitiveHasTileOffsetData->GetValueOnAnyThread() != 0;
+  SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, PRIMITIVE_HAS_TILEOFFSET_DATA, bPrimitiveHasTileOffsetData);
+
+  // 允许开发模式编译
+  if (bAllowDevelopmentShaderCompile)
+  {
+      static const auto CVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.CompileShadersForDevelopment"));
+      SET_SHADER_DEFINE(Input.Environment, COMPILE_SHADERS_FOR_DEVELOPMENT, CVar ? (CVar->GetValueOnAnyThread() != 0) : 0);
+  }
+
+  // 静态光照
+  SET_SHADER_DEFINE(Input.Environment, ALLOW_STATIC_LIGHTING, IsStaticLightingAllowed() ? 1 : 0);
+
+  // GBuffer 配置
+  bool bUsingBasePassVelocity = IsUsingBasePassVelocity((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE(Input.Environment, USES_BASE_PASS_VELOCITY, bUsingBasePassVelocity ? 1 : 0);
+
+  bool bGBufferHasVelocity = bUsingBasePassVelocity;
+  if (!bGBufferHasVelocity)
+  {
+      const EGBufferLayout Layout = FShaderCompileUtilities::FetchGBufferLayout(Input.Environment);
+      bGBufferHasVelocity |= (Layout == GBL_ForceVelocity);
+  }
+  SET_SHADER_DEFINE(Input.Environment, GBUFFER_HAS_VELOCITY, bGBufferHasVelocity ? 1 : 0);
+
+  SET_SHADER_DEFINE(Input.Environment, GBUFFER_HAS_DIFFUSE_SAMPLE_OCCLUSION, CVar ? (CVar->GetValueOnAnyThread() != 0) : 1);
+
+  SET_SHADER_DEFINE(Input.Environment, SELECTIVE_BASEPASS_OUTPUTS, IsUsingSelectiveBasePassOutputs((EShaderPlatform)Target.Platform) ? 1 : 0);
+
+  SET_SHADER_DEFINE(Input.Environment, USE_DBUFFER, IsUsingDBuffers((EShaderPlatform)Target.Platform) ? 1 : 0);
+
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_ALLOW_GLOBAL_CLIP_PLANE, CVar ? (CVar->GetInt() != 0) : 0);
+
+  // 平台能力
+  const bool bSupportsClipDistance = FDataDrivenShaderPlatformInfo::GetSupportsClipDistance((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_CLIP_DISTANCE, bSupportsClipDistance ? 1u : 0u);
+
+  const bool bSupportsVertexShaderSRVs = FDataDrivenShaderPlatformInfo::GetSupportsVertexShaderSRVs((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_VERTEX_SHADER_SRVS, bSupportsVertexShaderSRVs ? 1u : 0u);
+
+  const bool bSupportsVertexShaderUAVs = FDataDrivenShaderPlatformInfo::GetSupportsVertexShaderUAVs((EShaderPlatform)Target.Platform) != ERHIFeatureSupport::Unsupported;
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_VERTEX_SHADER_UAVS, bSupportsVertexShaderUAVs ? 1u : 0u);
+
+  const uint32 MaxSamplers = FDataDrivenShaderPlatformInfo::GetMaxSamplers((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE_AND_COMPILE_ARGUMENT(Input.Environment, PLATFORM_MAX_SAMPLERS, MaxSamplers);
+
+  const bool bSupportsIndependentSamplers = FDataDrivenShaderPlatformInfo::GetSupportsIndependentSamplers((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE(Input.Environment, SUPPORTS_INDEPENDENT_SAMPLERS, bSupportsIndependentSamplers ? 1 : 0);
+
+  功能： 光源类型、GBuffer 配置、平台能力（Clip Distance、Vertex SRV/UAV、Sampler 数量）
+
+  ---
+  7. Forward Shading 和平台特性
+
+  文件位置： ShaderCompiler.cpp:3590-3640
+
+  bool bForwardShading = false;
+  {
+      if (bIsMobilePlatform)
+      {
+          bForwardShading = !IsMobileDeferredShadingEnabled((EShaderPlatform)Target.Platform);
+      }
+      else if (TargetPlatform)
+      {
+          bForwardShading = TargetPlatform->UsesForwardShading();
+      }
+      else
+      {
+          static IConsoleVariable* CVarForwardShading = IConsoleManager::Get().FindConsoleVariable(TEXT("r.ForwardShading"));
+          bForwardShading = CVarForwardShading ? (CVarForwardShading->GetInt() != 0) : false;
+      }
+      SET_SHADER_DEFINE(Input.Environment, FORWARD_SHADING, bForwardShading);
+  }
+
+  // Velocity Pass 配置
+  if (VelocityEncodeDepth((EShaderPlatform)Target.Platform))
+  {
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_ENCODE_DEPTH, 1);
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_SUPPORT_TEMPORAL_RESPONSIVENESS, VelocitySupportsTemporalResponsiveness((EShaderPlatform)Target.Platform) ? 1 : 0);
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_SUPPORT_PS_MOTION_VECTOR_WORLD_OFFSET, VelocitySupportsPixelShaderMotionVectorWorldOffset((EShaderPlatform)Target.Platform) ? 1 : 0);
+  }
+  else
+  {
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_ENCODE_DEPTH, 0);
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_SUPPORT_TEMPORAL_RESPONSIVENESS, 0);
+      SET_SHADER_DEFINE(Input.Environment, VELOCITY_SUPPORT_PS_MOTION_VECTOR_WORLD_OFFSET, 0);
+  }
+
+  if (MaskedInEarlyPass((EShaderPlatform)Target.Platform))
+  {
+      SET_SHADER_DEFINE(Input.Environment, EARLY_Z_PASS_ONLY_MATERIAL_MASKING, 1);
+  }
+  else
+  {
+      SET_SHADER_DEFINE(Input.Environment, EARLY_Z_PASS_ONLY_MATERIAL_MASKING, 0);
+  }
+
+  功能： Forward Shading 识别、Velocity Pass 编码、Early Z Masking
+
+  ---
+  8. 场景特性宏（Fog、LocalFog、SkyAtmosphere 等）
+
+  文件位置： ShaderCompiler.cpp:3645-3730
+
+  // Vertex Fogging
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VertexFoggingForOpaque"));
+  bool bVertexFoggingForOpaque = false;
+  if (bForwardShading)
+  {
+      bVertexFoggingForOpaque = CVar ? (CVar->GetInt() != 0) : 0;
+      if (TargetPlatform)
+      {
+          const int32 PlatformHeightFogMode = TargetPlatform->GetHeightFogModeForOpaque();
+          if (PlatformHeightFogMode == 1)
+          {
+              bVertexFoggingForOpaque = false;
+          }
+          else if (PlatformHeightFogMode == 2)
+          {
+              bVertexFoggingForOpaque = true;
+          }
+      }
+  }
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_VERTEX_FOGGING_FOR_OPAQUE, bVertexFoggingForOpaque);
+
+  // Mobile Fog
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Mobile.DisableVertexFog"));
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_MOBILE_DISABLE_VERTEX_FOG, CVar ? (CVar->GetInt() != 0) : 0);
+
+  // Local Fog Volume
+  bool bSupportLocalFogVolumes = false;
+  {
+      static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportLocalFogVolumes"));
+      bSupportLocalFogVolumes = CVar && CVar->GetInt() > 0;
+      SET_SHADER_DEFINE(Input.Environment, PROJECT_SUPPORTS_LOCALFOGVOLUME, (bSupportLocalFogVolumes ? 1 : 0));
+  }
+
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.LocalFogVolume.ApplyOnTranslucent"));
+  const bool bLocalFogVolumesApplyOnTranclucent = CVar && CVar->GetInt() > 0;
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_LOCALFOGVOLUME_APPLYONTRANSLUCENT, ((bSupportLocalFogVolumes && bLocalFogVolumesApplyOnTranclucent) ? 1 : 0));
+
+  // Sky Atmosphere
+  bool bSupportSkyAtmosphere = false;
+  {
+      static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportSkyAtmosphere"));
+      bSupportSkyAtmosphere = CVar && CVar->GetInt() != 0;
+      SET_SHADER_DEFINE(Input.Environment, PROJECT_SUPPORT_SKY_ATMOSPHERE, bSupportSkyAtmosphere ? 1 : 0);
+  }
+
+  // Cloud Shadow
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportSkyAtmosphereAffectsHeightFog"));
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_SUPPORT_SKY_ATMOSPHERE_AFFECTS_HEIGHFOG, (CVar && bSupportSkyAtmosphere) ? (CVar->GetInt() != 0) : 0);
+
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_EXPFOG_MATCHES_VFOG, DoesProjectSupportExpFogMatchesVolumetricFog() ? 1 : 0);
+
+  // Translucent 相关
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Deferred.SupportPrimitiveAlphaHoldout"));
+  const bool bDeferredSupportPrimitiveAlphaHoldout = CVar->GetBool();
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_PRIMITIVE_ALPHA_HOLDOUT, bDeferredSupportPrimitiveAlphaHoldout ? 1 : 0);
+
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportCloudShadowOnForwardLitTranslucent"));
+  const bool bSupportCloudShadowOnForwardLitTranslucent = CVar && CVar->GetInt() > 0;
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_CLOUD_SHADOW_ON_FORWARD_LIT_TRANSLUCENT, bSupportCloudShadowOnForwardLitTranslucent ? 1 : 0);
+
+  static IConsoleVariable *CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Water.SingleLayerWater.SupportCloudShadow"));
+  const bool bSupportCloudShadowOnSingleLayerWater = CVar && CVar->GetInt() > 0;
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_CLOUD_SHADOW_ON_SINGLE_LAYER_WATER, bSupportCloudShadowOnSingleLayerWater ? 1 : 0);
+
+  // Translucent Light 相关
+  const bool bTranslucentUsesLightRectLights = GetTranslucentUsesLightRectLights();
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_RECTLIGHT_ON_FORWARD_LIT_TRANSLUCENT, bTranslucentUsesLightRectLights ? 1 : 0);
+
+  const bool bTranslucentUsesShadowedLocalLights = GetTranslucentUsesShadowedLocalLights();
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_SHADOWED_LOCAL_LIGHT_ON_FORWARD_LIT_TRANSLUCENT, bTranslucentUsesShadowedLocalLights ? 1 : 0);
+
+  const bool bTranslucentUsesLightIESProfiles = GetTranslucentUsesLightIESProfiles();
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_IESPROFILE_ON_FORWARD_LIT_TRANSLUCENT, bTranslucentUsesLightIESProfiles ? 1 : 0);
+
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Shadow.Virtual.TranslucentQuality"));
+  const bool bHighQualityShadow = CVar && CVar->GetInt() > 0;
+  SET_SHADER_DEFINE(Input.Environment, SUPPORT_VSM_FOWARD_QUALITY, bHighQualityShadow ? 1 : 0);
+
+  // Hair Strands
+  const bool bUseTriangleStrips = GetHairStrandsUsesTriangleStrips();
+  SET_SHADER_DEFINE(Input.Environment, USE_HAIR_TRIANGLE_STRIP, bUseTriangleStrips ? 1 : 0);
+
+  // First Person GBuffer
+  const bool bHasFirstPersonGBufferBit = HasFirstPersonGBufferBit(Target.GetPlatform());
+  SET_SHADER_DEFINE(Input.Environment, HAS_FIRST_PERSON_GBUFFER_BIT, bHasFirstPersonGBufferBit ? 1 : 0);
+
+  功能： 场景效果配置（Fog、SkyAtmosphere、CloudShadow、Translucent Lighting、HairStrands、First Person）
+
+  ---
+  9. Substrate 材质系统宏
+
+  文件位置： ShaderCompiler.cpp:3735-3870
+
+  const bool bSubstrate = Substrate::IsSubstrateEnabled() && IsSubstrateSupportForShaderPipeline(Input);
+  {
+      SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_ENABLED, bSubstrate ? 1 : 0);
+
+      // GBuffer 格式
+      SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_GBUFFER_FORMAT, bSubstrate && !Substrate::IsSubstrateBlendableGBufferEnabled(Target.GetPlatform()) ? 1 : 0);
+
+      if (bSubstrate)
+      {
+          // Shading Quality
+          const uint32 SubstrateShadingQuality = FMath::Clamp(Substrate::GetShadingQuality(Target.GetPlatform()), 0u, 1u);
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_SHADING_QUALITY, SubstrateShadingQuality);
+
+          const bool bLowQuality = SubstrateShadingQuality == 0;
+          SET_SHADER_DEFINE(Input.Environment, USE_ACHROMATIC_BXDF_ENERGY, bLowQuality ? 1u : 0u);
+
+          // Sheen Quality
+          const uint32 SubstrateSheenQuality = FMath::Clamp(Substrate::GetSheenQuality(Target.GetPlatform()), 0u, 1u);
+          Input.Environment.SetDefine(TEXT("SUBSTRATE_SHEEN_QUALITY"), bLowQuality ? 0 : SubstrateSheenQuality);
+
+          // Normal Quality
+          const uint32 SubstrateNormalQuality = Substrate::GetNormalQuality();
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_NORMAL_QUALITY, SubstrateNormalQuality);
+          if (SubstrateNormalQuality == 0)
+          {
+              SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_TOP_LAYER_TYPE, TEXT("uint"));
+          }
+          else
+          {
+              SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_TOP_LAYER_TYPE, TEXT("uint2"));
+          }
+
+          // Material 层配置
+          const uint32 SubstrateUintPerPixel = Substrate::GetBytePerPixel(Target.GetPlatform()) / 4u;
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_MATERIAL_NUM_UINTS, SubstrateUintPerPixel);
+
+          const uint32 SubstrateClosurePerPixel = Substrate::GetClosurePerPixel(Target.GetPlatform());
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_MATERIAL_CLOSURE_COUNT, SubstrateClosurePerPixel);
+
+          // DBuffer Pass
+          const bool bSubstrateDBufferPass = Substrate::IsDBufferPassEnabled(Target.GetPlatform());
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_USE_DBUFFER_PASS, bSubstrateDBufferPass ? 1 : 0);
+
+          // Glints
+          const bool bSubstrateGlints = Substrate::IsGlintEnabled(Target.GetPlatform());
+          SET_SHADER_DEFINE(Input.Environment, PLATFORM_ENABLES_SUBSTRATE_GLINTS, bSubstrateGlints ? 1 : 0);
+
+          // Specular Profile
+          const bool bSpecularProfileEnabled = Substrate::IsSpecularProfileEnabled(Target.GetPlatform());
+          SET_SHADER_DEFINE(Input.Environment, PLATFORM_ENABLES_SUBSTRATE_SPECULAR_PROFILE, bSpecularProfileEnabled ? 1 : 0);
+      }
+      else
+      {
+          // 非substrate 也需要定义
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_TOP_LAYER_TYPE, TEXT("uint"));
+          SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_MATERIAL_CLOSURE_COUNT, 0);
+      }
+
+      // Rough Refraction
+      const bool bSubstrateOpaqueRoughRefrac = bSubstrate && Substrate::IsOpaqueRoughRefractionEnabled(Target.GetPlatform());
+      SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_OPAQUE_ROUGH_REFRACTION_ENABLED, bSubstrateOpaqueRoughRefrac ? 1 : 0);
+
+      // Advanced Debug
+      const bool bSubstrateAdvDebug = bSubstrate && Substrate::IsAdvancedVisualizationEnabled(Target.GetPlatform());
+      SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_ADVANCED_DEBUG_ENABLED, bSubstrateAdvDebug ? 1 : 0);
+
+      // Stochastic Lighting
+      const bool IsStochasticLightingEnabled = bSubstrate && Substrate::IsStochasticLightingEnabled(Target.GetPlatform());
+      SET_SHADER_DEFINE(Input.Environment, SUBSTRATE_STOCHASTIC_LIGHTING_ENABLED, IsStochasticLightingEnabled ? 1 : 0);
+  }
+
+  // Rough Diffuse
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Material.RoughDiffuse"));
+  const bool bMaterialRoughDiffuse = CVar && CVar->GetInt() != 0;
+  const bool bSubstrateRoughDiffuse = Substrate::IsRoughDiffuseEnabled(Target.GetPlatform());
+  SET_SHADER_DEFINE(Input.Environment, MATERIAL_ROUGHDIFFUSE, (bSubstrate ? bSubstrateRoughDiffuse : bMaterialRoughDiffuse) ? 1 : 0);
+
+  功能： Substrate 高级材质系统配置（Shading Quality、Sheen、Normal、GBuffer、Glints、Stochastic Lighting）
+
+  ---
+  10. Lumen 和渲染特性宏
+
+  文件位置： ShaderCompiler.cpp:3875-3910
+
+  // Lumen 支持
+  const bool bLumenSupported = DoesProjectSupportLumenGI((EShaderPlatform)Target.Platform);
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_SUPPORTS_LUMEN, bLumenSupported ? 1 : 0);
+
+  // OIT (Order Independent Transparency)
+  const bool bSupportOIT = FDataDrivenShaderPlatformInfo::GetSupportsOIT(EShaderPlatform(Target.Platform));
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.OIT.SortedPixels"));
+  const bool bOIT = CVar && CVar->GetInt() != 0;
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_OIT, (bSupportOIT && bOIT) ? 1 : 0);
+
+  // Energy Conservation
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Material.EnergyConservation"));
+  const bool bMaterialEnergyConservation = CVar && CVar->GetInt() != 0;
+  SET_SHADER_DEFINE(Input.Environment, LEGACY_MATERIAL_ENERGYCONSERVATION, bMaterialEnergyConservation ? 1 : 0);
+
+  // Sky Atmosphere Affects Height Fog
+  static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.SupportSkyAtmosphereAffectsHeightFog"));
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_SUPPORT_SKY_ATMOSPHERE_AFFECTS_HEIGHFOG, (CVar && bSupportSkyAtmosphere) ? (CVar->GetInt() != 0) : 0);
+
+  // ExpFog 匹配 Volumetric Fog
+  SET_SHADER_DEFINE(Input.Environment, PROJECT_EXPFOG_MATCHES_VFOG, DoesProjectSupportExpFogMatchesVolumetricFog() ? 1 : 0);
+
+  功能： Lumen GI、OIT、能量守恒、高度雾相关
+
+  ---
+  11. 平台能力宏（高级）
+
+  文件位置： ShaderCompiler.cpp:3915-3975
+
+  // Normalmap 编码
+  if (TargetPlatform && TargetPlatform->SupportsFeature(ETargetPlatformFeatures::NormalmapLAEncodingMode))
+  {
+      SET_SHADER_DEFINE(Input.Environment, LA_NORMALMAPS, 1);
+  }
+
+  // Light Function Atlas
+  SET_SHADER_DEFINE(Input.Environment, COLORED_LIGHT_FUNCTION_ATLAS, GetLightFunctionAtlasFormat() > 0 ? 1 : 0);
+
+  // Geometry Shader 替代
+  SET_SHADER_DEFINE(Input.Environment, USING_VERTEX_SHADER_LAYER, !RHISupportsGeometryShaders(EShaderPlatform(Target.Platform)) && RHISupportsVertexShaderLayer(EShaderPlatform(Target.Platform)) ? 1 : 0);
+
+  // 高级平台能力
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_SHADER_ROOT_CONSTANTS, RHISupportsShaderRootConstants(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_SHADER_BUNDLE_DISPATCH, RHISupportsShaderBundleDispatch(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_RENDERTARGET_WRITE_MASK, RHISupportsRenderTargetWriteMask(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_PER_PIXEL_DBUFFER_MASK, FDataDrivenShaderPlatformInfo::GetSupportsPerPixelDBufferMask(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_DISTANCE_FIELDS, DoesPlatformSupportDistanceFields(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_MESH_SHADERS_TIER0, RHISupportsMeshShadersTier0(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_MESH_SHADERS_TIER1, RHISupportsMeshShadersTier1(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_ALLOW_SCENE_DATA_COMPRESSED_TRANSFORMS, FDataDrivenShaderPlatformInfo::GetSupportSceneDataCompressedTransforms(EShaderPlatform(Target.Platform)) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_BUFFER_LOAD_TYPE_CONVERSION, RHISupportsBufferLoadTypeConversion(ShaderPlatform) ? 1 : 0);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_UNIFORM_BUFFER_OBJECTS, FDataDrivenShaderPlatformInfo::GetSupportsUniformBufferObjects(EShaderPlatform(Target.Platform)) ? 1 : 0);
+
+  // 编译器能力
+  SET_SHADER_DEFINE(Input.Environment, COMPILER_SUPPORTS_BARYCENTRIC_INTRINSICS, FDataDrivenShaderPlatformInfo::GetSupportsBarycentricsIntrinsics(EShaderPlatform(Target.Platform)));
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_BARYCENTRICS_SEMANTIC, FDataDrivenShaderPlatformInfo::GetSupportsBarycentricsSemantic(EShaderPlatform(Target.Platform)) != ERHIFeatureSupport::Unsupported);
+  SET_SHADER_DEFINE(Input.Environment, PLATFORM_SUPPORTS_BINDLESS, FDataDrivenShaderPlatformInfo::GetSupportsBindless(ShaderPlatform));
+
+  // Bindless
+  SET_SHADER_DEFINE(Input.Environment, UE_BINDLESS_ENABLED, Input.bBindlessEnabled);
+
+  // Shader Binding Layout
+  if (Input.Environment.ShaderBindingLayout)
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_ShaderBindingLayout);
+  }
+
+  功能： Normalmap 编码、Mesh Shaders、Distance Fields、Barycentric、Bindless、Root Constants
+
+  ---
+  12. 编译器 Flags（控制编译行为）
+
+  文件位置： ShaderCompiler.cpp:3980-4030
+
+  // Dead Code 移除
+  if (CVarShadersRemoveDeadCode.GetValueOnAnyThread())
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_RemoveDeadCode);
+  }
+
+  // 源代码剥离
+  if (CVarDisableSourceStripping.GetValueOnAnyThread())
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_DisableSourceStripping);
+  }
+
+  // VT (Virtual Texture) 配置
+  {
+      static const auto CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VT.AnisotropicFiltering"));
+      SET_SHADER_DEFINE(Input.Environment, VIRTUAL_TEXTURE_ANISOTROPIC_FILTERING, CVar ? (CVar->GetInt() != 0) : 0);
+
+      if (bIsMobilePlatform)
+      {
+          static FShaderPlatformCachedIniValue<bool> CVarVTMobileManualTrilinearFiltering(TEXT("r.VT.Mobile.ManualTrilinearFiltering"));
+          SET_SHADER_DEFINE(Input.Environment, VIRTUAL_TEXTURE_MANUAL_TRILINEAR_FILTERING, (CVarVTMobileManualTrilinearFiltering.Get(Target.GetPlatform()) ? 1 : 0));
+      }
+  }
+
+  // Mobile Movable Spotlight Shadows
+  if (bIsMobilePlatform)
+  {
+      const bool bMobileMovableSpotlightShadowsEnabled = IsMobileMovableSpotlightShadowsEnabled(Target.GetPlatform());
+      SET_SHADER_DEFINE(Input.Environment, PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHT_SHADOWS, bMobileMovableSpotlightShadowsEnabled ? 1 : 0);
+  }
+
+  功能： Dead Code 移除、源代码剥离、Virtual Texture 配置
+
+  ---
+  13. 颜色空间和工作区宏
+
+  文件位置： ShaderCompiler.cpp:4035-4110
+
+  // 工作颜色空间
+  using namespace UE::Color;
+  const bool bWorkingColorSpaceIsSRGB = FColorSpace::GetWorking().IsSRGB();
+  SET_SHADER_DEFINE(Input.Environment, WORKING_COLOR_SPACE_IS_SRGB, bWorkingColorSpaceIsSRGB ? 1 : 0);
+
+  // 如果不是 SRGB，定义颜色空间转换矩阵
+  if (!bWorkingColorSpaceIsSRGB)
+  {
+      static constexpr TCHAR MatrixFormat[] = TEXT("float3x3(%0.10f, %0.10f, %0.10f, %0.10f, %0.10f, %0.10f, %0.10f, %0.10f, %0.10f)");
+      const FColorSpace& WorkingColorSpace = FColorSpace::GetWorking();
+
+      // RGB → XYZ 转换矩阵
+      const FMatrix44d& ToXYZ = WorkingColorSpace.GetRgbToXYZ();
+      Input.Environment.SetDefine(
+          TEXT("WORKING_COLOR_SPACE_RGB_TO_XYZ_MAT"),
+          FString::Printf(MatrixFormat,
+              ToXYZ.M[0][0], ToXYZ.M[1][0], ToXYZ.M[2][0],
+              ToXYZ.M[0][1], ToXYZ.M[1][1], ToXYZ.M[2][1],
+              ToXYZ.M[0][2], ToXYZ.M[1][2], ToXYZ.M[2][2]));
+
+      // XYZ → RGB 转换矩阵
+      const FMatrix44d& FromXYZ = WorkingColorSpace.GetXYZToRgb();
+      Input.Environment.SetDefine(
+          TEXT("XYZ_TO_RGB_WORKING_COLOR_SPACE_MAT"),
+          FString::Printf(MatrixFormat,
+              FromXYZ.M[0][0], FromXYZ.M[1][0], FromXYZ.M[2][0],
+              FromXYZ.M[0][1], FromXYZ.M[1][1], FromXYZ.M[2][1],
+              FromXYZ.M[0][2], FromXYZ.M[1][2], FromXYZ.M[2][2]));
+
+      // SRGB → 工作颜色空间转换矩阵
+      const FColorSpaceTransform& FromSRGB = FColorSpaceTransform::GetSRGBToWorkingColorSpace();
+      SET_SHADER_DEFINE(Input.Environment,
+          SRGB_TO_WORKING_COLOR_SPACE_MAT,
+          FString::Printf(MatrixFormat,
+              FromSRGB.M[0][0], FromSRGB.M[1][0], FromSRGB.M[2][0],
+              FromSRGB.M[0][1], FromSRGB.M[1][1], FromSRGB.M[2][1],
+              FromSRGB.M[0][2], FromSRGB.M[1][2], FromSRGB.M[2][2]));
+  }
+
+  // 旧版 Luminance 系数
+  static const auto CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.LegacyLuminanceFactors"));
+  const bool bUseLegacyLuminance = CVar && CVar->GetInt() != 0;
+  SET_SHADER_DEFINE(Input.Environment, UE_LEGACY_LUMINANCE_FACTORS, bUseLegacyLuminance ? 1 : 0);
+
+  功能： 工作颜色空间（SRGB/线性）及颜色空间转换矩阵、Luminance 系数
+
+  ---
+  14. Large World 渲染宏
+
+  文件位置： ShaderCompiler.cpp:4115-4125
+
+  // Large World Coordinate (LWC) 系统
+  const double TileSize = FLargeWorldRenderScalar::GetTileSize();
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE, (float)TileSize);
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE_SQRT, (float)FMath::Sqrt(TileSize));
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE_RSQRT, (float)FMath::InvSqrt(TileSize));
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE_RCP, (float)(1.0 / TileSize));
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE_FMOD_PI, (float)FMath::Fmod(TileSize, UE_DOUBLE_PI));
+  SET_SHADER_DEFINE(Input.Environment, UE_LWC_RENDER_TILE_SIZE_FMOD_2PI, (float)FMath::Fmod(TileSize, 2.0 * UE_DOUBLE_PI));
+
+  功能： Large World Coordinate 系统的 Tile 大小常量
+
+  ---
+  15. Nanite Foliage 宏
+
+  文件位置： ShaderCompiler.cpp:4130-4140
+
+  // Nanite 相关
+  {
+      const bool bNanitePlatform = DoesRuntimeSupportNanite(ShaderPlatform, false, true);
+      SET_SHADER_DEFINE(Input.Environment, NANITE_ASSEMBLY_DATA, bNanitePlatform && NaniteAssembliesSupported());
+      SET_SHADER_DEFINE(Input.Environment, NANITE_VOXEL_DATA, bNanitePlatform && NaniteVoxelsSupported());
+  }
+
+  功能： Nanite 系统的 Assembly 和 Voxel 数据支持
+
+  ---
+  16. 编译器 DXC 宏
+
+  文件位置： ShaderCompiler.cpp:3700-3715
+
+  // 添加编译器 flag CFLAG_ForceDXC 如果 DXC 启用
+  const bool bHlslVersion2021 = Input.Environment.CompilerFlags.Contains(CFLAG_HLSL2021);
+  const bool bIsDxcEnabled = IsDxcEnabledForPlatform((EShaderPlatform)Target.Platform, bHlslVersion2021);
+  SET_SHADER_DEFINE(Input.Environment, COMPILER_DXC, bIsDxcEnabled);
+  if (bIsDxcEnabled)
+  {
+      Input.Environment.CompilerFlags.Add(CFLAG_ForceDXC);
+  }
+
+  功能： 启用 DXC (DirectX Shader Compiler) 替代 FXC
+
+  ---
+  17. 总结表格
+
+  ┌──────────────────┬────────┬────────────────────────────────────────────┐
+  │       分类       │ 宏数量 │                  主要用途                  │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Shader Frequency │ 11     │ 识别当前编译的 Shader Stage                │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Shading Path     │ 12     │ 区分 Forward/Deferred/Mobile 渲染          │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 编译器配置       │ 5      │ HLSL 版本、优化级别                        │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ VR/Stereo        │ 6      │ Instanced Stereo、Multi-View               │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Mobile 平台      │ 5      │ Early Z、Warp Culling、SPIR-V              │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 材质特性         │ 16     │ GBuffer、Velocity、Clip Distance 等        │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Forward Shading  │ 7      │ Forward 识别、Velocity 编码                │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 场景特性         │ 19     │ Fog、SkyAtmosphere、Cloud、Translucent 等  │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Substrate        │ 15     │ 高级材质系统配置                           │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Lumen/渲染       │ 6      │ Lumen、OIT、能量守恒                       │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 平台能力         │ 13     │ Mesh Shaders、Distance Fields、Bindless 等 │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 编译器 Flags     │ 6      │ Dead Code、Source Stripping、VT            │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 颜色空间         │ 8      │ 工作颜色空间、转换矩阵                     │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Large World      │ 6      │ LWC Tile 常量                              │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ Nanite           │ 2      │ Nanite Assembly/Voxel                      │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ DXC              │ 2      │ DXC 启用                                   │
+  ├──────────────────┼────────┼────────────────────────────────────────────┤
+  │ 总计             │ ~139   │ 覆盖所有平台/功能组合                      │
+  └──────────────────┴────────┴────────────────────────────────────────────┘
+
+  ---
+  这就是 GlobalBeginCompileShader 函数组装的所有宏定义完整清单。设计理念是在 C++ 端做出所有平台/功能判断，摊平成 HLSL 宏，使得 .usf 文件可以用简单的 #ifdef 处理多平台代码，而无需在 HLSL 中进行复杂的运行时判断。
