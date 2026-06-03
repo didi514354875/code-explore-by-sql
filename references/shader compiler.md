@@ -537,8 +537,7 @@
 
 
 
-   ---
-  Unreal Shader 编译完整链路图谱
+    Unreal Shader 编译完整链路图谱
 
   1. 整体架构概览
 
@@ -754,4 +753,166 @@
           ▼                                  ▼                                  ▼
   ┌───────────────────────┐    ┌───────────────────────┐    ┌───────────────────────┐
   │  基础信息填充        │    │  平台特性宏定义      │    │  编译器 Flags         │
-  │  (L
+  │  (L3175-L3220)       │    │  (L3335-L4140)        │    │  (L3540-L3630)        │
+  ├───────────────────────┤    ├───────────────────────┤    ├───────────────────────┤
+  │ Input.Target         │    │ PIXELSHADER           │    │ CFLAG_Debug           │
+  │ Input.ShaderFormat   │    │ VERTEXSHADER          │    │ CFLAG_ForceOptimization│
+  │ Input.SourceFilename │    │ COMPUTESHADER         │    │ CFLAG_HLSL2021        │
+  │ Input.EntryPointName │    │ MESHSHADER            │    │ CFLAG_ForceDXC        │
+  │ Input.DebugGroupName  │    │ GEOMETRYSHADER        │    │ CFLAG_WarningsAsErrors│
+  │ Input.ShaderName     │    │ RAYxxxSHADER          │    │ CFLAG_RemoveDeadCode   │
+  │ Input.RootParameters │    │ COMPILER_DXC          │    │ CFLAG_DisableSourceStr│
+  │ Input.bBindlessEnabled│   │ COMPILER_SUPPORTS_HLSL│    │ CFLAG_SkipValidation   │
+  └───────────────────────┘    │ 2021                  │    │ CFLAG_GenerateSymbols  │
+                                │ PLATFORM_MAX_SAMPLERS │    │ CFLAG_Archive(Metal)  │
+                                │ PLATFORM_SUPPORTS_xxx │    └───────────────────────┘
+                                │ FORWARD_SHADING       │
+                                │ INSTANCED_STEREO      │
+                                │ SUBSTRATE_ENABLED     │
+                                │ PROJECT_SUPPORTS_LUMEN│
+                                │ VELOCITY_ENCODE_DEPTH │
+                                └───────────────────────┘
+                                             │
+          ┌──────────────────────────────────┼──────────────────────────────────┐
+          │                                  │                                  │
+          ▼                                  ▼                                  ▼
+  ┌───────────────────────┐    ┌───────────────────────┐    ┌───────────────────────┐
+  │  Uniform Buffer      │    │  Platform-Specific    │    │  色彩空间/Other      │
+  │  Include 处理        │    │  配置                │    │  配置                │
+  │  (L3470-L3490)       │    │  (L3350-L3690)        │    │  (L3700-L4160)       │
+  ├───────────────────────┤    ├───────────────────────┤    ├───────────────────────┤
+  │ ShaderType->AddUB()  │    │ Metal 平台配置:       │    │ WORKING_COLOR_SPACE   │
+  │ VFType->AddUB()      │    │ - Metal shader 版本   │    │ UE_LEGACY_LUMINANCE   │
+  │ InstancedStereo.ush  │    │ - Archive 模式        │    │ UE_LWC_RENDER_TILE_x  │
+  │                      │    │ - FastIntrinsics      │    │ NANITE_ASSEMBLY_DATA  │
+  └───────────────────────┘    │ Android:              │    │ PROJECT_OIT          │
+                                │ - 禁用 dev shaders   │    │ PROJECT_SUPPORT_SKY_  │
+                                │ Mobile:               │    │ ATMOSPHERE           │
+                                │ - Forward/Deferred    │    │ SUPPORT_LOCALFOGVOL   │
+                                │ - FramebufferFetch    │    │ └───────────────────────┘
+                                │ - UBO emulation      │
+                                └───────────────────────┘
+
+  ---
+  4. 完整数据流图谱
+
+  输入参数                      GlobalBeginCompileShader 内部处理                    输出: FShaderCompilerInput
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────
+  DebugGroupName         ───────▶  Input.DebugGroupName = DebugGroupName / VFName /           │
+  VFType (MeshMaterial)   │       │   PipelineName / ShaderTypeName / PermutationId        │
+          │              │       │                                                          │
+          │              ▼       │   Input.Target = Target                                 │
+          ▼       Input.SourceFilename = SourceFilename                                   │
+  ShaderType            │       │   Input.EntryPointName = FunctionName                    │
+          │              │       │   Input.ShaderName = ShaderType->GetName()               │
+          │              ▼       │   Input.RootParametersStructure =                        │
+          ▼       Input.ShaderPlatformName = FDataDriven...GetName()                      │
+  ShaderPipeline        │       │   Input.ShaderFormat = ShaderFormatName                  │
+          │              │       │   Input.VirtualSourceFilePath = SourceFilename           │
+          │              ▼       │   Input.bBindlessEnabled = ShouldCompileWithBindless()   │
+          ▼       SET_SHADER_DEFINE(PIXELSHADER/VERTEXSHADER/...) ← Frequency macro        │
+  PermutationId         │       │   SET_SHADER_DEFINE(FORWARD_SHADING)                     │
+          │              │       │   SET_SHADER_DEFINE(SHADING_PATH_DEFERRED/MOBILE)        │
+          │              ▼       │   SET_SHADER_DEFINE(INSTANCED_STEREO/MULTI_VIEW)          │
+          ▼       SET_SHADER_DEFINE(PLATFORM_MAX_SAMPLERS) ← 平台能力                      │
+  SourceFilename        │       │   SET_SHADER_DEFINE(PLATFORM_SUPPORTS_xxx)                │
+          │              │       │   SET_SHADER_DEFINE(SUBSTRATE_ENABLED/xxx)                │
+          │              ▼       │   SET_SHADER_DEFINE(PROJECT_SUPPORTS_LUMEN)              │
+          ▼       SET_SHADER_DEFINE(VELOCITY_ENCODE_DEPTH)                                 │
+  FunctionName          │       │   SET_SHADER_DEFINE(USE_DBUFFER/GBUFFER_xxx)               │
+          │              │       │   SET_SHADER_DEFINE(NANITE_xxx)                          │
+          │              ▼       │                                                          │
+          ▼       if (bIsDxcEnabled) Add(CFLAG_ForceDXC)                                  │
+  bAllowDevCompile      │       │   if (Metal) Add(CFLAG_Archive)                         │
+          │              │       │   if (ShouldOptimize) Add(CFLAG_Debug)                   │
+          │              ▼       │   if (bUsingMobile) Add(CFLAG_UseEmulatedUB)              │
+          ▼       ShaderType->AddUniformBufferIncludesToEnvironment()                     │
+  Input (Environment)   │       │   if (VFType) VFType->AddUniformBufferIncludes()          │
+          │              │       │   Add GeneratedInstancedStereo.ush                       │
+          │              ▼       │                                                          │
+          ▼       Format->ModifyShaderCompilerInput(Input)                                  │
+                        │       │   ApplyDerivedDefines(Environment, SharedEnv)             │
+                        │       │                                                          │
+                        ▼       ▼                                                          │
+                        最终 FShaderCompilerInput 包含:                                     │
+                        ├── Target (Frequency, Platform)                                    │
+                        ├── Environment (所有 #define + compiler flags)                   │
+                        ├── SharedEnvironment (材质共享环境)                                │
+                        ├── VirtualSourceFilePath / EntryPointName                           │
+                        ├── DebugGroupName / DebugDescription                               │
+                        ├── RootParametersStructure                                        │
+                        ├── bBindlessEnabled                                               │
+                        └── Platform/Feature flags                                          │
+                                                                                            │
+                                                                                            ▼
+                                                                                      GShaderCompilingManager->
+                                                                                      SubmitJobs(CompileJobs)
+
+  ---
+  5. 三种 Shader 类型的关键差异对比表
+
+  ┌─────────────────────────┬──────────────────────┬────────────────────────────┬────────────────────────────────┐
+  │          维度           │    Global Shader     │      Material Shader       │      MeshMaterial Shader       │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ VFType                  │ nullptr              │ nullptr                    │ 非空                           │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ DebugGroupName          │ "Global"             │ 材质资产名                 │ 材质名 + VF名                  │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ PermutationId           │ 0-N (多 permutation) │ kUniqueShaderPermutationId │ kUniqueShaderPermutationId     │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ SharedEnvironment       │ 无                   │ MaterialEnvironment        │ MaterialEnvironment            │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ SetupCompileEnvironment │ GlobalShaderType::   │ MaterialShaderType::       │ MeshMaterialShaderType::       │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ Uniform Buffer          │ 仅 ShaderType        │ 仅 ShaderType              │ ShaderType + VFType            │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ bIsGlobalShader         │ true                 │ false                      │ false                          │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ bBypassCache            │ false                │ Material->IsPreview()      │ Material->IsPreview()          │
+  ├─────────────────────────┼──────────────────────┼────────────────────────────┼────────────────────────────────┤
+  │ bAllowDevCompile        │ true (默认)          │ true                       │ Material->GetAllowDevCompile() │
+  └─────────────────────────┴──────────────────────┴────────────────────────────┴────────────────────────────────┘
+
+  ---
+  6. Pipeline 编译的数据流分支
+
+  Pipeline 判断逻辑:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  SubmitCompileJobs()                                             │
+  │   │                                                              │
+  │   ├─ for (Pipeline : Layout.ShaderPipelines)                     │
+  │   │   │                                                          │
+  │   │   ├─ if (Pipeline->ShouldOptimizeUnusedOutputs(Platform))   │
+  │   │   │   │  = true  ──────────────────────┐                   │
+  │   │   │   │                               │                   │
+  │   │   │   ▼                               ▼                   │
+  │   │   │  【路径 A: 专用 Pipeline Shader】   │                   │
+  │   │   │  ┌──────────────────────────┐      │                   │
+  │   │   │  │ BeginCompileShaderPipeline()│      │                   │
+  │   │   │  │  ├─ 为每个 Stage 创建 Job  │      │                   │
+  │   │   │  │  │  └─ GlobalBeginCompileShader(│      │                   │
+  │   │   │  │  │      ShaderPipeline=Pipeline│      │                   │
+  │   │   │  │  │  )                         │      │                   │
+  │   │   │  │  ├─ Job.bCompilingForShaderPipeline│                │
+  │   │   │  │  └─ 输出可被 HLSL 跨 stage 优化的 shader              │
+  │   │   │  └──────────────────────────┘      │                   │
+  │   │   │                               │                   │
+  │   │   └─ else (bShouldOptimize= false)  │                   │
+  │   │       │  = false ───────────────────┘                   │
+  │   │       │                                                   │
+  │   │       ▼                                                   │
+  │   │      【路径 B: 共享 Shader】                               │
+  │   │      ┌──────────────────────────┐                         │
+  │   │      │ SharedShaderJobs 中的 Job│                         │
+  │   │      │  └─ Job->SharingPipelines│                         │
+  │   │      │      .Add(Pipeline)      │                         │
+  │   │      └──────────────────────────┘                         │
+  │   │                                                           │
+  │   └─ 结果:                                                    │
+  │       - 路径 A: 每个 Pipeline Stage 有独立 FShader 对象        │
+  │       - 路径 B: 多个 Pipeline 共享同一个 FShader 对象          │
+  │       - 在 TryGetShaders() 中通过 Pipeline 字段区分           │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ---
+  这就是完整的 Unreal Shader 编译链路图谱。从触发点到 GlobalBeginCompileShader 的数据填充，再到最终提交编译的全过程都已经覆盖。
