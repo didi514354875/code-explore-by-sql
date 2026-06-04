@@ -13,17 +13,10 @@ Refactored to accept LanguageConfig + FrameworkConfig instead of hardcoded const
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
 
 from .bracket_scanner import BracketBlock
-from .configs import LanguageConfig, FrameworkConfig
-
-# ── Shared regex constants (comment handling — language-agnostic) ───────
-
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
-
+from .configs import FrameworkConfig, LanguageConfig
 
 # ── Data types ───────────────────────────────────────────────────────────
 
@@ -39,7 +32,7 @@ class SymbolDef:
     parent_class: str | None = None  # for methods, the containing class name
     signature: str | None = None
     inheritance_base: str | None = None  # for class/struct, the base class name
-    language: str = "cpp"  # cpp, csharp, etc.
+    language: str = ""
 
 
 @dataclass
@@ -51,14 +44,17 @@ class ExtraSymbol:
     start_line: int
     end_line: int
     signature: str = ""
-    language: str = "cpp"
+    language: str = ""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def _strip_comments(text: str) -> str:
-    text = _BLOCK_COMMENT_RE.sub(" ", text)
-    text = _LINE_COMMENT_RE.sub(" ", text)
+def _strip_comments(text: str, lang: LanguageConfig) -> str:
+    if lang.block_comment_pair:
+        o, c = lang.block_comment_pair
+        text = re.compile(f"{re.escape(o)}.*?{re.escape(c)}", re.DOTALL).sub(" ", text)
+    if lang.line_comment:
+        text = re.compile(f"{re.escape(lang.line_comment)}[^\n]*").sub(" ", text)
     return text
 
 
@@ -71,7 +67,7 @@ def _strip_template(text: str, template_re: re.Pattern) -> str:
 
 
 def _normalize_decl(text: str, lang: LanguageConfig) -> str:
-    text = _strip_comments(text)
+    text = _strip_comments(text, lang)
     if lang.attribute_re:
         text = lang.attribute_re.sub(" ", text)
     if lang.calling_conv_re:
@@ -120,7 +116,12 @@ def _gather_declaration(
     fw: FrameworkConfig,
     max_lookback: int = 24,
 ) -> list[str]:
-    """Gather the declaration text preceding a brace at open_line_0 (0-based)."""
+    """Gather the declaration text preceding a brace at open_line_0 (0-based).
+
+    For indent-based languages (Python), the open_line already contains the
+    declaration (e.g. 'class Foo:' or 'def bar():'). Only look back to gather
+    multi-line signatures when parentheses are unbalanced.
+    """
     if open_line_0 < 0 or open_line_0 >= len(lines):
         return []
 
@@ -131,6 +132,22 @@ def _gather_declaration(
 
     paren_balance = open_text.count("(") - open_text.count(")")
     angle_balance = open_text.count("<") - open_text.count(">")
+
+    # For indent-based languages, if open_line is already a complete declaration
+    # (balanced parens, no need to look back), return immediately.
+    if lang.uses_indent_blocks:
+        if paren_balance == 0 and angle_balance == 0:
+            return context
+        # Unbalanced — multi-line signature, look back to gather it
+        for j in range(open_line_0 - 1, max(open_line_0 - max_lookback, -1), -1):
+            stripped = lines[j].strip()
+            if not stripped:
+                break
+            context.insert(0, stripped)
+            paren_balance += stripped.count("(") - stripped.count(")")
+            if paren_balance == 0:
+                break
+        return context
 
     if (
         open_text
@@ -156,10 +173,10 @@ def _gather_declaration(
             continue
 
         # Skip preprocessor directives — they can appear inside declarations
-        if stripped.startswith("#"):
+        if lang.preprocessor_prefix and stripped.startswith(lang.preprocessor_prefix):
             continue
 
-        clean = _strip_comments(stripped).strip()
+        clean = _strip_comments(stripped, lang).strip()
         if not clean:
             continue
         if _declaration_boundary(clean, lang) and paren_balance <= 0 and angle_balance <= 0:
@@ -178,7 +195,7 @@ def _gather_declaration(
             and (
                 (lang.block_keyword_re and lang.block_keyword_re.search(clean))
                 or re.search(r"\w\s*\([^;{}]*$", clean)
-                or clean.startswith("template")
+                or (lang.has_preprocessor_macros and clean.startswith("template"))
             )
         ):
             break
@@ -295,7 +312,7 @@ def _classify_block(
     # Function / method detection
     test_sig = lang.trailing_mods_re.sub("", function_sig).rstrip()
     test_sig = re.sub(r"\s+", " ", test_sig).strip()
-    if test_sig.endswith(")") or re.search(r"\)\s*(?:const\s*)?$", test_sig):
+    if test_sig.endswith(")") or lang.func_sig_end_re.search(test_sig):
         # Destructor
         dtor = lang.dtor_re.search(test_sig)
         if dtor:
@@ -341,12 +358,13 @@ def analyze_file(
     Returns (bracket_symbols, extra_symbols).
     """
     content = "\n".join(lines)
-    from .bracket_scanner import scan_brackets, compute_parent_map
+    from .bracket_scanner import compute_parent_map, scan_brackets
 
     blocks = scan_brackets(
         content,
         verbatim_string_prefix=lang.verbatim_string_prefix,
         raw_string_char=lang.raw_string_char,
+        lang=lang,
     )
     if not blocks:
         return [], extract_extra_symbols(lines, file_id, lang, fw)
@@ -450,19 +468,20 @@ def extract_extra_symbols(
 
         # #define macros (C/C++ only)
         if "macro_def" in fw.extra_symbol_types and lang.define_re:
-            dm = re.match(r"#\s*define\s+(\w+)(\([^)]*\))?\s*(.*)", stripped)
-            if dm:
-                name = dm.group(1)
-                if fw.macro_name_filter and fw.macro_name_filter(name):
-                    continue
-                results.append(ExtraSymbol(
-                    qualified_name=name,
-                    block_type="macro_def",
-                    file_id=file_id,
-                    start_line=i,
-                    end_line=i,
-                    signature=stripped,
-                    language=lang.name,
-                ))
+            if lang.define_line_re:
+                dm = lang.define_line_re.match(stripped)
+                if dm:
+                    name = dm.group(1)
+                    if fw.macro_name_filter and fw.macro_name_filter(name):
+                        continue
+                    results.append(ExtraSymbol(
+                        qualified_name=name,
+                        block_type="macro_def",
+                        file_id=file_id,
+                        start_line=i,
+                        end_line=i,
+                        signature=stripped,
+                        language=lang.name,
+                    ))
 
     return results

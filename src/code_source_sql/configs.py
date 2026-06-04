@@ -11,9 +11,8 @@ Any language can combine with any framework (e.g., Unreal uses C# for build syst
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
-
 
 # ── Language Layer ────────────────────────────────────────────────────────
 
@@ -86,6 +85,10 @@ class LanguageConfig:
     # Lambda expression detection regex (None if language has no lambdas)
     lambda_re: re.Pattern | None = None
 
+    # Function signature end pattern: matches when a joined declaration looks like
+    # a complete function signature. C/C++: ")", ") const". Python: "):".
+    func_sig_end_re: re.Pattern = re.compile(r"\)\s*(?:const\s*)?$")
+
     # Namespace signature regex for _classify_block (captures namespace name)
     namespace_sig_re: re.Pattern | None = None
 
@@ -120,6 +123,71 @@ class LanguageConfig:
     # Range-based for loop pattern for function body summary (None if unsupported)
     # C++: for (Type name : container), C#: foreach (Type name in collection)
     range_for_re: re.Pattern | None = None
+
+    # ── Comment syntax (consumed by bracket_scanner, symbol_analyzer, edge_extractor, code_block_summary) ──
+
+    # Line comment prefix (e.g. "//" for C-family, "#" for Python)
+    line_comment: str = "//"
+
+    # Block comment open/close pair, or None if unsupported
+    block_comment_pair: tuple[str, str] | None = ("/*", "*/")
+
+    # ── String syntax (consumed by bracket_scanner) ───────────────────
+
+    # Characters that start string literals (e.g. {'"', "'"} for Python, {'"'} for C++ where ' is char)
+    string_delimiters: frozenset[str] = frozenset({'"', "'"})
+
+    # Escape character inside strings (None if no escape mechanism)
+    string_escape_char: str | None = "\\"
+
+    # Triple-quoted string openers for indent-based languages (e.g. ('"""', "'''") for Python)
+    triple_quote_strings: tuple[str, ...] = ()
+
+    # ── Block style (consumed by bracket_scanner) ─────────────────────
+
+    # Whether this language uses indent-based blocks instead of braces
+    uses_indent_blocks: bool = False
+
+    # ── Preprocessor (consumed by symbol_analyzer, edge_extractor, code_block_summary) ──
+
+    # Preprocessor directive prefix (e.g. "#" for C/C++, "" if none)
+    preprocessor_prefix: str = "#"
+
+    # Whether #define-style macros exist (controls macro_def extraction)
+    has_preprocessor_macros: bool = True
+
+    # ── Statement / block close (consumed by code_block_summary) ──────
+
+    # Statement terminator character (e.g. ";" for C-family, "" for Python)
+    statement_terminator: str = ";"
+
+    # Closing brace syntax for summary output (e.g. "};" for C++, "}" for most others)
+    block_close_suffix: str = "}"
+
+    # Comment prefix for summary lines (e.g. "//" for C-family, "#" for Python)
+    summary_comment_prefix: str = "//"
+
+    # ── Config-driven control flow (consumed by code_block_summary) ───
+
+    # Control flow patterns: tuple of (label, compiled_regex) for function body summary
+    control_flow_patterns: tuple[tuple[str, re.Pattern], ...] = ()
+
+    # Return keyword regex for function body summary
+    return_re: re.Pattern | None = None
+
+    # ── Extra syntax hints ────────────────────────────────────────────
+
+    # Pointer/reference type indicator chars (e.g. "*&" for C/C++, "" for Python/Java)
+    type_indicator_chars: str = "*&"
+
+    # Full #define line regex for ExtraSymbol extraction (None if language has no macros)
+    define_line_re: re.Pattern | None = None
+
+    # Whether backtick template literal strings exist (JavaScript/TypeScript)
+    has_template_strings: bool = False
+
+    # Raw string syntax style: "cpp" for R"delim(...)delim", "rust" for r#"..."#
+    raw_string_style: str = "cpp"
 
 
 # ── Framework Layer ───────────────────────────────────────────────────────
@@ -224,152 +292,7 @@ class ProjectConfig:
     framework_name: str = "generic"
 
 
-# ── Defaults ──────────────────────────────────────────────────────────────
-
-def make_cpp_language() -> LanguageConfig:
-    """C/C++ language configuration."""
-    return LanguageConfig(
-        name="cpp",
-        class_re=re.compile(
-            r"(?:^|\s)(class|struct)\s+"
-            r"(?:(?:[A-Z][A-Z0-9_]*_API|[A-Z][A-Z0-9_]*(?:\s*\([^)]*\))?)\s+)*"
-            r"(\w+)"
-            r"\s*(?::\s*(?:public|protected|private)\s+(\w+))?",
-        ),
-        enum_re=re.compile(r"\benum\s+(?:(?:class|struct)\s+)?(\w+)"),
-        namespace_re=re.compile(r"\bnamespace\s+(\w+)"),
-        func_name_re=re.compile(r"(\w+(?:\s*::\s*\w+)*)\s*\([^)]*\)\s*$"),
-        export_macro_re=re.compile(r"\b[A-Z][A-Z0-9_]*_API\b"),
-        calling_conv_re=re.compile(
-            r"\b(?:__cdecl|__stdcall|__fastcall|__thiscall|__vectorcall|WINAPI|CALLBACK|"
-            r"STDMETHODCALLTYPE|FORCEINLINE|FORCENOINLINE|FORCEINLINE_DEBUGGABLE|inline)\b"
-        ),
-        attribute_re=re.compile(
-            r"\b(?:__declspec|__attribute__|alignas)\s*\([^)]*(?:\)[^)]*)?\)|\[\[[^\]]*\]\]"
-        ),
-        template_re=re.compile(r"\btemplate\s*<[^<>]*>"),
-        dtor_re=re.compile(r"~(\w+)\s*\("),
-        control_flow_re=re.compile(r"\b(if|else\s+if|else|while|for|do|switch|catch|try)\b"),
-        control_flow_names=frozenset({
-            "if", "else", "while", "for", "do", "switch", "catch", "try",
-            "return", "delete", "goto", "break", "continue", "throw",
-            "co_await", "co_yield", "co_return",
-        }),
-        trailing_mods_re=re.compile(
-            r"\s*(?:const|override|final|noexcept|mutable|constexpr|inline|static)\s*[;{]*\s*$"
-        ),
-        access_spec_re=re.compile(r"^(?:public|private|protected)\s*:\s*(?://.*)?$"),
-        macro_like_re=re.compile(r"^[A-Z][A-Z0-9_]*\s*(?:\([^{};]*\))?\s*$"),
-        define_re=re.compile(r"#\s*define\s+"),
-        extern_c_re=re.compile(r'\bextern\s+"C"'),
-        operator_re=re.compile(r"\boperator\b"),
-        uses_braces=True,
-        uses_namespaces=True,
-        uses_colon_inheritance=True,
-        # Edge extraction
-        scope_operator="::",
-        base_keyword="Super",
-        static_call_re=re.compile(r"\b([A-Z][A-Za-z0-9_]+)::([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-        super_call_re=re.compile(r"\bSuper::([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-        type_re=re.compile(r"\b([A-Z][A-Za-z0-9_]+)\b"),
-        param_type_re=re.compile(
-            r"(?:const\s+)?([A-Z][A-Za-z0-9_]+)\s*(?:\*+|&)?\s+\w+"
-        ),
-        basic_skip_types=frozenset({
-            "int8", "int16", "int32", "int64",
-            "uint8", "uint16", "uint32", "uint64",
-            "float", "double", "bool", "void", "int", "char", "long", "short",
-            "unsigned", "size_t", "auto", "nullptr_t",
-        }),
-        # Block classification helpers
-        block_keyword_re=re.compile(r"\b(?:namespace|class|struct|enum)\b"),
-        lambda_re=re.compile(r"\[.*\]\s*[\(]"),
-        namespace_sig_re=re.compile(r"(?:inline\s+)?namespace\s+(\w+)?\s*$"),
-        init_list_re=re.compile(r"\)\s*:"),
-        # View / summary helpers
-        access_spec_names=frozenset({"public:", "protected:", "private:"}),
-        view_structural_kws=("class ", "struct ", "enum ", "namespace "),
-        view_modifier_kws=("virtual ", "static ", "override", "FORCEINLINE"),
-        local_var_modifiers="const|static|mutable|constexpr|volatile",
-        # Bracket scanner hints
-        verbatim_string_prefix=None,
-        raw_string_char="R",
-        # Function body summary hints
-        range_for_re=re.compile(
-            r"for\s*\(\s*(?:const\s+)?(\w+(?:\s*<[^>]*>)?)\s*[*&]?\s+(\w+)\s*:\s*(\w+)"
-        ),
-    )
-
-
-def make_csharp_language() -> LanguageConfig:
-    """C# language configuration."""
-    return LanguageConfig(
-        name="csharp",
-        class_re=re.compile(
-            r"(?:^|\s)(class|struct|interface|record)"
-            r"(?:\s+(?:class|struct))?"  # C# compound: record struct, record class, interface class
-            r"\s+"
-            r"(\w+)"
-            r"\s*(?::\s*(\w+))?",
-        ),
-        enum_re=re.compile(r"\benum\s+(\w+)"),
-        namespace_re=re.compile(r"\bnamespace\s+([\w.]+)"),
-        func_name_re=re.compile(r"(\w+)\s*\([^)]*\)\s*$"),
-        export_macro_re=re.compile(r"(?!x)x"),  # never matches — no export macros in C#
-        calling_conv_re=re.compile(r"(?!x)x"),
-        attribute_re=re.compile(r"\[[^\]]*\]"),
-        template_re=re.compile(r"<[^<>]*>"),
-        dtor_re=re.compile(r"(?!x)x"),  # C# uses Dispose pattern, not ~
-        control_flow_re=re.compile(r"\b(if|else\s+if|else|while|for|foreach|do|switch|catch|try|using|lock)\b"),
-        control_flow_names=frozenset({
-            "if", "else", "while", "for", "foreach", "do", "switch", "catch", "try",
-            "return", "break", "continue", "throw", "using", "lock", "yield",
-            "async", "await", "new", "this", "base", "typeof", "sizeof", "nameof",
-            "default", "checked", "unchecked", "delegate",
-        }),
-        trailing_mods_re=re.compile(r"\s*(?:override|virtual|abstract|sealed|static|async)\s*[;{]*\s*$"),
-        access_spec_re=re.compile(r"^(?!x)x"),  # C# has no standalone access-spec lines
-        macro_like_re=re.compile(r"(?!x)x"),  # no macros in C#
-        define_re=re.compile(r"(?!x)x"),
-        extern_c_re=re.compile(r"(?!x)x"),
-        operator_re=None,
-        uses_braces=True,
-        uses_namespaces=True,
-        uses_colon_inheritance=True,
-        # Edge extraction
-        scope_operator=".",
-        base_keyword="base",
-        static_call_re=re.compile(r"\b([A-Z][A-Za-z0-9_]+)\.([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-        super_call_re=re.compile(r"\bbase\.([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-        type_re=re.compile(r"\b([A-Z][A-Za-z0-9_]+)\b"),
-        param_type_re=re.compile(
-            r"([A-Z][A-Za-z0-9_]+)\s+\w+"
-        ),
-        basic_skip_types=frozenset({
-            "int", "uint", "long", "ulong", "short", "ushort",
-            "byte", "sbyte", "float", "double", "decimal",
-            "bool", "string", "object", "void", "char",
-            "var", "dynamic", "nint", "nuint",
-        }),
-        # Block classification helpers
-        block_keyword_re=re.compile(r"\b(?:namespace|class|struct|interface|record|enum)\b"),
-        lambda_re=re.compile(r"(?:\w+\s*=>|delegate\s*\()"),  # C# lambdas: x => ... or delegate(...)
-        namespace_sig_re=re.compile(r"namespace\s+([\w.]+)\s*$"),
-        init_list_re=None,  # C# uses constructor chaining, not initializer lists
-        # View / summary helpers
-        access_spec_names=frozenset({"public", "private", "protected", "internal", "protected internal", "private protected"}),
-        view_structural_kws=("class ", "struct ", "interface ", "record ", "enum ", "namespace "),
-        view_modifier_kws=("virtual ", "static ", "override", "abstract ", "sealed ", "async "),
-        local_var_modifiers="const|static|volatile|readonly|ref|out",
-        # Bracket scanner hints
-        verbatim_string_prefix="@",
-        raw_string_char=None,
-        # Function body summary hints
-        range_for_re=re.compile(
-            r"foreach\s*\(\s*(\w+(?:\s*<[^>]*>)?)\s+(\w+)\s+in\s+(\w+)"
-        ),
-    )
-
+# ── Framework / Project Defaults ──────────────────────────────────────────
 
 def make_generic_framework() -> FrameworkConfig:
     """Generic framework — no framework-specific rules."""
@@ -404,3 +327,71 @@ def make_unreal_project(
         }),
         framework_name=framework.name if framework else "generic",
     )
+
+
+def make_generic_project(
+    extra_extensions: dict[str, str] | None = None,
+) -> ProjectConfig:
+    """Generic project configuration supporting all registered languages."""
+    ext_map: dict[str, str] = {
+        # C/C++
+        ".h": "cpp", ".hpp": "cpp", ".hh": "cpp", ".inl": "cpp",
+        ".c": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+        # C#
+        ".cs": "csharp",
+        # Java
+        ".java": "java",
+        # Go
+        ".go": "go",
+        # Rust
+        ".rs": "rust",
+        # JavaScript/TypeScript
+        ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+        ".ts": "typescript", ".tsx": "typescript",
+        # Kotlin
+        ".kt": "kotlin", ".kts": "kotlin",
+        # Swift
+        ".swift": "swift",
+        # Python
+        ".py": "python", ".pyi": "python",
+    }
+    if extra_extensions:
+        ext_map.update(extra_extensions)
+
+    return ProjectConfig(
+        extension_to_language=ext_map,
+        exclude_parts=frozenset({".git", ".vs", "node_modules", "__pycache__"}),
+        source_marker="",
+        categories=frozenset(),
+        invalid_module_names=frozenset(),
+        framework_name="generic",
+    )
+
+
+# ── Language Registry ──────────────────────────────────────────────────────
+
+_LANGUAGE_FACTORIES: dict[str, Callable[[], LanguageConfig]] = {}
+
+
+def register_language(name: str, factory: Callable[[], LanguageConfig]) -> None:
+    """Register a language factory function."""
+    _LANGUAGE_FACTORIES[name] = factory
+
+
+def get_language(name: str) -> LanguageConfig:
+    """Get a LanguageConfig by name, raising ValueError if unknown."""
+    if name not in _LANGUAGE_FACTORIES:
+        raise ValueError(
+            f"Unknown language: {name!r}. Registered: {sorted(_LANGUAGE_FACTORIES.keys())}"
+        )
+    return _LANGUAGE_FACTORIES[name]()
+
+
+def registered_languages() -> list[str]:
+    """Return sorted list of registered language names."""
+    return sorted(_LANGUAGE_FACTORIES.keys())
+
+
+# Re-export language factory functions from the languages/ subpackage.
+# This import triggers registration of all language factories.
+from . import languages  # noqa: E402, F401

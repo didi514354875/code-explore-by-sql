@@ -13,22 +13,22 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .symbol_analyzer import SymbolDef, ExtraSymbol
 from .edge_extractor import StrictEdge
+from .symbol_analyzer import ExtraSymbol, SymbolDef
 
 
 def _resolve_lang_fw(language: str) -> tuple[Any, Any]:
     """Resolve a language name string to (LanguageConfig, FrameworkConfig).
 
-    Mirrors the build-time dispatch logic:
-    - cpp → Unreal framework
-    - csharp → generic framework
+    Uses the language registry for LanguageConfig lookup.
+    C++ keeps Unreal framework for backward compat with existing databases.
     """
-    from .configs import make_cpp_language, make_csharp_language, make_generic_framework
-    from .unreal_rules import make_unreal_framework
-    if language == "csharp":
-        return make_csharp_language(), make_generic_framework()
-    return make_cpp_language(), make_unreal_framework()
+    from .configs import get_language, make_generic_framework
+    lang = get_language(language)
+    if language == "cpp":
+        from .unreal_rules import make_unreal_framework
+        return lang, make_unreal_framework()
+    return lang, make_generic_framework()
 
 
 def _get_lang_for(language: str) -> Any:
@@ -267,20 +267,26 @@ def read_symbol(
     _weak_types = frozenset({"namespace", "macro_def"})
     need_prefix = not rows or all(r["block_type"] in _weak_types for r in rows)
     if need_prefix:
-        _, fw_resolve = _resolve_lang_fw("cpp")
-        if fw_resolve.resolve_type_prefixes:
-            for candidate in fw_resolve.resolve_type_prefixes(qualified_name):
-                prefix_rows = conn.execute(
-                    """SELECT si.*, fc.file_path, fc.module_name, fc.content
-                       FROM symbol_index si
-                       JOIN file_content fc ON fc.file_id = si.file_id
-                       WHERE si.qualified_name = ?
-                       ORDER BY si.file_id, si.start_line""",
-                    (candidate,),
-                ).fetchall()
-                if prefix_rows:
-                    rows = prefix_rows
-                    break
+        db_langs = [r["language"] for r in conn.execute(
+            "SELECT DISTINCT language FROM symbol_index"
+        ).fetchall()]
+        for lang_name in db_langs:
+            _, fw_resolve = _resolve_lang_fw(lang_name)
+            if fw_resolve.resolve_type_prefixes:
+                for candidate in fw_resolve.resolve_type_prefixes(qualified_name):
+                    prefix_rows = conn.execute(
+                        """SELECT si.*, fc.file_path, fc.module_name, fc.content
+                           FROM symbol_index si
+                           JOIN file_content fc ON fc.file_id = si.file_id
+                           WHERE si.qualified_name = ?
+                           ORDER BY si.file_id, si.start_line""",
+                        (candidate,),
+                    ).fetchall()
+                    if prefix_rows:
+                        rows = prefix_rows
+                        break
+            if rows:
+                break
 
     # 3. Partial match: contains the name (e.g., "Jump" matches "ACharacter::Jump")
     if not rows:
@@ -298,7 +304,6 @@ def read_symbol(
 
     results = []
     for r in rows:
-        file_id = r["file_id"]
         start = r["start_line"]
         end = r["end_line"]
         content = r["content"]

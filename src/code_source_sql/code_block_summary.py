@@ -15,7 +15,26 @@ from typing import Any
 
 from .bracket_scanner import BracketBlock, compute_parent_map, scan_brackets
 from .configs import FrameworkConfig, LanguageConfig
-from .symbol_analyzer import _gather_declaration, _classify_block
+from .symbol_analyzer import _gather_declaration
+
+
+def _is_comment_or_empty(s: str, lang: LanguageConfig) -> bool:
+    """Check if a stripped line is empty, a line comment, or starts a block comment."""
+    if not s:
+        return True
+    if lang.line_comment and s.startswith(lang.line_comment):
+        return True
+    if lang.block_comment_pair and s.startswith(lang.block_comment_pair[0]):
+        return True
+    return False
+
+
+def _format_control_flow(lang: LanguageConfig, kw: str, cond: str) -> str:
+    """Format a control flow summary line based on language brace style."""
+    if lang.uses_braces:
+        return f"  {kw} ({cond}) {{ ... }}"
+    return f"  {kw} {cond}: ..."
+
 
 # ── Dispatcher ───────────────────────────────────────────────────────────
 
@@ -80,11 +99,11 @@ def _pick_strategy(block_type: str | None, code: str, lang: LanguageConfig) -> s
 
     for line in code.split("\n"):
         s = line.strip()
-        if not s or s.startswith("//") or s.startswith("/*"):
+        if _is_comment_or_empty(s, lang):
             continue
         if block_kw_re.search(s):
             return "class"
-        if s.startswith("#") and "define" in s:
+        if lang.preprocessor_prefix and s.startswith(lang.preprocessor_prefix) and "define" in s:
             return "macro"
         if "(" in s and ")" in s:
             return "function"
@@ -141,7 +160,7 @@ def _class_summary_from_symbols(
         if child:
             btype = child["block_type"]
             if btype in _FUNC_TYPES:
-                sig = child.get("signature") or _declaration_from_code(lines, i - 1)
+                sig = child.get("signature") or _declaration_from_code(lines, i - 1, lang)
                 if sig:
                     kept.append(f"  {sig};")
                 else:
@@ -149,8 +168,8 @@ def _class_summary_from_symbols(
                 continue
             if btype in _CLASS_TYPES:
                 kept.append(line)
-                kept.append(f"  // ... {btype} {child.get('qualified_name', '')} ...")
-                kept.append("};")
+                kept.append(f"  {lang.summary_comment_prefix} ... {btype} {child.get('qualified_name', '')} ...")
+                kept.append(lang.block_close_suffix)
                 continue
             if btype == "enum":
                 kept.append(line)
@@ -162,20 +181,22 @@ def _class_summary_from_symbols(
             continue
 
         if not _is_inside_child_block(i, child_by_start):
-            if ";" in stripped and not stripped.startswith("//"):
+            if (
+                lang.statement_terminator and lang.statement_terminator in stripped
+            ) and not _is_comment_or_empty(stripped, lang):
                 kept.append(line)
 
-    kept.append(f"// ... {total} lines total")
+    kept.append(f"{lang.summary_comment_prefix} ... {total} lines total")
     return "\n".join(kept)
 
 
-def _declaration_from_code(lines: list[str], line_idx_0: int) -> str | None:
+def _declaration_from_code(lines: list[str], line_idx_0: int, lang: LanguageConfig | None = None) -> str | None:
     start = line_idx_0
-    while start > 0 and lines[start - 1].strip().startswith("//"):
+    while start > 0 and lines[start - 1].strip().startswith(lang.line_comment if lang else "//"):
         start -= 1
     for j in range(start, min(start + 6, len(lines))):
         if "{" in lines[j]:
-            decl = " ".join(l.strip() for l in lines[start:j + 1])
+            decl = " ".join(ln.strip() for ln in lines[start:j + 1])
             brace_pos = decl.find("{")
             if brace_pos > 0:
                 return decl[:brace_pos].rstrip()
@@ -218,7 +239,6 @@ def _class_summary_from_text(
     deco_macro_re = fw.decoration_macro_re
 
     outermost = min(blocks, key=lambda b: b.depth)
-    outer_depth = outermost.depth
     outer_key = (outermost.open_line, outermost.depth)
 
     child_blocks: list[BracketBlock] = []
@@ -269,10 +289,12 @@ def _class_summary_from_text(
                         kept.append(line)
             continue
 
-        if ";" in stripped and not stripped.startswith("//"):
+        if (
+            lang.statement_terminator and lang.statement_terminator in stripped
+        ) and not _is_comment_or_empty(stripped, lang):
             kept.append(line)
 
-    kept.append(f"// ... {len(lines)} lines total")
+    kept.append(f"{lang.summary_comment_prefix} ... {len(lines)} lines total")
     return "\n".join(kept)
 
 
@@ -289,7 +311,7 @@ def summarize_macro_block(
         raw_string_char=lang.raw_string_char,
     )
     if not blocks:
-        return _macro_fallback(code)
+        return _macro_fallback(code, lang)
 
     parent_map = compute_parent_map(blocks)
     lines = code.split("\n")
@@ -340,23 +362,25 @@ def summarize_macro_block(
                         kept.append(line)
             continue
 
-        if ";" in stripped and not stripped.startswith("//"):
+        if (
+            lang.statement_terminator and lang.statement_terminator in stripped
+        ) and not _is_comment_or_empty(stripped, lang):
             kept.append(line)
 
-    kept.append(f"// ... {len(lines)} lines total")
+    kept.append(f"{lang.summary_comment_prefix} ... {len(lines)} lines total")
     return "\n".join(kept)
 
 
-def _macro_fallback(code: str) -> str:
+def _macro_fallback(code: str, lang: LanguageConfig) -> str:
     lines = code.split("\n")
     kept: list[str] = []
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("//"):
+        if _is_comment_or_empty(stripped, lang):
             continue
-        if ";" in stripped:
+        if lang.statement_terminator and lang.statement_terminator in stripped:
             kept.append(line)
-    kept.append(f"// ... {len(lines)} lines total")
+    kept.append(f"{lang.summary_comment_prefix} ... {len(lines)} lines total")
     return "\n".join(kept)
 
 
@@ -395,18 +419,13 @@ def summarize_function_body(
 
     range_for_re = lang.range_for_re
 
-    control_flow_res = [
-        (re.compile(r"^\s*for\s*\((.{1,80})\)\s*\{?\s*$"), "for"),
-        (re.compile(r"^\s*while\s*\((.{1,80})\)\s*\{?\s*$"), "while"),
-        (re.compile(r"^\s*(?:else\s+)?if\s*\((.{1,80})\)\s*\{?\s*$"), "if"),
-        (re.compile(r"^\s*switch\s*\((.{1,40})\)\s*\{?\s*$"), "switch"),
-    ]
+    control_flow_res = [(regex, label) for label, regex in lang.control_flow_patterns]
 
-    return_re = re.compile(r"^\s*return\s+(.{1,60});")
+    return_re = lang.return_re or re.compile(r"(?!x)x")  # never-match if None
 
     for line in body_lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("//") or stripped in ("{", "}", "{})", "};"):
+        if _is_comment_or_empty(stripped, lang) or stripped in ("{", "}", "{})", "};"):
             continue
 
         m = local_var_re.match(stripped)
@@ -426,8 +445,12 @@ def summarize_function_body(
         if range_for_re:
             rf = range_for_re.search(stripped)
             if rf:
-                vtype, vname, container = rf.group(1), rf.group(2), rf.group(3)
-                summary_lines.append(f"  for ({vtype} {vname} : {container}) {{ ... }}")
+                groups = rf.groups()
+                if len(groups) >= 3:
+                    desc = f"{groups[0]} {groups[1]} : {groups[2]}"
+                else:
+                    desc = " ".join(groups)
+                summary_lines.append(_format_control_flow(lang, "for", desc))
                 continue
 
         matched_flow = False
@@ -437,7 +460,7 @@ def summarize_function_body(
                 cond = m.group(1).strip()
                 if len(cond) > 60:
                     cond = cond[:57] + "..."
-                summary_lines.append(f"  {kw} ({cond}) {{ ... }}")
+                summary_lines.append(_format_control_flow(lang, kw, cond))
                 matched_flow = True
                 break
         if matched_flow:
@@ -448,7 +471,7 @@ def summarize_function_body(
             retval = rm.group(1).strip()
             if len(retval) > 60:
                 retval = retval[:57] + "..."
-            summary_lines.append(f"  return {retval};")
+            summary_lines.append(f"  return {retval}{lang.statement_terminator}")
             continue
 
     closing = _find_closing_brace(body_lines)
@@ -456,7 +479,7 @@ def summarize_function_body(
         summary_lines.append(closing)
 
     body_count = len(body_lines)
-    summary_lines.append(f"// ... {body_count} lines in body")
+    summary_lines.append(f"{lang.summary_comment_prefix} ... {body_count} lines in body")
 
     return "\n".join(summary_lines)
 

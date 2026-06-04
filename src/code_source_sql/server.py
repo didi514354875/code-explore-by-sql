@@ -1,12 +1,18 @@
-"""MCP server for UE Semantic Search — two tools per plan.md.
+"""MCP server for source code navigation — four tools.
 
-Tool 1: Read_Symbol(qualified_name)
+Tool 1: read_symbol(qualified_name)
   - Precise lookup via symbol_index
-  - Returns code with [System Hint] header (edges, UE metadata, action guide)
+  - Returns code with [System Hint] header (edges, metadata, action guide)
 
-Tool 2: Search_FTS(keyword, path_filter)
+Tool 2: search_fts_tool(keyword, path_filter)
   - FTS5 full-text search, grep-mode results
   - Returns hit line + 2 lines context, minimal token cost
+
+Tool 3: read_file_range(file_path, start_line, end_line)
+  - File range read with symbol metadata overlay
+
+Tool 4: get_directory_structure()
+  - Module/file counts from index
 """
 
 from __future__ import annotations
@@ -18,20 +24,28 @@ from mcp.server.fastmcp import FastMCP
 
 from .db import (
     connect,
-    initialize_schema,
-    read_symbol as db_read_symbol,
-    read_file_range as db_read_file_range,
-    search_fts as db_search_fts,
-    format_symbol_response,
     format_file_range_response,
+    format_symbol_response,
+    initialize_schema,
+)
+from .db import (
     get_directory_structure as db_get_directory_structure,
+)
+from .db import (
+    read_file_range as db_read_file_range,
+)
+from .db import (
+    read_symbol as db_read_symbol,
+)
+from .db import (
+    search_fts as db_search_fts,
 )
 
 mcp = FastMCP("code-source-sql")
 
 
 def _db_path() -> str:
-    return os.environ.get("CODE_SOURCE_DB", "unreal.db")
+    return os.environ.get("CODE_SOURCE_DB", "code_source.db")
 
 
 def _conn():
@@ -45,22 +59,21 @@ def read_symbol(qualified_name: str, view: str = "full", expand_item: list[str] 
     """Read a symbol's source code with [System Hint] header.
 
     The core tool for precise code lookup. Accepts a qualified name
-    (e.g., 'ACharacter::Jump', 'UWeaponComponent', 'FWeaponData').
+    (e.g., 'ClassName::MethodName', 'ClassName').
 
     Returns the symbol's code block with a [System Hint] header that includes:
     - Qualified Name and file location
-    - UE Metadata (UFUNCTION/UCLASS params, RPC routing hints)
+    - Decoration metadata and framework-specific hints
     - Static Relations (inheritance, type dependencies, static calls, RPC targets)
     - Action Guide for resolving pointer calls via type dependencies
 
     Supports fuzzy resolution:
-    - 'Actor' resolves to 'AActor' (UE prefix normalization)
-    - 'Jump' matches 'ACharacter::Jump' (partial QN match)
+    - Partial names match qualified names (e.g., 'MethodName' matches 'ClassName::MethodName')
 
     view: controls output granularity:
     - "full" (default): complete source code
     - "signature": only member declarations (functions, variables, enums) — use for large classes
-    - "meta": only [System Hint] header with edges and UE metadata, no code
+    - "meta": only [System Hint] header with edges and metadata, no code
 
     expand_item: optional signal-enrichment hints. These do not expand or
     filter the query; they only rank multiple matches and annotate matches in
@@ -69,7 +82,23 @@ def read_symbol(qualified_name: str, view: str = "full", expand_item: list[str] 
     with _conn() as conn:
         entries = db_read_symbol(conn, qualified_name, expand_item=expand_item)
         if not entries:
-            return f"Symbol '{qualified_name}' not found. Try with full qualified name (e.g., 'ClassName::MethodName')."
+            # FTS fallback: when symbol_index has no match, try full-text search
+            fts_results = db_search_fts(conn, qualified_name, limit=5)
+            if fts_results and "file_path" in fts_results[0]:
+                lines = [f"Symbol '{qualified_name}' not found in symbol_index."]
+                lines.append("FTS fallback — these source matches found:")
+                for r in fts_results[:5]:
+                    loc = f"  {r['file_path']}:{r['hit_line']}"
+                    if r.get("block_name"):
+                        loc += f" in {r['block_name']}"
+                    lines.append(loc)
+                lines.append("Use search_fts_tool or read_file_range for details.")
+                return "\n".join(lines)
+            return (
+                f"Symbol '{qualified_name}' not found. "
+                "Try with full qualified name "
+                "(e.g., 'ClassName::MethodName' or 'ClassName.MethodName')."
+            )
 
         # Return the best match with System Hint
         best = entries[0]

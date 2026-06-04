@@ -13,7 +13,10 @@
       "Bash(python3 *)",
       "Bash(grep -E \"\\\\.\\(md|toml|json|txt|cfg|ini|yaml|yml\\)$|Makefile\")",
       "Bash(git add *)",
-      "Bash(git rm *)"
+      "Bash(git rm *)",
+      "Bash(PYTHONPATH=src python3 -c \"from code_explore_by_sql.db import connect\")",
+      "Bash(PYTHONPATH=src python3 -c \"from code_source_sql.db import connect; print\\('code_source_sql.db imports OK'\\)\")",
+      "mcp__code-source-sql__get_directory_structure"
     ]
   },
   "enableAllProjectMcpServers": true,

@@ -1,14 +1,21 @@
-"""Bracket skeleton scanner — lightweight structural indexing for brace-based source.
+"""Bracket skeleton scanner — lightweight structural indexing for source code.
 
 FSM tracks brace depth while correctly ignoring braces inside comments,
-string literals, character literals, raw strings, and verbatim strings.
-Supports C/C++ and C# syntax via optional LanguageConfig parameter.
+string literals, character literals, raw strings, verbatim strings,
+triple-quoted strings, and template literals. Supports multiple languages
+via optional LanguageConfig parameter. When `lang is None`, defaults to
+C/C++ syntax (backward compatible).
+
+For indent-based languages (Python), delegates to _scan_indent_blocks().
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .configs import LanguageConfig
 
 # FSM states
 _CODE = 0
@@ -18,6 +25,8 @@ _STRING = 3
 _CHAR_LITERAL = 4
 _RAW_STRING = 5
 _VERBATIM_STRING = 6
+_TRIPLE_STRING = 7
+_TEMPLATE_LITERAL = 8
 
 _TRIGGER_CHARS_BASE = frozenset('{}"/\'R@')
 
@@ -34,6 +43,7 @@ def scan_brackets(
     content: str,
     verbatim_string_prefix: str | None = None,
     raw_string_char: str | None = None,
+    lang: LanguageConfig | None = None,
 ) -> list[BracketBlock]:
     """Scan content and return matched brace pairs with depth info.
 
@@ -41,20 +51,56 @@ def scan_brackets(
         content: Source code text to scan.
         verbatim_string_prefix: If set (e.g. '@' for C#), enables verbatim
             string handling. Braces inside verbatim strings are ignored.
+            Ignored when `lang` is provided (resolved from lang instead).
         raw_string_char: If set (e.g. 'R' for C++), enables raw string
             literal handling. Braces inside raw strings are ignored.
+            Ignored when `lang` is provided (resolved from lang instead).
+        lang: Optional LanguageConfig for multi-language support. When
+            provided, all syntax parameters are resolved from it. When
+            None, defaults to C/C++ syntax (backward compatible).
     """
+    # Indent-based language dispatch
+    if lang and lang.uses_indent_blocks:
+        return _scan_indent_blocks(content, lang)
+
+    # Resolve syntax parameters from lang or legacy params
+    if lang:
+        _line_comment = lang.line_comment
+        _block_comment_open, _block_comment_close = lang.block_comment_pair or (None, None)
+        _string_delims = lang.string_delimiters
+        _escape_char = lang.string_escape_char
+        _triple_quotes = lang.triple_quote_strings
+        _has_template_strings = lang.has_template_strings
+        _raw_style = lang.raw_string_style
+        # Override legacy params from lang
+        raw_string_char = lang.raw_string_char
+        verbatim_string_prefix = lang.verbatim_string_prefix
+    else:
+        _line_comment = "//"
+        _block_comment_open, _block_comment_close = "/*", "*/"
+        _string_delims = frozenset({'"', "'"})
+        _escape_char = "\\"
+        _triple_quotes = ()
+        _has_template_strings = False
+        _raw_style = "cpp"
+
     depth = 0
     stack: list[tuple[int, int]] = []  # (open_line, open_depth)
     blocks: list[BracketBlock] = []
     state = _CODE
     raw_delim = ""
+    _current_string_delim = '"'
+    _current_triple_end = '"""'
+
+    # Build trigger chars for line-skip optimisation
     _base = frozenset('{}"/\'')
     extras = set()
     if raw_string_char:
         extras.add(raw_string_char)
     if verbatim_string_prefix:
         extras.add(verbatim_string_prefix)
+    if _has_template_strings:
+        extras.add('`')
     trigger_chars = _base | frozenset(extras)
 
     lines = content.split("\n")
@@ -71,31 +117,67 @@ def scan_brackets(
             next_ch = line[i + 1] if i + 1 < n else ""
 
             if state == _CODE:
-                if ch == "/" and next_ch == "/":
+                # Line comment
+                if _line_comment and line[i:i + len(_line_comment)] == _line_comment:
                     state = _LINE_COMMENT
-                    i += 2
+                    i += len(_line_comment)
                     continue
-                if ch == "/" and next_ch == "*":
+                # Block comment open
+                if _block_comment_open and line[i:i + len(_block_comment_open)] == _block_comment_open:
                     state = _BLOCK_COMMENT
-                    i += 2
+                    i += len(_block_comment_open)
                     continue
+                # Raw string (C++ R"delim(...)delim" or Rust r#"..."#)
                 if raw_string_char and ch == raw_string_char and next_ch == '"':
-                    delim_end = line.find("(", i + 2)
-                    if delim_end != -1:
-                        raw_delim = line[i + 2 : delim_end]
+                    if _raw_style == "rust":
+                        # Rust: r"...", r#"..."#, r##"..."##
+                        j = i + 2
+                        hash_count = 0
+                        while j < n and line[j] == '#':
+                            hash_count += 1
+                            j += 1
+                        raw_delim = "#" * hash_count
                         state = _RAW_STRING
-                        i = delim_end + 1
+                        i = j
                         continue
+                    else:
+                        # C++ style: R"delim(...)delim"
+                        delim_end = line.find("(", i + 2)
+                        if delim_end != -1:
+                            raw_delim = line[i + 2 : delim_end]
+                            state = _RAW_STRING
+                            i = delim_end + 1
+                            continue
                 # Verbatim string: @"..." (C#) — doubles "" are escaped quotes
                 if verbatim_string_prefix and ch == verbatim_string_prefix and next_ch == '"':
                     state = _VERBATIM_STRING
                     i += 2
                     continue
-                if ch == '"':
-                    state = _STRING
+                # Triple-quoted strings (Python """ and ''')
+                if _triple_quotes:
+                    matched_tq = None
+                    for tq in _triple_quotes:
+                        if line[i:i + len(tq)] == tq:
+                            matched_tq = tq
+                            break
+                    if matched_tq:
+                        _current_triple_end = matched_tq
+                        state = _TRIPLE_STRING
+                        i += len(matched_tq)
+                        continue
+                # Template literals (JavaScript/TypeScript backtick)
+                if _has_template_strings and ch == '`':
+                    state = _TEMPLATE_LITERAL
                     i += 1
                     continue
-                if ch == "'":
+                # String delimiters
+                if ch in _string_delims:
+                    state = _STRING
+                    _current_string_delim = ch
+                    i += 1
+                    continue
+                # Char literal (only when ' is NOT a string delimiter)
+                if ch == "'" and "'" not in _string_delims:
                     state = _CHAR_LITERAL
                     i += 1
                     continue
@@ -120,22 +202,22 @@ def scan_brackets(
                 break
 
             elif state == _BLOCK_COMMENT:
-                if ch == "*" and next_ch == "/":
+                if _block_comment_close and line[i:i + len(_block_comment_close)] == _block_comment_close:
                     state = _CODE
-                    i += 2
+                    i += len(_block_comment_close)
                     continue
                 i += 1
 
             elif state == _STRING:
-                if ch == "\\":
+                if _escape_char and ch == _escape_char:
                     i += 2
                     continue
-                if ch == '"':
+                if ch == _current_string_delim:
                     state = _CODE
                 i += 1
 
             elif state == _CHAR_LITERAL:
-                if ch == "\\":
+                if _escape_char and ch == _escape_char:
                     i += 2
                     continue
                 if ch == "'":
@@ -143,7 +225,10 @@ def scan_brackets(
                 i += 1
 
             elif state == _RAW_STRING:
-                end_marker = ")" + raw_delim + '"'
+                if _raw_style == "rust":
+                    end_marker = raw_delim + '"'
+                else:
+                    end_marker = ")" + raw_delim + '"'
                 pos = line.find(end_marker, i)
                 if pos != -1:
                     state = _CODE
@@ -163,6 +248,23 @@ def scan_brackets(
                         continue
                 i += 1
 
+            elif state == _TRIPLE_STRING:
+                tq_end = _current_triple_end
+                pos = line.find(tq_end, i)
+                if pos != -1:
+                    state = _CODE
+                    i = pos + len(tq_end)
+                    continue
+                break  # multi-line triple string
+
+            elif state == _TEMPLATE_LITERAL:
+                if _escape_char and ch == _escape_char:
+                    i += 2
+                    continue
+                if ch == '`':
+                    state = _CODE
+                i += 1
+
         if state == _LINE_COMMENT:
             state = _CODE
 
@@ -171,6 +273,87 @@ def scan_brackets(
             open_line=open_line,
             close_line=last_line,
             depth=open_depth,
+            is_complete=False,
+        ))
+
+    return blocks
+
+
+def _scan_indent_blocks(content: str, lang: LanguageConfig) -> list[BracketBlock]:
+    """Scan indent-based source and return pseudo-brace blocks.
+
+    Detects block openings when indentation increases relative to the
+    previous significant line. Closes blocks on dedent. Tracks
+    triple-quoted strings to avoid false positives from colons inside
+    string literals.
+    """
+    lines = content.split("\n")
+    blocks: list[BracketBlock] = []
+    stack: list[tuple[int, int, int]] = []  # (open_line_1based, depth, indent_level)
+    depth = 0
+    in_triple_string = False
+    triple_end = ""
+    prev_indent = 0  # indent of previous significant line
+    prev_line_idx = 0  # 1-based line number of previous significant line
+
+    _line_comment = lang.line_comment
+    _triple_quotes = lang.triple_quote_strings
+
+    for line_idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+
+        # Track triple-quoted strings (they may contain colons)
+        if _triple_quotes and not in_triple_string:
+            for tq in _triple_quotes:
+                idx = stripped.find(tq)
+                if idx != -1:
+                    # Check if it closes on same line
+                    after = stripped[idx + len(tq):]
+                    if tq in after:
+                        continue  # opens and closes on same line
+                    in_triple_string = True
+                    triple_end = tq
+                    break
+            if in_triple_string:
+                continue
+
+        if in_triple_string:
+            if triple_end in line:
+                in_triple_string = False
+            continue
+
+        # Skip blank and comment-only lines for indent comparison
+        if not stripped or (_line_comment and stripped.startswith(_line_comment)):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        # Dedent: pop stack until matching indent
+        while stack and indent < stack[-1][2]:
+            open_line, block_depth, _ = stack.pop()
+            blocks.append(BracketBlock(
+                open_line=open_line,
+                close_line=line_idx - 1,
+                depth=block_depth,
+                is_complete=True,
+            ))
+            depth -= 1
+
+        # Indent increase: open a new block (open_line is previous significant line)
+        if indent > prev_indent and prev_line_idx > 0:
+            depth += 1
+            stack.append((prev_line_idx, depth, indent))
+
+        prev_indent = indent
+        prev_line_idx = line_idx
+
+    # Close remaining open blocks
+    total_lines = len(lines)
+    for open_line, block_depth, _ in stack:
+        blocks.append(BracketBlock(
+            open_line=open_line,
+            close_line=total_lines,
+            depth=block_depth,
             is_complete=False,
         ))
 

@@ -15,11 +15,10 @@ Refactored to accept LanguageConfig + FrameworkConfig instead of hardcoded const
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
-from .symbol_analyzer import SymbolDef, ExtraSymbol
 from .configs import FrameworkConfig, LanguageConfig
+from .symbol_analyzer import ExtraSymbol, SymbolDef
 
 
 @dataclass
@@ -27,7 +26,7 @@ class StrictEdge:
     source_qn: str
     target_qn: str
     edge_type: str  # inheritance, type_dependency, static_call, rpc_routing
-    language: str = "cpp"
+    language: str = ""
 
 
 def extract_edges(
@@ -43,7 +42,6 @@ def extract_edges(
     All regex patterns come from LanguageConfig and FrameworkConfig.
     """
     language = lang.name
-    scope_op = lang.scope_operator
     base_kw = lang.base_keyword
     type_re = lang.type_re
     static_call_re = lang.static_call_re
@@ -107,7 +105,9 @@ def extract_edges(
             line = lines[line_idx].strip()
 
             # Skip comments and preprocessor
-            if line.startswith("//") or line.startswith("/*") or line.startswith("#"):
+            if ((lang.line_comment and line.startswith(lang.line_comment)) or
+                (lang.block_comment_pair and line.startswith(lang.block_comment_pair[0])) or
+                (lang.preprocessor_prefix and line.startswith(lang.preprocessor_prefix))):
                 continue
             # Skip framework decoration macro lines
             if fw.decoration_macro_names and any(
@@ -115,7 +115,7 @@ def extract_edges(
             ):
                 continue
             # Skip string literals (rough check)
-            if line.startswith('"') or line.startswith('R"'):
+            if line.startswith('"') or (lang.raw_string_char and line.startswith(lang.raw_string_char + '"')):
                 continue
 
             # 3. Static calls: ClassName.Method( or ClassName::Method(
@@ -142,7 +142,7 @@ def extract_edges(
             if line_idx == start and param_type_re:
                 for m in param_type_re.finditer(line):
                     tname = m.group(1)
-                    if tname not in all_skip and len(tname) >= 3:
+                    if tname and tname not in all_skip and len(tname) >= 3:
                         _add(qn, tname, "type_dependency")
 
     # --- Pass 3: Type dependencies from class member variables ---
@@ -156,7 +156,9 @@ def extract_edges(
             line = lines[line_idx].strip()
             if not line:
                 continue
-            if line.startswith("//") or line.startswith("/*") or line.startswith("#"):
+            if ((lang.line_comment and line.startswith(lang.line_comment)) or
+                (lang.block_comment_pair and line.startswith(lang.block_comment_pair[0])) or
+                (lang.preprocessor_prefix and line.startswith(lang.preprocessor_prefix))):
                 continue
             if line in access_spec_names:
                 continue
@@ -169,13 +171,13 @@ def extract_edges(
             if type_re:
                 for m in type_re.finditer(line):
                     tname = m.group(1)
-                    if tname in all_skip:
+                    if not tname or tname in all_skip:
                         continue
                     if len(tname) < 3:
                         continue
                     pos = m.end()
                     rest = line[pos:].lstrip() if pos < len(line) else ""
-                    if rest and (rest[0] in "*&" or (rest[0].isalpha() or rest[0] == "_")):
+                    if rest and (rest[0] in lang.type_indicator_chars or (rest[0].isalpha() or rest[0] == "_")):
                         _add(qn, tname, "type_dependency")
 
     return edges

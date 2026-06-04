@@ -1,10 +1,10 @@
-"""Build the three-table index for UE source code.
+"""Build the three-table index for source code.
 
 Pipeline per file:
   1. Dispatch by file extension -> LanguageConfig
   2. Read file content -> upsert into file_content (FTS5)
   3. bracket_scanner -> bracket blocks
-  4. symbol_analyzer -> SymbolDef[] with QN normalization + UE metadata
+  4. symbol_analyzer -> SymbolDef[] with QN normalization + decoration metadata
   5. edge_extractor -> StrictEdge[] (4 types only)
   6. Write symbol_index + strict_edges
 
@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import sys
 import time
 from pathlib import Path
 
-from .configs import LanguageConfig, FrameworkConfig, ProjectConfig, make_cpp_language, make_csharp_language
+from .configs import FrameworkConfig, LanguageConfig, ProjectConfig, get_language
 from .unreal_rules import make_unreal_framework
 
 EXCLUDE_PARTS = {".git", ".vs", "Binaries", "Build", "DerivedDataCache", "Intermediate", "Saved", "ThirdParty"}
@@ -31,7 +30,12 @@ _INVALID_MODULE_NAMES = frozenset({
 })
 
 
-def iter_source_files(root: Path, extensions: set[str], exclude_parts: frozenset[str], limit: int | None = None) -> list[Path]:
+def iter_source_files(
+    root: Path,
+    extensions: set[str],
+    exclude_parts: frozenset[str],
+    limit: int | None = None,
+) -> list[Path]:
     files: list[Path] = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in extensions:
@@ -81,16 +85,11 @@ def _get_configs(
         fw_unreal = None
     fw_generic = make_generic_framework()
 
-    # Build languages
+    # Build languages (registry-based)
     lang_names = set(project.extension_to_language.values())
     langs: dict[str, LanguageConfig] = {}
     for ln in lang_names:
-        if ln == "cpp":
-            langs[ln] = make_cpp_language()
-        elif ln == "csharp":
-            langs[ln] = make_csharp_language()
-        else:
-            raise ValueError(f"Unknown language: {ln}")
+        langs[ln] = get_language(ln)
 
     # Map extension -> (lang, fw)
     # C# files always use generic framework even in Unreal projects,
@@ -113,8 +112,8 @@ def _process_file(
     fw: FrameworkConfig,
 ) -> tuple[list, list, list]:
     """Process a single file: extract symbols + edges."""
-    from .symbol_analyzer import analyze_file
     from .edge_extractor import extract_edges
+    from .symbol_analyzer import analyze_file
 
     symbols, extras = analyze_file(lines, file_id, lang, fw)
     edges = extract_edges(symbols, extras, lines, fw, lang)
@@ -128,13 +127,12 @@ def build_index(
     limit: int | None = None,
     project: ProjectConfig | None = None,
 ) -> int:
-    from .db import connect, initialize_schema, upsert_file, insert_symbols, insert_extra_symbols, insert_edges, commit
+    from .db import commit, connect, initialize_schema, insert_edges, insert_extra_symbols, insert_symbols, upsert_file
 
     if project is None:
-        # Default to Unreal project config
-        from .configs import make_unreal_project
-        fw = make_unreal_framework()
-        project = make_unreal_project(framework=fw)
+        # Default to generic project config
+        from .configs import make_generic_project
+        project = make_generic_project()
 
     conn = connect(db_path)
     initialize_schema(conn)
@@ -157,7 +155,7 @@ def build_index(
     edge_count = 0
     batch_size = 200
 
-    for i, path in enumerate(files):
+    for _, path in enumerate(files):
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -173,7 +171,7 @@ def build_index(
         # Dispatch by file extension
         ext = path.suffix.lower()
         from .configs import make_generic_framework
-        lang, fw_for_file = ext_configs.get(ext, (make_cpp_language(), make_generic_framework()))
+        lang, fw_for_file = ext_configs.get(ext, (get_language("cpp"), make_generic_framework()))
 
         sym_rows, extra_rows, edge_rows = _process_file(file_id, content, lines, lang, fw_for_file)
 
@@ -237,23 +235,23 @@ def build_index(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build SQLite index for UE source code (three-table architecture)."
+        description="Build SQLite index for source code (three-table architecture)."
     )
     parser.add_argument("root", type=Path, help="Source root directory")
     parser.add_argument("db", type=Path, help="SQLite database path")
     parser.add_argument("--limit", type=int, default=None, help="File limit for testing")
     parser.add_argument(
-        "--source-marker", default="Source",
-        help="Path component marking source root (default: Source)"
+        "--source-marker", default="",
+        help="Path component marking source root (default: auto-detect)"
     )
     parser.add_argument(
         "--categories", default="",
         help="Comma-separated category dirs to skip after source marker"
     )
     parser.add_argument(
-        "--framework", default="unreal",
+        "--framework", default="generic",
         choices=["unreal", "generic"],
-        help="Framework rules to apply (default: unreal)"
+        help="Framework rules to apply (default: generic)"
     )
     args = parser.parse_args()
 
@@ -261,20 +259,21 @@ def main() -> None:
 
     if args.framework == "unreal":
         fw = make_unreal_framework()
+        from .configs import make_unreal_project
+        base_project = make_unreal_project(framework=fw)
+        source_marker = args.source_marker or "Source"
     else:
-        from .configs import make_generic_framework
+        from .configs import make_generic_framework, make_generic_project
         fw = make_generic_framework()
+        base_project = make_generic_project()
+        source_marker = args.source_marker
 
-    from .configs import make_unreal_project
-    project = make_unreal_project(
-        framework=fw,
-    )
     project = ProjectConfig(
-        extension_to_language=project.extension_to_language,
-        exclude_parts=project.exclude_parts,
-        source_marker=args.source_marker,
+        extension_to_language=base_project.extension_to_language,
+        exclude_parts=base_project.exclude_parts,
+        source_marker=source_marker,
         categories=frozenset(cats) if cats else frozenset(),
-        invalid_module_names=project.invalid_module_names,
+        invalid_module_names=base_project.invalid_module_names,
         framework_name=fw.name,
     )
 
