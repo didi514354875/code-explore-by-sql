@@ -31,12 +31,6 @@ def _resolve_lang_fw(language: str) -> tuple[Any, Any]:
     return lang, make_generic_framework()
 
 
-def _get_lang_for(language: str) -> Any:
-    """Resolve a language name string to a LanguageConfig instance."""
-    lang, _ = _resolve_lang_fw(language)
-    return lang
-
-
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,17 +238,15 @@ def _signal_hits(text: str, expand_item: list[str]) -> list[str]:
 def read_symbol(
     conn: sqlite3.Connection,
     qualified_name: str,
+    view: str = "full",
     expand_item: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Look up symbols by qualified_name. Supports exact and fuzzy matching.
-
-    Returns list of dicts with symbol metadata + source code + edges.
-    """
+    """Look up symbols by qualified_name. Returns minimal identity + code."""
     expand_item = _normalize_expand_item(expand_item)
 
     # 1. Exact match
     rows = conn.execute(
-        """SELECT si.*, fc.file_path, fc.module_name, fc.content
+        """SELECT si.*, fc.file_path, fc.content
            FROM symbol_index si
            JOIN file_content fc ON fc.file_id = si.file_id
            WHERE si.qualified_name = ?
@@ -262,8 +254,7 @@ def read_symbol(
         (qualified_name,),
     ).fetchall()
 
-    # 2. Type prefix resolution: Actor -> AActor, UActor, FActor...
-    #    Try if no exact results, or if exact results are only namespace/weak matches
+    # 2. Type prefix resolution
     _weak_types = frozenset({"namespace", "macro_def"})
     need_prefix = not rows or all(r["block_type"] in _weak_types for r in rows)
     if need_prefix:
@@ -275,7 +266,7 @@ def read_symbol(
             if fw_resolve.resolve_type_prefixes:
                 for candidate in fw_resolve.resolve_type_prefixes(qualified_name):
                     prefix_rows = conn.execute(
-                        """SELECT si.*, fc.file_path, fc.module_name, fc.content
+                        """SELECT si.*, fc.file_path, fc.content
                            FROM symbol_index si
                            JOIN file_content fc ON fc.file_id = si.file_id
                            WHERE si.qualified_name = ?
@@ -288,10 +279,10 @@ def read_symbol(
             if rows:
                 break
 
-    # 3. Partial match: contains the name (e.g., "Jump" matches "ACharacter::Jump")
+    # 3. Partial match
     if not rows:
         rows = conn.execute(
-            """SELECT si.*, fc.file_path, fc.module_name, fc.content
+            """SELECT si.*, fc.file_path, fc.content
                FROM symbol_index si
                JOIN file_content fc ON fc.file_id = si.file_id
                WHERE si.qualified_name LIKE ?
@@ -306,105 +297,47 @@ def read_symbol(
     for r in rows:
         start = r["start_line"]
         end = r["end_line"]
-        content = r["content"]
-        lines = content.split("\n")
+        lines = r["content"].split("\n")
+        code = "\n".join(lines[start - 1 : end])
 
-        # Extract the code slice
-        code_lines = lines[start - 1 : end]
-        code = "\n".join(code_lines)
-
-        # Get edges for this symbol
         qn = r["qualified_name"]
-        edges = conn.execute(
-            """SELECT target_qn, edge_type FROM strict_edges
-               WHERE source_qn = ?
-               ORDER BY edge_type, target_qn""",
-            (qn,),
-        ).fetchall()
 
-        # Get reverse edges (who points to this symbol)
-        reverse_edges = conn.execute(
-            """SELECT source_qn, edge_type FROM strict_edges
-               WHERE target_qn = ?
-               ORDER BY edge_type, source_qn""",
-            (qn,),
-        ).fetchall()
-
-        decoration_meta = json.loads(r["decoration_meta"]) if r["decoration_meta"] else None
-
-        signal_text = "\n".join(
-            [
-                qn,
-                r["file_path"] or "",
-                r["module_name"] or "",
-                r["signature"] or "",
-                r["parent_class"] or "",
-                r["inheritance_base"] or "",
-                json.dumps(decoration_meta) if decoration_meta else "",
-                " ".join(e["target_qn"] for e in edges),
-                " ".join(e["source_qn"] for e in reverse_edges),
-                code,
-            ]
-        )
+        # Signal text for ranking only
+        signal_text = "\n".join([qn, r["file_path"] or "", r["signature"] or "", code])
         expand_item_hits = _signal_hits(signal_text, expand_item)
 
         results.append({
-            "qualified_name": qn,
-            "block_type": r["block_type"],
-            "file_path": r["file_path"],
-            "module_name": r["module_name"],
-            "language": r["language"],
-            "start_line": start,
-            "end_line": end,
-            "code": code,
-            "decoration_meta": decoration_meta,
-            "signature": r["signature"],
-            "parent_class": r["parent_class"],
-            "inheritance_base": r["inheritance_base"],
-            "edges": [{"target": e["target_qn"], "type": e["edge_type"]} for e in edges],
-            "reverse_edges": [{"source": e["source_qn"], "type": e["edge_type"]} for e in reverse_edges],
-            "expand_item_hits": expand_item_hits,
+            "qn": qn,
+            "type": r["block_type"],
+            "file": r["file_path"],
+            "range": [start, end],
+            "_code_raw": code,
+            "_expand_item_hits": expand_item_hits,
+            "_language": r["language"],
+            "_block_type_raw": r["block_type"],
         })
 
     if expand_item:
-        results.sort(key=lambda item: len(item.get("expand_item_hits", [])), reverse=True)
+        results.sort(key=lambda item: len(item.get("_expand_item_hits", [])), reverse=True)
+
+    # Apply view to best match only, strip internals
+    for i, item in enumerate(results):
+        if i == 0 and view != "meta":
+            lang, fw = _resolve_lang_fw(item["_language"])
+            item["code"] = _apply_view(
+                item["_code_raw"], view,
+                block_type=item["_block_type_raw"],
+                qualified_name=item["qn"],
+                lang=lang, fw=fw,
+                max_lines=80 if view == "signature" else 0,
+            )
+        # Strip internal fields
+        item.pop("_code_raw", None)
+        item.pop("_expand_item_hits", None)
+        item.pop("_language", None)
+        item.pop("_block_type_raw", None)
 
     return results
-
-
-# Edge priority: lower = more important; only top 5 are shown
-_EDGE_PRIORITY = {
-    "rpc_routing": 0,
-    "inheritance": 1,
-    "static_call": 2,
-    "type_dependency": 3,
-}
-_MAX_EDGES = 5
-
-
-def _format_edges(edges: list[dict[str, str]]) -> str:
-    sorted_edges = sorted(edges, key=lambda e: _EDGE_PRIORITY.get(e["type"], 99))
-    shown = []
-    for e in sorted_edges[:_MAX_EDGES]:
-        etype = e["type"]
-        target = e["target"]
-        label = {"rpc_routing": "RPC", "inheritance": "Base", "static_call": "Call"}.get(etype, "Dep")
-        shown.append(f"{label}:{target}")
-    result = f"[Rel] {' | '.join(shown)}"
-    if len(edges) > _MAX_EDGES:
-        result += f"\n[Rel] ...+{len(edges) - _MAX_EDGES} more"
-    return result
-
-
-def _format_meta_display(meta: dict | None, fw: Any) -> list[str]:
-    """Format decoration metadata into display parts for [Meta] line."""
-    if not meta:
-        return []
-    # Use framework callback if available
-    if fw.format_meta_display is not None:
-        return fw.format_meta_display(meta)
-    # Generic fallback: format without framework-specific routing info
-    return [f"{macro}({','.join(params)})" for macro, params in meta.items()]
 
 
 def _apply_view(
@@ -416,6 +349,7 @@ def _apply_view(
     child_symbols: list[dict] | None = None,
     lang: Any | None = None,
     fw: Any | None = None,
+    max_lines: int = 0,
 ) -> str:
     from .code_block_summary import apply_view
     return apply_view(
@@ -425,51 +359,38 @@ def _apply_view(
         child_symbols=child_symbols,
         lang=lang,
         fw=fw,
+        max_lines=max_lines,
     )
-
-
-def format_symbol_response(entry: dict[str, Any], view: str = "full") -> str:
-    """Format a symbol entry with [System Hint] header per plan.md."""
-    lang, fw = _resolve_lang_fw(entry.get("language", "cpp"))
-    lines = []
-    lines.append(f"[Hint] {entry['qualified_name']} | {entry['file_path']}")
-
-    # Decoration Metadata (compact, single line)
-    meta_parts = _format_meta_display(entry.get("decoration_meta"), fw)
-    if meta_parts:
-        lines.append(f"[Meta] {' '.join(meta_parts)}")
-
-    # Signal enrichment metadata (compact)
-    expand_item_hits = entry.get("expand_item_hits") or []
-    if expand_item_hits:
-        lines.append(f"[Signal] matched: {', '.join(expand_item_hits)}")
-
-    # Static Relations — prioritized, limited to top 5
-    edges = entry.get("edges", [])
-    if edges:
-        lines.append(_format_edges(edges))
-
-    # Inheritance base (fallback if not in edges)
-    base = entry.get("inheritance_base")
-    if base and not any(e["type"] == "inheritance" for e in edges if e["target"] == base):
-        lines.append(f"[Rel] Base:{base}")
-
-    if view == "meta":
-        return "\n".join(lines)
-
-    code = _apply_view(
-        entry["code"], view,
-        block_type=entry.get("block_type"),
-        qualified_name=entry.get("qualified_name"),
-        lang=lang,
-        fw=fw,
-    )
-    lines.append("---")
-    lines.append(code)
-    return "\n".join(lines)
 
 
 # ── Search_FTS query ─────────────────────────────────────────────────
+
+def _fts_ranked(
+    conn: sqlite3.Connection,
+    fts_query: str,
+    path_filter: str,
+    expand_item: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Execute FTS5 ranked query, return list of {fts_rowid, rank}."""
+    if path_filter:
+        fetch_limit = limit * (8 if expand_item else 5)
+        return [dict(r) for r in conn.execute(
+            "SELECT file_content_fts.rowid AS fts_rowid, bm25(file_content_fts) AS rank "
+            "FROM file_content_fts "
+            "JOIN file_content fc ON fc.file_id = file_content_fts.rowid "
+            "WHERE file_content_fts MATCH ? AND (fc.module_name = ? OR fc.file_path LIKE ? || '%') "
+            "ORDER BY rank LIMIT ?",
+            (fts_query, path_filter, path_filter + "/", fetch_limit),
+        ).fetchall()]
+    return [dict(r) for r in conn.execute(
+        "SELECT file_content_fts.rowid AS fts_rowid, bm25(file_content_fts) AS rank "
+        "FROM file_content_fts "
+        "WHERE file_content_fts MATCH ? "
+        "ORDER BY rank LIMIT ?",
+        (fts_query, limit * (6 if expand_item else 3)),
+    ).fetchall()]
+
 
 def _fts5_escape(query: str) -> str:
     import re
@@ -485,40 +406,41 @@ def _fts5_escape(query: str) -> str:
 
 def search_fts(
     conn: sqlite3.Connection,
-    keyword: str,
+    keyword: str = "",
     path_filter: str = "",
     expand_item: list[str] | None = None,
+    raw_query: str = "",
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """FTS5 search returning grep-style results (hit line + 2 lines context)."""
-    fts_query = _fts5_escape(keyword)
+    """FTS5 search returning located code blocks with preview.
+
+    Query modes (mutually exclusive — use one):
+      - keyword: auto-escaped AND of tokens. Simple, safe.
+      - raw_query: passed directly to FTS5 MATCH. Supports column filters,
+        OR, NOT, and all FTS5 syntax.
+
+    FTS5 columns: file_path, module_name, content (all trigram).
+    All terms must be ≥3 characters.
+    """
+    if raw_query:
+        fts_query = raw_query
+    elif keyword:
+        fts_query = _fts5_escape(keyword)
+    else:
+        return []
     expand_item = _normalize_expand_item(expand_item)
 
-    # Get matching file IDs
-    if path_filter:
-        # Apply module/path filter — match module_name exactly OR file_path prefix
-        fetch_limit = limit * (8 if expand_item else 5)
-        ranked = [dict(r) for r in conn.execute(
-            "SELECT file_content_fts.rowid AS fts_rowid, bm25(file_content_fts) AS rank "
-            "FROM file_content_fts "
-            "JOIN file_content fc ON fc.file_id = file_content_fts.rowid "
-            "WHERE file_content_fts MATCH ? AND (fc.module_name = ? OR fc.file_path LIKE ? || '%') "
-            "ORDER BY rank LIMIT ?",
-            (fts_query, path_filter, path_filter + "/", fetch_limit),
-        ).fetchall()]
-    else:
-        ranked = [dict(r) for r in conn.execute(
-            "SELECT file_content_fts.rowid AS fts_rowid, bm25(file_content_fts) AS rank "
-            "FROM file_content_fts "
-            "WHERE file_content_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (fts_query, limit * (6 if expand_item else 3)),
-        ).fetchall()]
+    # Execute FTS query — catch malformed raw_query
+    try:
+        ranked = _fts_ranked(conn, fts_query, path_filter, expand_item, limit)
+    except Exception:
+        return []
+    if not ranked:
+        return []
 
     if not ranked:
         return []
 
-    # For each matching file, find the hit lines and extract context
     results = []
     keyword_lower = keyword.lower()
     words = keyword_lower.split()
@@ -541,38 +463,26 @@ def search_fts(
                 hit_lines.append(i + 1)  # 1-based
 
         for hit_line in hit_lines[:5]:  # Max 5 hits per file
-            # Extract context: 2 lines before + hit + 2 lines after
-            ctx_start = max(0, hit_line - 3)  # 0-based, 2 lines before
-            ctx_end = min(len(lines), hit_line + 2)  # 0-based, 2 lines after
-            context_lines = lines[ctx_start : ctx_end]
-
-            # Find enclosing symbol for block metadata
             block_info = _find_enclosing_symbol(conn, file_id, hit_line)
 
             result = {
-                "file_path": row["file_path"],
-                "module_name": row["module_name"],
-                "hit_line": hit_line,
-                "context": "\n".join(context_lines),
+                "file": row["file_path"],
+                "line": hit_line,
             }
             if block_info:
+                result["block"] = block_info["qualified_name"]
                 result["block_type"] = block_info["block_type"]
-                result["block_name"] = block_info["qualified_name"]
-                result["block_range"] = f"{block_info['start_line']}-{block_info['end_line']}"
 
             if expand_item:
-                signal_text = "\n".join(
-                    [
-                        row["file_path"] or "",
-                        row["module_name"] or "",
-                        result.get("block_name", ""),
-                        result["context"],
-                        row["content"],
-                    ]
-                )
+                signal_text = "\n".join([
+                    row["file_path"] or "",
+                    row["module_name"] or "",
+                    result.get("block", ""),
+                    row["content"],
+                ])
                 hits = _signal_hits(signal_text, expand_item)
                 if hits:
-                    result["expand_item_hits"] = hits
+                    result["_expand_item_hits"] = hits  # internal ranking only
 
             results.append(result)
 
@@ -580,7 +490,11 @@ def search_fts(
             break
 
     if expand_item:
-        results.sort(key=lambda item: len(item.get("expand_item_hits", [])), reverse=True)
+        results.sort(key=lambda item: len(item.get("_expand_item_hits", [])), reverse=True)
+
+    # Strip internal ranking field before returning
+    for item in results:
+        item.pop("_expand_item_hits", None)
 
     return results[:limit]
 
@@ -598,6 +512,15 @@ def _find_enclosing_symbol(
         (file_id, line, line),
     ).fetchone()
     return dict(row) if row else None
+
+
+def _get_language_for_symbol(conn: sqlite3.Connection, file_id: int, line: int) -> str:
+    """Get language string for a symbol at a given position, defaulting to 'cpp'."""
+    row = conn.execute(
+        "SELECT language FROM symbol_index WHERE file_id = ? AND start_line <= ? AND end_line >= ? LIMIT 1",
+        (file_id, line, line),
+    ).fetchone()
+    return row["language"] if row else "cpp"
 
 
 # ── Directory structure ──────────────────────────────────────────────
@@ -637,23 +560,6 @@ def _find_intersecting_symbols(
     return [dict(r) for r in rows]
 
 
-def _collect_edges_for_symbols(
-    conn: sqlite3.Connection, qualified_names: list[str],
-) -> list[dict[str, str]]:
-    seen: set[tuple[str, str]] = set()
-    edges: list[dict[str, str]] = []
-    for qn in qualified_names:
-        for e in conn.execute(
-            "SELECT target_qn, edge_type FROM strict_edges WHERE source_qn = ? ORDER BY edge_type, target_qn",
-            (qn,),
-        ).fetchall():
-            key = (e["target_qn"], e["edge_type"])
-            if key not in seen:
-                seen.add(key)
-                edges.append({"target": e["target_qn"], "type": e["edge_type"]})
-    return edges
-
-
 def read_file_range(
     conn: sqlite3.Connection,
     file_path: str,
@@ -663,7 +569,7 @@ def read_file_range(
     expand_item: list[str] | None = None,
 ) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT file_id, module_name, content FROM file_content WHERE file_path = ?",
+        "SELECT file_id, content FROM file_content WHERE file_path = ?",
         (file_path,),
     ).fetchone()
     if not row:
@@ -673,105 +579,34 @@ def read_file_range(
     code = "\n".join(lines[start_line - 1 : end_line])
 
     file_id = row["file_id"]
-    symbols = _find_intersecting_symbols(conn, file_id, start_line, end_line)
+    symbols_full = _find_intersecting_symbols(conn, file_id, start_line, end_line)
 
-    all_edges: list[dict[str, str]] = []
-    decoration_meta_all: dict[str, list[str]] = {}
-    for sym in symbols:
-        qn = sym["qualified_name"]
-        sym_edges = _collect_edges_for_symbols(conn, [qn])
-        all_edges.extend(sym_edges)
-        if sym["decoration_meta"]:
-            decoration_meta_all.update(json.loads(sym["decoration_meta"]))
+    # Apply view to code
+    if view != "meta":
+        file_language = symbols_full[0].get("language", "cpp") if symbols_full else "cpp"
+        lang, fw = _resolve_lang_fw(file_language)
+        single_block_type = symbols_full[0]["block_type"] if len(symbols_full) == 1 else None
+        code = _apply_view(
+            code, view,
+            block_type=single_block_type,
+            qualified_name=symbols_full[0]["qualified_name"] if len(symbols_full) == 1 else None,
+            child_symbols=symbols_full if len(symbols_full) > 1 else None,
+            lang=lang, fw=fw,
+            max_lines=80 if view == "signature" else 0,
+        )
 
-    # Deduplicate edges
-    seen: set[tuple[str, str]] = set()
-    deduped: list[dict[str, str]] = []
-    for e in all_edges:
-        key = (e["target"], e["type"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(e)
+    # Simplified symbols for output
+    symbols_out = [
+        {"qn": s["qualified_name"], "type": s["block_type"], "range": [s["start_line"], s["end_line"]]}
+        for s in symbols_full
+    ]
 
-    # Signal enrichment
-    expand_item = _normalize_expand_item(expand_item)
-    signal_text = "\n".join([
-        file_path,
-        row["module_name"] or "",
-        " ".join(s["qualified_name"] for s in symbols),
-        " ".join(e["target"] for e in deduped),
-        code,
-    ])
-    expand_item_hits = _signal_hits(signal_text, expand_item)
-
-    return {
-        "file_path": file_path,
-        "module_name": row["module_name"],
-        "start_line": start_line,
-        "end_line": end_line,
-        "code": code,
-        "symbols": symbols,
-        "edges": deduped,
-        "decoration_meta": decoration_meta_all or None,
-        "expand_item_hits": expand_item_hits,
+    result: dict[str, Any] = {
+        "file": file_path,
+        "range": [start_line, end_line],
     }
-
-
-def format_file_range_response(entry: dict[str, Any], view: str = "full") -> str:
-    lines: list[str] = []
-    lines.append(f"[Hint] {entry['file_path']}:{entry['start_line']}-{entry['end_line']}")
-
-    # Determine language from symbols (use first symbol's language)
-    symbols = entry.get("symbols", [])
-    file_language = symbols[0].get("language", "cpp") if symbols else "cpp"
-    lang, fw = _resolve_lang_fw(file_language)
-
-    # Module
-    if entry.get("module_name"):
-        lines.append(f"[Module] {entry['module_name']}")
-
-    # Symbols covered by this range
-    if symbols:
-        sym_strs = []
-        for s in symbols[:8]:
-            sym_strs.append(f"{s['qualified_name']} ({s['block_type']}) {s['start_line']}-{s['end_line']}")
-        lines.append(f"[Symbol] {' | '.join(sym_strs)}")
-        if len(symbols) > 8:
-            lines.append(f"[Symbol] ...+{len(symbols) - 8} more")
-
-    # Decoration Metadata
-    meta_parts = _format_meta_display(entry.get("decoration_meta"), fw)
-    if meta_parts:
-        lines.append(f"[Meta] {' '.join(meta_parts)}")
-
-    # Signal enrichment
-    expand_item_hits = entry.get("expand_item_hits") or []
-    if expand_item_hits:
-        lines.append(f"[Signal] matched: {', '.join(expand_item_hits)}")
-
-    # Edges (merged from all symbols, up to 10)
-    edges = entry.get("edges", [])
-    if edges:
-        sorted_edges = sorted(edges, key=lambda e: _EDGE_PRIORITY.get(e["type"], 99))[:10]
-        shown = []
-        for e in sorted_edges:
-            label = {"rpc_routing": "RPC", "inheritance": "Base", "static_call": "Call"}.get(e["type"], "Dep")
-            shown.append(f"{label}:{e['target']}")
-        lines.append(f"[Rel] {' | '.join(shown)}")
-        if len(edges) > 10:
-            lines.append(f"[Rel] ...+{len(edges) - 10} more")
-
-    if view == "meta":
-        return "\n".join(lines)
-
-    single_block_type = symbols[0]["block_type"] if len(symbols) == 1 else None
-    code = _apply_view(
-        entry["code"], view,
-        block_type=single_block_type,
-        child_symbols=symbols if len(symbols) > 1 else None,
-        lang=lang,
-        fw=fw,
-    )
-    lines.append("---")
-    lines.append(code)
-    return "\n".join(lines)
+    if symbols_out:
+        result["symbols"] = symbols_out
+    if view != "meta":
+        result["code"] = code
+    return result

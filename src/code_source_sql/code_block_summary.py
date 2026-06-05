@@ -44,6 +44,16 @@ _MACRO_TYPES = frozenset({"macro_def"})
 _DECL_TYPES = frozenset({"enum", "delegate_def"})
 
 
+_MAX_TRUNCATE_SUFFIX = "// ... truncated, {total} lines total"
+
+
+def _truncate_lines(lines: list[str], max_lines: int) -> list[str]:
+    """Truncate result lines to max_lines, appending truncation notice if needed."""
+    if max_lines <= 0 or len(lines) <= max_lines:
+        return lines
+    return lines[: max_lines - 1] + [_MAX_TRUNCATE_SUFFIX.format(total=len(lines))]
+
+
 def apply_view(
     code: str,
     view: str,
@@ -53,6 +63,7 @@ def apply_view(
     child_symbols: list[dict[str, Any]] | None = None,
     lang: LanguageConfig | None = None,
     fw: FrameworkConfig | None = None,
+    max_lines: int = 0,
 ) -> str:
     if view == "full":
         return code
@@ -75,13 +86,19 @@ def apply_view(
     strategy = _pick_strategy(block_type, code, lang)
 
     if strategy == "class":
-        return summarize_class_block(code, child_symbols=child_symbols, lang=lang, fw=fw)
-    if strategy == "function":
-        return summarize_function_body(code, lang=lang)
-    if strategy == "macro":
-        return summarize_macro_block(code, lang=lang, fw=fw)
+        result = summarize_class_block(code, child_symbols=child_symbols, lang=lang, fw=fw)
+    elif strategy == "function":
+        result = summarize_function_body(code, lang=lang)
+    elif strategy == "macro":
+        result = summarize_macro_block(code, lang=lang, fw=fw)
+    else:
+        return code
 
-    return code
+    if max_lines > 0:
+        result_lines = result.split("\n")
+        result_lines = _truncate_lines(result_lines, max_lines)
+        return "\n".join(result_lines)
+    return result
 
 
 def _pick_strategy(block_type: str | None, code: str, lang: LanguageConfig) -> str:
