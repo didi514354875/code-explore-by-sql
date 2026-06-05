@@ -1,6 +1,6 @@
 ---
 name: code-source-sql-search
-description: "Use when: source code lookup with code-source-sql MCP tools, qualified-symbol lookup, Search_FTS grep-style discovery, Read_Symbol navigation, Read_File_Range location-based reading, macro/delegate/routing inspection, or directory/module lookup."
+description: "Use when: source code lookup with code-source-sql MCP tools, qualified-symbol lookup, search_fts_tool grep-style discovery, read_symbol navigation, read_file_range location-based reading, macro/delegate/routing inspection, or directory/module lookup."
 argument-hint: "Describe the symbol, qualified name, macro, binding, subsystem, or behavior to locate."
 user-invocable: true
 disable-model-invocation: false
@@ -8,202 +8,76 @@ disable-model-invocation: false
 
 # Code Source SQL Search
 
-Use the **`code-source-sql` MCP tools** for source code lookup. This skill follows the semantic retrieval design in `src/code-source-sql/plan.md`: keep the tool surface minimal, retrieve only deterministic anchors, and let the agent reason over qualified names and bounded context.
+Use the **`code-source-sql` MCP tools** for source code lookup.
 
 ## Tool surface
 
-### `Read_Symbol(qualified_name, view="full", expand_item=None)`
+### `search_fts_tool(keyword="", path_filter="", expand_item=None, raw_query="")`
 
-Precise symbol lookup by qualified name. Primary tool when a qualified name is known or can be inferred.
+**Locate** — find code blocks, return file location and enclosing symbol.
 
-Semantics:
-- Looks up `qualified_name` in `Symbol_Index`.
-- Returns bounded source code with `[System Hint]` header (edges, metadata, action guide).
-- May list alternative definitions when multiple matches exist.
+Two query modes (mutually exclusive — use one):
 
-Use for:
-- `ClassName::MethodName` implementations.
-- Class, enum, delegate, macro, or method definitions.
-- Framework routing targets (e.g., generated `_Implementation` variants).
-- Type-dependency guided follow-up lookups.
+| Mode | Param | When | Example |
+|------|-------|------|---------|
+| Simple | `keyword` | Quick search, one or two tokens | `"AddDynamic"` |
+| Advanced | `raw_query` | Column filter, OR/NOT, file narrowing | `'(file_path : "Character.h") AND "BeginPlay"'` |
 
-Rules:
-- Prefer qualified names such as `Namespace::Class::Method`, `ClassName::MethodName`, `EnumName::Value`.
-- If only a short name is known, use `Search_FTS` first to locate the owner, then call `Read_Symbol` with the qualified name.
-- Read the `[System Hint]` before deciding the next lookup.
-- Follow explicit static relations from the hint: inheritance, type dependencies, static calls, routing metadata.
+- `keyword`: auto-escaped AND of tokens. Safe, no syntax errors.
+- `raw_query`: full FTS5 MATCH expression. Agent controls the query.
 
-### `Search_FTS(keyword, path_filter="", expand_item=None)`
+Each result: `file`, `line`.
+If enclosing block found: `block` (QN), `block_type`.
+No code — use `read_symbol` or `read_file_range` to fetch code.
+No results → `[]`. Malformed raw_query → `[]` (no crash).
 
-Grep-style full-text search. The **anchor** tool — discovers file, line, owner, and module when no qualified name is available.
+**FTS5 raw_query syntax:**
 
-Semantics:
-- Searches indexed file content with FTS5.
-- Returns matching lines with small context.
-- `path_filter` narrows results by module/path-like ownership.
+```
+Columns: file_path, module_name, content (all trigram, ≥3 chars per term)
 
-Use for:
-- Event/callback glue: delegate bindings, callback registrations, event dispatch.
-- Framework macro discovery: class/function declarations, code-gen markers.
-- Locating the owner of an unqualified function name.
-- Finding cross-file glue that is not a precise symbol definition.
+Operators:
+  AND  →  '"AddDynamic" AND "UObject"'
+  OR   →  '"AActor" OR "APawn"'
+  NOT  →  '"Update" NOT "Component"'
+  Column filter →  '(file_path : "Character.h") AND "BeginPlay"'
 
-Rules:
-- Search concrete code tokens, not natural-language phrases.
-- Use `path_filter` when results are broad.
-- Do not blindly search common method names; first infer the receiver type from nearby context.
-
-### `Read_File_Range(file_path, start_line, end_line, view="full", expand_item=None)`
-
-Read source code by file path and line range, with `[System Hint]` metadata. The **fallback reader** when `Read_Symbol` cannot resolve the correct definition.
-
-Semantics:
-- Reads raw source from `file_content` at the given line range.
-- Queries `symbol_index` for all symbols intersecting that range.
-- Collects edges and metadata for those symbols.
-- Returns code with the same `[System Hint]` format as `Read_Symbol`.
-
-Use for:
-- `Read_Symbol` returned the wrong definition (e.g., .cpp implementation instead of .h declaration).
-- Need to read a specific code region that `Search_FTS` located but `Read_Symbol` cannot target.
-- Browsing part of a large class or struct without reading the whole symbol.
-- Reading code outside any symbol boundary (e.g., #include blocks, forward declarations).
+Examples:
+  '("Server" OR "Client") AND "EquipWeapon"'           # RPC discovery
+  '(file_path : "Shader.h") AND "FShaderType"'         # Pin to known file
+  '(module_name : "Renderer") AND "VirtualTexture"'    # Module-scoped
+  '"AddDynamic" NOT "Test"'                            # Exclude test files
+```
 
 Rules:
-- Use `file_path` as returned by `Search_FTS` results (the `file_path` field).
-- Line numbers are 1-based and inclusive on both ends.
-- Prefer `Read_Symbol` when a qualified name is known — `Read_File_Range` is the fallback, not the default.
-- Use `view="signature"` for large ranges (>100 lines) to avoid token explosion.
+- Search concrete code tokens, not natural language
+- `path_filter` narrows by module_name (simple mode only). For file_path filtering, use `raw_query` column filter instead.
+
+### `read_symbol(qualified_name, view="full", expand_item=None)`
+
+**Read by name** — get full code. **Only use after `search_fts_tool` provides a block QN.**
+
+- Exact or fuzzy match (`Jump` matches `ACharacter::Jump`)
+- Returns `{qn, type, file, range, code?}`
+  - `view="full"`: complete code
+  - `view="signature"`: signature summary (≤80 lines)
+  - `view="meta"`: identity only, no code
+- Multiple matches: `alt` list (max 4, no code)
+- Not found → `{error: "not_found", query, fts?}`
+
+### `read_file_range(file_path, start_line, end_line, view="full", expand_item=None)`
+
+**Read by position** — get code. **Only use after `search_fts_tool` provides file+line.**
+
+- Returns `{file, range, code?, symbols?}`
+- `symbols` lists all symbols in range as `{qn, type, range}`
+- Not found → `{error: "not_found", file}`
 
 ### `get_directory_structure()`
 
-Directory/module summary for choosing `path_filter` values.
+Module overview. Returns `{total_files, total_modules, modules: [{module_name, file_count}]}`.
 
-**MANDATORY — must call before any `Search_FTS` with `path_filter`.**
-
-`path_filter` matches against the actual `module_name` values stored in the database (derived from directory structure at index time). Guessing a module name from framework knowledge will silently drop all results. The only safe sources are:
-
-1. A value returned by `get_directory_structure()` (call it directly, or read `ref/directory-structure.md`).
-2. A `module_name` field from a previous tool result (e.g., a `Search_FTS` hit, a `Read_Symbol` entry).
-
-Rules:
-- **Before first `Search_FTS` with `path_filter`**: call `get_directory_structure()` once, or read `ref/directory-structure.md` if it exists and is current.
-- **Never guess `path_filter` values** from framework knowledge (e.g., "Engine", "Renderer"). They often differ from the actual indexed module names.
-- If `path_filter` is not needed (narrow keyword, few expected hits), omit it — this is always safe.
-- After calling `get_directory_structure()`, update `ref/directory-structure.md` if it is missing or stale.
-
-Expected `ref/directory-structure.md` format:
-
-```markdown
-# Directory Structure
-total_files: N
-## Valid modules (top 30)
-- ModuleName (count)
-## False positive modules
-- Private
-- Public
-```
-
-## View parameter strategy
-
-Both `Read_Symbol` and `Read_File_Range` accept a `view` parameter to control output granularity:
-
-| view | Returns | Token cost | When to use |
-|------|---------|------------|-------------|
-| `"full"` (default) | Complete source code | Normal | Default for small/medium symbols |
-| `"signature"` | Only member declarations (function signatures, variables, enums, access specifiers) | ~10-20% | Browsing large classes (>100 lines) |
-| `"meta"` | Only `[System Hint]` with edges and metadata, no code | ~2-5% | Quick check on inheritance, dependencies, routing |
-
-Strategy:
-1. First encounter with a large symbol → `view="signature"` to scan the public API.
-2. Identify target methods → `view="full"` on specific method via `Read_Symbol`.
-3. Need only inheritance/dependency info → `view="meta"` before deciding what to read.
-
-## Pipeline — anchor, read, fallback
-
-Three tools, one pipeline. Run per Abstraction Frame layer; move to the next layer when the current layer has enough confirmed anchors.
-
-```
-Search_FTS     = Anchor  → "where"  (returns file, line, owner, module)
-Read_Symbol    = Read    → "what"   (needs qualified name)
-Read_File_Range= Fallback→ "what"   (needs file + line, used when Read_Symbol misses)
-```
-
-```
-                         Have qualified name?
-                              │
-                         ┌────┴────┐
-                         Yes       No
-                         │         │
-                         ▼         ▼
-                   Read_Symbol   Search_FTS  ← anchor once
-                         │         │
-                         │    Got qualified name?
-                         │         │
-                         │    ┌────┴────┐
-                         │    Yes       No
-                         │    │         │
-                         │    ▼         ▼
-                         │  Read_Symbol Read_File_Range ← read directly with file+line
-                         │    │              │
-                         └────┴──────┬───────┘
-                                    │
-                               Hit & correct?
-                                    │
-                               ┌────┴────┐
-                               Yes       No
-                               │         │
-                               ▼         ▼
-                              Done    Read_File_Range ← fallback with known file+line
-```
-
-**Two iron rules:**
-
-1. **Anchor only once.** After `Search_FTS` returns file+line, do not `Search_FTS` again for the same target.
-2. **Read_Symbol miss → Read_File_Range directly.** Never re-anchor when you already have file+line.
-
-### Phase 1 — LOCATE (anchor)
-
-Choose one entry:
-
-1. **Known qualified name** → `Read_Symbol("ClassName::MethodName")` directly. Skip anchoring.
-2. **Known short name only** → `Search_FTS("ShortName")`, extract owner from results, then `Read_Symbol("Owner::ShortName")`.
-3. **Glue code / event binding** → `Search_FTS("binding_macro")` or `Search_FTS("callback_name")`. Narrow with `path_filter` once module ownership is observed.
-4. **Unknown entry** → `Search_FTS("ConcreteToken")`. Use concrete code tokens, not natural-language phrases.
-
-### Phase 2 — READ
-
-Use `Read_Symbol` for the best qualified anchor found in Phase 1.
-
-**Miss handling (critical):**
-
-When `Read_Symbol` returns the wrong definition (e.g., .cpp instead of .h, or an unrelated overload):
-1. Try a more specific qualified name first (e.g., `Read_Symbol("ClassName")` → try `Read_Symbol("ClassName::MethodName")`). Costs 1 call, may save a fallback.
-2. If still wrong, call `Read_File_Range(file_path, start_line, end_line)` with the anchored position.
-3. **Do NOT re-anchor.** The position is already known.
-
-For large symbols (>100 lines):
-- `view="signature"` first to scan the public API.
-- `view="full"` on specific methods via `Read_Symbol`.
-
-While reading:
-- Treat `[System Hint]` as authoritative only for deterministic relations.
-- Follow routing targets when listed or implied by metadata (e.g., `_Implementation` / `_Validate` suffixes).
-- Track type dependencies as candidate owners for later qualified-name lookups.
-- Do not invent dynamic call edges from untyped pointer calls.
-
-### Phase 3 — TRACE
-
-Follow deterministic and context-supported relations from `[System Hint]`:
-
-- Static call → `Read_Symbol(target_qualified_name)`.
-- Routing metadata → `Read_Symbol("Function_Suffix")` or listed target.
-- Type dependency + pointer call → infer `TypeName::MethodName`, then `Read_Symbol`.
-- Event/callback binding → `Search_FTS("BoundFunctionName")`, then `Read_Symbol` if owner is identified.
-
-### Phase 4 — CLOSE
-
-Answer with confirmed file/symbol findings, inferred next steps, and unresolved gaps. Mention the exact queries used if the target was not found.
+Use to discover module names for `(module_name : "...")` column filter in raw_query.
 
 ## Abstraction Frame
 
@@ -220,7 +94,6 @@ ABSTRACTION FRAME (for "<user intent>"):
   Layer 5: [Glue] — macros, callbacks, bindings, generated routing
   Layer 6: [Boundaries] — modules, platform/subsystem seams
 ```
-
 ## Signal enrichment
 
 `expand_item` is **ranking acceleration** for tool calls — it annotates and prioritizes results when multiple candidates match. It is **not** intent expansion and must never substitute for the actual query.
@@ -229,64 +102,87 @@ ABSTRACTION FRAME (for "<user intent>"):
 
 | Signal type | Examples |
 |-------------|---------|
-| Qualified names | `ClassName::MethodName` |
+| Qualified names | `ClassName::MethodName` or `ClassName.MethodName`|
 | Owning types | parent class, component type |
 | Routing variants | `_Implementation`, `_Validate` |
 | Framework metadata | macro specifiers, routing annotations |
 | Glue terms | delegate names, callback names, binding macros |
-| Module/path | from `Search_FTS` or `get_directory_structure` |
+| Module/path | from `search_fts_tool` or `get_directory_structure` |
 
 **Usage:**
 
 - Pass as `expand_item` to any tool call to rank ambiguous results.
 - Refresh after every read: add confirmed dependencies, drop unresolved guesses.
-- Use to construct the next precise `Read_Symbol` qualified name or choose narrower `Search_FTS` keywords.
+- Use to construct the next precise `read_symbol` qualified name or choose narrower `search_fts_tool` keywords.
 
 **Anti-patterns:**
 
-- Bad: `Search_FTS("Update", expand_item=["everything related"])` without a receiver type.
+- Bad: `search_fts_tool("Update", expand_item=["everything related"])` without a receiver type.
 - Bad: Using `expand_item` as the actual query instead of `qualified_name` / `keyword`.
 
-## Agent reasoning rules
+## Three-level funnel
 
-1. The first reasoning unit is the qualified name: `ClassName::MethodName`.
-2. `Read_Symbol` is the core read tool. `Search_FTS` is the anchor. `Read_File_Range` is the fallback.
-3. **Anchor only once per target.** After `Search_FTS` returns file+line, do not re-anchor.
-4. **Miss → fallback, not re-anchor.** `Read_Symbol` returns wrong definition → `Read_File_Range` with known file+line.
-5. When seeing `Obj->Update()`, never search `Update` blindly. Infer the receiver type from local variables or `[System Hint]` type dependencies, then use the qualified name.
-6. Framework macro metadata is routing information. Follow routing suffixes when listed or implied.
-7. Avoid Cartesian explosion: only follow deterministic static relations or context-supported qualified names.
+**Always start with `search_fts_tool`.** Every lookup enters the funnel at Level 1.
+
+```
+Level 1: search_fts_tool(keyword) → file_path candidates + block QNs
+Level 2: search_fts_tool(raw_query, file_path filter) → precise block in target file
+Level 3: read_symbol(block QN) or read_file_range(file, line) → full code
+```
+
+| Level | Tool | Input | Output | What narrows |
+|-------|------|-------|--------|-------------|
+| 1 | `search_fts_tool` keyword | keyword | file_path candidates + block QNs | all files → ~30 hits |
+| 2 | `search_fts_tool` raw_query | file_path from L1 + new token | precise block in specific file | ~30 hits → ~5 hits in target file |
+| 3 | `read_symbol` / `read_file_range` | QN from L1/L2 or file+line from L1/L2 | full code | exact code block |
+
+**Iron rules:**
+
+1. **Always start with `search_fts_tool`.** No tool call before it. Even with a known QN, search first to get file_path and preview.
+2. **Stop when preview suffices.** If `search_fts_tool` returns enough code/signature, done — no `read_symbol` needed.
+3. **`read_symbol` / `read_file_range` only use data from `search_fts_tool`.** Block QN, file, and line all come from search results. Never guess or assume.
+
+## Tool selection by intent
+
+| Intent | Level 1 | Level 2 if needed | Level 3 if needed |
+|--------|---------|-------------------|-------------------|
+| Any symbol | `search_fts_tool` keyword | `search_fts_tool` raw_query file_path filter | `read_symbol` (block QN) |
+| Glue / delegate | `search_fts_tool` keyword | Usually preview is enough | — |
+| Narrow to file | `search_fts_tool` keyword → then raw_query | file_path column filter | `read_symbol` |
+| Browse large class | `search_fts_tool` keyword → get class block QN | `read_symbol` view="signature" | `read_symbol` view="full" on methods |
+| Code outside symbols | `search_fts_tool` keyword → get file+line | — | `read_file_range` |
+
+## Trace rules
+
+After reading code in Level 3:
+- static call → `search_fts_tool(keyword="CalledFunction")` to locate, then `read_symbol` with block QN
+- delegate binding → `search_fts_tool(keyword="BoundFunctionName")` to locate
+- On seeing `Obj->Update()`, never blindly search `Update`. Infer receiver type first, then `search_fts_tool(keyword="Type::Update")`.
+- Avoid Cartesian explosion: only follow deterministic static relations.
 
 ## Failure handling
 
 | Failure | Response |
 |---------|----------|
-| `Read_Symbol` not found | `Search_FTS` with the shortest distinctive symbol to discover owner |
-| `Read_Symbol` returned wrong definition | **Read_File_Range** with file+line from anchor. Do NOT re-`Search_FTS`. |
-| `Read_Symbol` miss, no anchor yet | Try more specific qualified name. If still miss, `Search_FTS` to anchor. |
-| Short name has too many matches | Add `path_filter` from directory/module ownership |
-| FTS query is too broad | Replace with specific macro/function/delegate name or module-specific path filter |
-| Pointer call target unknown | Read current symbol, infer receiver type from code/hint, then `Read_Symbol("Type::Method")` |
-| Routing target body is thin | Follow routing suffixes (`_Implementation`, `_Validate`, etc.) |
-| Callback binding found but target unknown | Search bound function name, then read qualified owner method |
-| Symbol too large (>100 lines) | Use `view="signature"` first, then target specific methods |
-| Need code outside symbol boundaries | Use `Read_File_Range` |
-| More than 5 searches without new signal | Stop and report knowns/unknowns plus next likely query |
+| `search_fts_tool` no results | Retry with different token or raw_query OR |
+| `search_fts_tool` too broad | Narrow with raw_query file_path column filter |
+| `read_symbol` miss (after search gave block QN) | `read_file_range` with file+line from search result |
+| `read_symbol` wrong definition | `read_file_range` with file+line from search result |
+| Pointer call target unknown | Read current code, infer receiver type, then `search_fts_tool` |
+| Large symbol (>100 lines) | `read_symbol` view="signature" first |
+| >5 searches with no new signal | Stop and report knowns/unknowns |
 
 ## Budget limits
 
 | Resource | Cap |
 |----------|-----|
-| Abstraction Frame layers | 6 max |
-| `Read_Symbol` | ≤8 calls |
-| `Search_FTS` | ≤6 calls |
-| `Read_File_Range` | ≤4 calls |
-| `get_directory_structure` | ≤1 call per session; mandatory before first `Search_FTS` with `path_filter` |
+| `search_fts_tool` | ≤6 |
+| `read_symbol` | ≤8 |
+| `read_file_range` | ≤4 |
+| `get_directory_structure` | ≤1 |
 
 ## Output requirements
 
-When answering after lookup:
-- Cite file paths and symbols with backticks when returned by tools.
-- Separate confirmed facts from inferred next steps.
-- Mention module/path ownership when observed.
-- If not found, state the exact queries attempted and the next recommended query.
+- Cite file paths and symbols with backticks
+- Separate confirmed facts from inferences
+- When not found, list queries attempted and recommended next step
