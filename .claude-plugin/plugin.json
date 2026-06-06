@@ -1,0 +1,6 @@
+{
+  "name": "code-source-sql",
+  "description": "SQLite FTS5 MCP server for source code navigation — search symbols, browse modules, read code across multiple codebases",
+  "version": "0.1.0",
+  "author": "yanwei"
+}

@@ -14,9 +14,16 @@
       "Bash(grep -E \"\\\\.\\(md|toml|json|txt|cfg|ini|yaml|yml\\)$|Makefile\")",
       "Bash(git add *)",
       "Bash(git rm *)",
-      "mcp__codegraph__codegraph_files",
+      "Bash(PYTHONPATH=src python3 -c \"from code_explore_by_sql.db import connect\")",
+      "Bash(PYTHONPATH=src python3 -c \"from code_source_sql.db import connect; print\\('code_source_sql.db imports OK'\\)\")",
       "mcp__code-source-sql__get_directory_structure",
-      "mcp__probe__search_code"
+      "Bash(git push *)",
+      "Read(//home/yanwei/.claude/plugins/cache/context-mode/context-mode/1.0.162/**)",
+      "Bash(node skills/ctx-doctor/../../cli.bundle.mjs doctor)",
+      "Bash(node skills/ctx-doctor/../../build/cli.js doctor)",
+      "Bash(node cli.bundle.mjs stats)",
+      "mcp__plugin_context-mode_context-mode__ctx_stats",
+      "mcp__plugin_context-mode_context-mode__ctx_execute"
     ]
   },
   "enableAllProjectMcpServers": true,

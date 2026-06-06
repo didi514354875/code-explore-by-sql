@@ -3,21 +3,59 @@ name = "code-explore-by-sql"
 version = "0.1.0"
 description = "SQLite FTS5 (trigram) MCP server for code source search."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.2.0",
     "pydantic>=2.0",
 ]
 
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Text Processing :: Indexing",
+]
+
+[project.urls]
+Repository = "https://github.com/didi514354875/code-explore-by-sql"
+
 [project.scripts]
-# code-explore-by-sql = "code_explore_by_sql.server:main"
-# code-explore-by-sql-build-db = "code_explore_by_sql.build_db:main"
 code-source-sql = "code_source_sql:main"
+code-source-sql-build-db = "code_source_sql.build_db:main"
 
 [tool.hatch.build.targets.wheel]
 packages = [
-    # "src/code_explore_by_sql",
     "src/code_source_sql",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "*.db.bak*",
+    "*.log",
+    ".venv/",
+    "uv.lock",
+    "tests/",
+    "scripts/",
+    "ref/",
+    "references/",
+    ".claude/",
+    ".claude-plugin/",
+    ".github/",
+    ".vscode/",
+    "*.txt",
+    "simplePlan.md",
+    "problemArch.md",
+    "SKILL copy.md",
 ]
 
 [tool.pytest.ini_options]

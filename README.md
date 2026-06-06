@@ -5,141 +5,179 @@ Local stdio MCP server for fast source code navigation using **SQLite FTS5** (tr
 ## Features
 
 - **Full-text search**: FTS5 with trigram tokenizer for code-symbol-precise search (`GetGBuffer`, `FMaterial`, `UE_LOG`)
+- **Symbol lookup**: read code by qualified name with fuzzy matching (`Jump` → `ACharacter::Jump`)
 - **Bracket skeleton index**: lightweight structural indexing via FSM brace matching (no AST parser needed)
-- **Symbol classification**: heuristic block-type detection (namespace/class/enum/function/macro) for C/C++
-- **Include dependency graph**: O(1) include path matching with upstream/downstream traversal
-- **Caller lookup**: find callers of any symbol using FTS5 + bracket skeleton with line-range verification
-- **Search result clustering**: merge multiple hits in the same code block into one result
-- **Scope filtering**: restrict search results to specific block types (function/class/namespace)
-- **History-accelerated ranking**: past feedback adjusts ranking without filtering (prevents confirmation bias)
-- **Anchor-based extraction**: efficient context retrieval around a symbol without reading the whole file
-- **Token-efficient responses**: compact snippets (~2,600 tokens/20 results, 95% reduction vs full snippets)
+- **12 language support**: C, C++, C#, Go, HLSL, GLSL, Java, JavaScript, Kotlin, Python, Rust, Swift
+- **Multi-database**: query multiple codebases simultaneously via `CODE_SOURCE_DBS`
+- **Token-efficient responses**: compact snippets (~2,600 tokens/20 results, 95% reduction vs full file reads)
 
-## Setup
+## Installation
+
+### From PyPI (recommended)
 
 ```bash
-uv sync --dev
+# Run the MCP server directly (no clone needed)
+uvx code-explore-by-sql
+
+# Or install persistently
+pip install code-explore-by-sql
 ```
 
-## Build the source index
+### Build a database
 
 ```bash
-# Full build (two-phase: fast import → parallel structural indexing)
-uv run code-explore-by-sql-build-db /path/to/UnrealEngine /path/to/unreal.db
+# Build index for your codebase
+uvx code-source-sql-build-db /path/to/source /path/to/output.db
 
 # Smoke test with limited files
-uv run code-explore-by-sql-build-db /path/to/UnrealEngine /path/to/unreal.db --limit 1000
+uvx code-source-sql-build-db /path/to/source /path/to/output.db --limit 1000
 ```
 
 Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
 
-## Run the MCP server
+### Configure in MCP clients
 
-```bash
-UNREAL_SOURCE_DB=/path/to/unreal.db uv run code-explore-by-sql
+**Claude Code** (`.claude/mcp.json`):
+```json
+{
+  "mcpServers": {
+    "code-source-sql": {
+      "command": "uvx",
+      "args": ["code-explore-by-sql"],
+      "env": {
+        "CODE_SOURCE_DB": "/path/to/your/code.db",
+        "CODE_SOURCE_DBS": "/path/to/your/code.db:/path/to/another.db"
+      }
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "code-source-sql": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["code-explore-by-sql"],
+      "env": {
+        "CODE_SOURCE_DB": "/path/to/your/code.db"
+      }
+    }
+  }
+}
+```
+
+**OpenAI Codex** (`~/.codex/config.toml`):
+```toml
+[mcp_servers.code-source-sql]
+command = "uvx"
+args = ["code-explore-by-sql"]
+
+[mcp_servers.code-source-sql.env]
+CODE_SOURCE_DB = "/path/to/your/code.db"
+```
+
+**Hermes Agent** (`~/.hermes/config.yaml`):
+```yaml
+mcp_servers:
+  code-source-sql:
+    command: uvx
+    args:
+      - code-explore-by-sql
+    env:
+      CODE_SOURCE_DB: /path/to/your/code.db
 ```
 
 ## Tools (5)
 
 | Tool | Purpose |
 |------|---------|
-| `search_code_source` | FTS5 search with history ranking, clustering, and scope filtering |
-| `get_file_content` | Read full file, line range, or anchor-based context extraction |
-| `log_code_query` | Record explicit feedback for a past query |
-| `find_include_graph` | Query include dependency graph (upstream/downstream, recursive) |
-| `find_callers` | Find callers of a symbol using FTS5 + bracket skeleton |
+| `list_databases` | Discover available databases with stats |
+| `search_fts_tool` | FTS5 search — locate code blocks by keyword or raw FTS5 query |
+| `read_symbol` | Read symbol code by qualified name (exact or fuzzy) |
+| `read_file_range` | Read source code by file path and line range |
+| `get_directory_structure` | Module/file counts overview |
 
-## Search query modes
+### Multi-database
 
-### Simple mode (`query`)
-Single keyword or phrase — auto-escaped for FTS5:
+Each tool accepts an optional `db` parameter to select a database by alias. Aliases are derived from database filenames (`unreal.db` → `"unreal"`). Use `list_databases` to discover available aliases. Default (`db=""`) uses the primary database (`CODE_SOURCE_DB`).
+
+### Search query modes
+
+**Simple mode** (`keyword`):
 ```
-query="GetGBuffer"
-query="FMaterial Render"
+keyword="GetGBuffer"
+keyword="FMaterial Render"
 ```
 
-### Advanced mode (`raw_query`)
-Full FTS5 boolean expressions:
+**Advanced mode** (`raw_query`) — full FTS5 boolean:
 ```
 raw_query='"GetGBuffer" AND "Emissive"'
 raw_query='"Material" NOT "hlsl"'
 raw_query='(file_path : "BasePass") AND "roughness"'
+raw_query='(module_name : "Renderer") AND "VirtualTexture"'
 ```
 
-### Optional parameters
-- `cluster=true` — merge hits in the same code block, includes `block_type` and `block_name`
-- `scope_filter='{"block_type": "function"}'` — only return results inside matching blocks
-- `expanded_terms=["FMaterial", "UMaterialInterface"]` — domain terms for history matching
-- `module="Renderer"` — filter by module name
+### Three-level funnel
+
+1. **`search_fts_tool(keyword)`** → file candidates + block QNs
+2. **`search_fts_tool(raw_query, file_path filter)`** → precise block in target file
+3. **`read_symbol(block QN)`** or **`read_file_range(file, line)`** → full code
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    MCP Server (FastMCP)                      │
-├──────────┬──────────┬──────────┬──────────┬─────────────────┤
-│ search   │ get_file │ log_     │ find_    │ find_           │
-│ _source  │ _content │ query    │ include  │ callers         │
-├──────────┴──────────┴──────────┴──────────┴─────────────────┤
-│                     Query Pipeline                           │
-│  FTS5 (two-step) → History signals → Composite scoring      │
-│  → Scope filter → Clustering → Log                          │
-├─────────────────────────────────────────────────────────────┤
-│                    SQLite Database                           │
-│  source_files + FTS5 │ bracket_index │ include_edges        │
-│  query_logs + FTS5   │ query_note                            │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    MCP Server (FastMCP)                       │
+├──────────┬──────────┬──────────┬──────────┬──────────────────┤
+│ search   │ read     │ read     │ get_dir  │ list             │
+│ fts_tool │ _symbol  │ _file    │ _struct  │ _databases       │
+│          │          │ _range   │          │                  │
+├──────────┴──────────┴──────────┴──────────┴──────────────────┤
+│                     Query Pipeline                            │
+│  FTS5 trigram → Symbol match → Edge extraction               │
+├──────────────────────────────────────────────────────────────┤
+│                    SQLite Database                            │
+│  file_content + FTS5 │ symbol_index │ strict_edges           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Bracket skeleton index
-A 6-state finite state machine (CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHAR_LITERAL, RAW_STRING) scans C/C++ source tracking brace pairs while correctly ignoring braces in comments and string literals. Each matched pair records `open_line`, `close_line`, `depth`, and `is_complete`.
 
-Top-level blocks (depth=1) are further classified by a **symbol sniffer** that examines preceding lines using heuristic regex patterns, producing `block_type` (namespace/class/enum/function/macro/control_flow) and `block_name`.
+A 6-state finite state machine (CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHAR_LITERAL, RAW_STRING) scans source code tracking brace pairs while correctly ignoring braces in comments and string literals. Each matched pair records `open_line`, `close_line`, `depth`, and `is_complete`.
 
-### Include dependency graph
-Include paths are matched to indexed files using a pre-built basename → file_id hash map with collision resolution. 96.5% of includes resolve in O(1); the rest use O(k) suffix matching.
+Top-level blocks are classified by a **symbol analyzer** producing `block_type` (namespace/class/enum/function/macro) and `block_name` (qualified name).
 
-### Two-step FTS5 query
-Instead of computing `snippet()` for all matching rows (10K+ for common terms), the query is split:
-1. `bm25() + ORDER BY + LIMIT` to get top-N rowids (fast)
-2. `snippet()` computed only for those top-N rows, truncated to 300 chars
+### Multi-database registry
 
-This provides **~100x speedup** for high-frequency terms and **95% token reduction**.
+Databases are registered via environment variables at server startup:
+- `CODE_SOURCE_DB` — primary database (default when `db` is omitted)
+- `CODE_SOURCE_DBS` — colon-separated list of additional databases
 
-## Performance (example: 84,696 source files from a game engine codebase)
+Aliases are auto-derived from filename stems. Connections are cached with health checks.
 
-| Operation | Latency | ~Tokens |
-|-----------|---------|---------|
-| Single keyword search (20 results) | ~90 ms | ~2,600 |
-| Full pipeline (FTS5 + history + scoring) | ~115 ms | ~2,600 |
-| Module-filtered search | ~250 ms | ~2,600 |
-| find_callers (precise, per-symbol) | 100–900 ms | 127–3,100 |
-| Include graph (depth=1) | ~15 ms | 50–2,100 |
-| Anchor-based content extraction | ~0.1 ms | ~125 |
-| Full file read (avoid!) | ~25 ms | ~45,000 |
-| **Typical 3-search workflow** | **~400 ms** | **~4,500** |
+## Environment Variables
 
-## Database schema
-
-| Table | Purpose |
-|-------|---------|
-| `source_files` | File metadata + raw content |
-| `source_files_fts` | FTS5 trigram index on content |
-| `bracket_index` | Brace pairs with depth, block type/name |
-| `include_edges` | #include source → target relationships |
-| `query_logs` | Search history for ranking signals |
-| `query_logs_fts` | FTS5 index on query text for similarity matching |
-| `query_note` | Explicit feedback (useful/not useful) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CODE_SOURCE_DB` | Yes | Path to primary SQLite database |
+| `CODE_SOURCE_DBS` | No | Colon-separated paths to additional databases |
 
 ## Development
 
 ```bash
+# Clone and setup
+git clone https://github.com/didi514354875/code-explore-by-sql.git
+cd code-explore-by-sql
+uv sync --dev
+
+# Run tests
 uv run pytest
 uv run ruff check .
-# Bracket scanner + symbol sniffer tests
-PYTHONPATH=src python3 tests/test_bracket_scanner.py
-# Query pipeline efficiency tests
-PYTHONPATH=src python3 tests/test_query_efficiency.py
-# Token & efficiency benchmark
-PYTHONPATH=src python3 tests/test_benchmark.py
 ```
+
+## License
+
+MIT
