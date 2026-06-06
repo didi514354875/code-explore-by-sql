@@ -183,4 +183,4 @@ uv run ruff check .
 MIT
 
 ## References
-搜索思路参考 https://github.com/IOchair/SQL-ManyThing
+Search inspiration from https://github.com/IOchair/SQL-ManyThing
