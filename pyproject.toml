@@ -1,6 +1,6 @@
 [project]
 name = "code-explore-by-sql"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQLite FTS5 (trigram) MCP server for code source search."
 readme = "README.md"
 license = "MIT"
@@ -27,8 +27,8 @@ classifiers = [
 Repository = "https://github.com/didi514354875/code-explore-by-sql"
 
 [project.scripts]
-code-source-sql = "code_source_sql:main"
-code-source-sql-build-db = "code_source_sql.build_db:main"
+code-explore-by-sql = "code_source_sql:main"
+code-explore-by-sql-build-db = "code_source_sql.build_db:main"
 
 [tool.hatch.build.targets.wheel]
 packages = [

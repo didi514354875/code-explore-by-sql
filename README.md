@@ -27,10 +27,10 @@ pip install code-explore-by-sql
 
 ```bash
 # Build index for your codebase
-uvx code-source-sql-build-db /path/to/source /path/to/output.db
+uvx code-explore-by-sql-build-db /path/to/source /path/to/output.db
 
 # Smoke test with limited files
-uvx code-source-sql-build-db /path/to/source /path/to/output.db --limit 1000
+uvx code-explore-by-sql-build-db /path/to/source /path/to/output.db --limit 1000
 ```
 
 Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
