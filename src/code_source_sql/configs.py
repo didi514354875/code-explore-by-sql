@@ -308,7 +308,7 @@ def make_unreal_project(
         ".h": "cpp", ".hpp": "cpp", ".hh": "cpp", ".inl": "cpp",
         ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
         ".cs": "csharp",
-        ".usf": "cpp", ".ush": "cpp", ".hlsl": "cpp",
+        ".usf": "hlsl", ".ush": "hlsl", ".hlsl": "hlsl",
     }
     if extra_extensions:
         ext_map.update(extra_extensions)
@@ -354,6 +354,11 @@ def make_generic_project(
         ".swift": "swift",
         # Python
         ".py": "python", ".pyi": "python",
+        # HLSL
+        ".hlsl": "hlsl", ".fx": "hlsl", ".fxh": "hlsl",
+        # GLSL
+        ".glsl": "glsl", ".vert": "glsl", ".frag": "glsl",
+        ".comp": "glsl", ".geom": "glsl", ".tesc": "glsl", ".tese": "glsl",
     }
     if extra_extensions:
         ext_map.update(extra_extensions)

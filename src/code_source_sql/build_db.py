@@ -165,13 +165,13 @@ def build_index(
         rel = str(path.relative_to(root)).replace("\\", "/")
         module = infer_module_name(path, project.source_marker, project.categories)
 
-        file_id = upsert_file(conn, rel, module, content, digest)
-        lines = content.split("\n")
-
         # Dispatch by file extension
         ext = path.suffix.lower()
         from .configs import make_generic_framework
         lang, fw_for_file = ext_configs.get(ext, (get_language("cpp"), make_generic_framework()))
+
+        file_id = upsert_file(conn, rel, module, content, digest, language=lang.name)
+        lines = content.split("\n")
 
         sym_rows, extra_rows, edge_rows = _process_file(file_id, content, lines, lang, fw_for_file)
 

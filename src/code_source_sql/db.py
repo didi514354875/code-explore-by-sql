@@ -50,7 +50,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             module_name TEXT,
             file_path TEXT NOT NULL UNIQUE,
             content TEXT NOT NULL,
-            content_hash TEXT
+            content_hash TEXT,
+            language TEXT NOT NULL DEFAULT 'cpp'
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
@@ -115,6 +116,10 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
 
     # Migrations for existing databases
     try:
+        conn.execute("ALTER TABLE file_content ADD COLUMN language TEXT NOT NULL DEFAULT 'cpp'")
+    except Exception:
+        pass  # Column already exists
+    try:
         conn.execute("ALTER TABLE symbol_index ADD COLUMN language TEXT NOT NULL DEFAULT 'cpp'")
     except Exception:
         pass  # Column already exists
@@ -133,7 +138,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
 # ── Write functions ──────────────────────────────────────────────────
 
 def upsert_file(conn: sqlite3.Connection, file_path: str, module_name: str | None,
-                content: str, content_hash: str | None = None) -> int:
+                content: str, content_hash: str | None = None,
+                language: str = "cpp") -> int:
     conn.execute(
         "DELETE FROM symbol_index WHERE file_id = "
         "(SELECT file_id FROM file_content WHERE file_path = ?)",
@@ -146,13 +152,14 @@ def upsert_file(conn: sqlite3.Connection, file_path: str, module_name: str | Non
         (file_path,),
     )
     conn.execute(
-        """INSERT INTO file_content(file_path, module_name, content, content_hash)
-           VALUES (?, ?, ?, ?)
+        """INSERT INTO file_content(file_path, module_name, content, content_hash, language)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(file_path) DO UPDATE SET
                module_name=excluded.module_name,
                content=excluded.content,
-               content_hash=excluded.content_hash""",
-        (file_path, module_name, content, content_hash),
+               content_hash=excluded.content_hash,
+               language=excluded.language""",
+        (file_path, module_name, content, content_hash, language),
     )
     row = conn.execute("SELECT file_id FROM file_content WHERE file_path = ?", (file_path,)).fetchone()
     return row["file_id"]
@@ -472,6 +479,12 @@ def search_fts(
             if block_info:
                 result["block"] = block_info["qualified_name"]
                 result["block_type"] = block_info["block_type"]
+            else:
+                # No enclosing symbol — suggest a context window for read_file_range
+                total_lines = len(lines)
+                ctx_start = max(1, hit_line - 5)
+                ctx_end = min(total_lines, hit_line + 25)
+                result["range"] = [ctx_start, ctx_end]
 
             if expand_item:
                 signal_text = "\n".join([
@@ -551,7 +564,7 @@ def _find_intersecting_symbols(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """SELECT id, qualified_name, block_type, start_line, end_line, decoration_meta,
-                  parent_class, signature, inheritance_base
+                  parent_class, signature, inheritance_base, language
            FROM symbol_index
            WHERE file_id = ? AND start_line <= ? AND end_line >= ?
            ORDER BY (end_line - start_line) ASC""",
@@ -569,7 +582,7 @@ def read_file_range(
     expand_item: list[str] | None = None,
 ) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT file_id, content FROM file_content WHERE file_path = ?",
+        "SELECT file_id, content, language FROM file_content WHERE file_path = ?",
         (file_path,),
     ).fetchone()
     if not row:
@@ -579,11 +592,11 @@ def read_file_range(
     code = "\n".join(lines[start_line - 1 : end_line])
 
     file_id = row["file_id"]
+    file_language = row["language"]
     symbols_full = _find_intersecting_symbols(conn, file_id, start_line, end_line)
 
     # Apply view to code
     if view != "meta":
-        file_language = symbols_full[0].get("language", "cpp") if symbols_full else "cpp"
         lang, fw = _resolve_lang_fw(file_language)
         single_block_type = symbols_full[0]["block_type"] if len(symbols_full) == 1 else None
         code = _apply_view(
