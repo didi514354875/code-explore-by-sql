@@ -102,7 +102,7 @@ mcp_servers:
 
 ### Multi-database
 
-Each tool accepts an optional `db` parameter to select a database by alias. Aliases are derived from database filenames (`unreal.db` → `"unreal"`). Use `list_databases` to discover available aliases. Default (`db=""`) uses the primary database (`CODE_SOURCE_DB`).
+Each tool accepts an optional `db` parameter to select a database by alias. Aliases are derived from database filenames (`unreal.db` → `"unreal"`). Use `list_databases` to discover available aliases. 
 
 ### Search query modes
 
@@ -146,7 +146,7 @@ raw_query='(module_name : "Renderer") AND "VirtualTexture"'
 
 ### Bracket skeleton index
 
-A 6-state finite state machine (CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHAR_LITERAL, RAW_STRING) scans source code tracking brace pairs while correctly ignoring braces in comments and string literals. Each matched pair records `open_line`, `close_line`, `depth`, and `is_complete`.
+A 6-state finite state machine (CODE, LINE_COMMENT, BLOCK_COMMENT, STRING, CHAR_LITERAL, RAW_STRING) scans source code tracking brace pairs while correctly ignoring braces in comments and strings.
 
 Top-level blocks are classified by a **symbol analyzer** producing `block_type` (namespace/class/enum/function/macro) and `block_name` (qualified name).
 
@@ -181,3 +181,6 @@ uv run ruff check .
 ## License
 
 MIT
+
+## References
+搜索思路参考 https://github.com/IOchair/SQL-ManyThing
