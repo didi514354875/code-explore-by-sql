@@ -10,9 +10,46 @@ disable-model-invocation: false
 
 Use the **`code-source-sql` MCP tools** for source code lookup.
 
+## Multi-database
+
+The server can access multiple databases. Each tool accepts an optional `db` parameter (database alias).
+
+- **`list_databases()`** — discover available databases and their aliases.
+- `db=""` (default) → primary database (`CODE_SOURCE_DB`).
+- `db="mygame"` → database whose filename stem is `mygame` (e.g. `mygame.db`).
+- Unknown alias → silently falls back to primary database.
+
+Use `list_databases` first to see what's available, then pass the `alias` as `db` to other tools.
+
+## Database Setup
+
+If `list_databases` returns empty, or any tool returns a database-not-found / no-such-table error, the database needs to be built first.
+
+**Build command** (run in terminal, not via MCP):
+
+```bash
+code-explore-by-sql-build-db /path/to/source_code /path/to/output.db [--limit N]
+```
+
+- `/path/to/source_code` — root directory of the codebase to index
+- `/path/to/output.db` — output SQLite database file (created automatically)
+- `--limit N` — optional: index only the first N files (smoke test)
+
+After building, update the MCP server config (`CODE_SOURCE_DB` env var) to point to the new `.db` file, then restart the MCP server.
+
+**Agent behavior:** When tools fail due to missing database, ask the user for the source code path and desired output path, then provide the exact `code-explore-by-sql-build-db` command for them to run.
+
 ## Tool surface
 
-### `search_fts_tool(keyword="", path_filter="", expand_item=None, raw_query="")`
+### `list_databases()`
+
+Discover — list available databases with stats.
+
+Returns `{default, databases: [{alias, path, total_files?, total_symbols?, error?}]}`.
+
+Use before any other tool when multiple databases are configured.
+
+### `search_fts_tool(keyword="", path_filter="", expand_item=None, raw_query="", db="")`
 
 **Locate** — find code blocks, return file location and enclosing symbol.
 
@@ -53,7 +90,7 @@ Rules:
 - Search concrete code tokens, not natural language
 - `path_filter` narrows by module_name (simple mode only). For file_path filtering, use `raw_query` column filter instead.
 
-### `read_symbol(qualified_name, view="full", expand_item=None)`
+### `read_symbol(qualified_name, view="full", expand_item=None, db="")`
 
 **Read by name** — get full code. **Only use after `search_fts_tool` provides a block QN.**
 
@@ -65,7 +102,7 @@ Rules:
 - Multiple matches: `alt` list (max 4, no code)
 - Not found → `{error: "not_found", query, fts?}`
 
-### `read_file_range(file_path, start_line, end_line, view="full", expand_item=None)`
+### `read_file_range(file_path, start_line, end_line, view="full", expand_item=None, db="")`
 
 **Read by position** — get code. **Only use after `search_fts_tool` provides file+line.**
 
@@ -73,7 +110,7 @@ Rules:
 - `symbols` lists all symbols in range as `{qn, type, range}`
 - Not found → `{error: "not_found", file}`
 
-### `get_directory_structure()`
+### `get_directory_structure(db="")`
 
 Module overview. Returns `{total_files, total_modules, modules: [{module_name, file_count}]}`.
 
@@ -164,6 +201,7 @@ After reading code in Level 3:
 
 | Failure | Response |
 |---------|----------|
+| Database not found / empty `list_databases` | See **Database Setup** section — provide `code-explore-by-sql-build-db` command |
 | `search_fts_tool` no results | Retry with different token or raw_query OR |
 | `search_fts_tool` too broad | Narrow with raw_query file_path column filter |
 | `read_symbol` miss (after search gave block QN) | `read_file_range` with file+line from search result |
