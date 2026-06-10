@@ -11,7 +11,7 @@ Local stdio MCP server for fast source code navigation using **SQLite FTS5** (tr
 - **Multi-database**: query multiple codebases simultaneously via `CODE_SOURCE_DBS`
 - **Token-efficient responses**: compact snippets (~2,600 tokens/20 results, 95% reduction vs full file reads)
 
-## Installation
+## Test Installation
 
 ### From PyPI (recommended)
 
@@ -34,6 +34,9 @@ uvx code-explore-by-sql-build-db /path/to/source /path/to/output.db --limit 1000
 ```
 
 Performance: ~84,700 files indexed in ~3.3 minutes on a 2-core machine.
+
+## AI Agent UseCase
+if use with AI Agent, copy current directory .claude/code-source-sql-search skill to AI Agent skills directory and modify mcp settings.
 
 ### Configure in MCP clients
 
