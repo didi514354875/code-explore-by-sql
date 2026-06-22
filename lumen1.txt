@@ -1,0 +1,441 @@
+ Lumen Surface Cache 存储布局
+
+ 一、总体架构：虚拟纹理系统
+
+ Lumen Surface Cache 本质上是一个自定义的虚拟纹理系统（类似 SVT/Virtual Texture），它把场景中所有物体的表面"摊平"到几张大的物理纹理 Atlas 上。
+
+ ```
+   ABSTRACTION FRAME (for "Surface Cache 存储布局"):
+     Layer 1: 几何层 — MeshCards + Card (物体表面→2D 卡片映射)
+     Layer 2: 虚拟层 — PageTable (虚拟页→物理页地址映射)
+     Layer 3: 物理层 — PhysicalAtlas (大纹理 Atlas)
+     Layer 4: 分配器 — FLumenSurfaceCacheAllocator (页内子分配)
+ ```
+
+ 源码常量（Lumen.h:45-57）：
+
+ ```cpp
+   PhysicalPageSize      = 128    // 物理页大小 (128x128 texel)
+   VirtualPageSize       = 127    // 虚拟页大小 (127x127, 预留 0.5 texel 边框)
+   MinCardResolution     = 8      // Card 最小分辨率 (8x8)
+   MinResLevel           = 3      // 2^3 = 8
+   MaxResLevel           = 11     // 2^11 = 2048
+   SubAllocationResLevel = 7      // 2^7 = 128 = PhysicalPageSize
+   NumResLevels          = 9      // ResLevel 3~11, 共 9 级
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 二、几何层：MeshCard
+
+ Card 是 Lumen 对物体表面的 2D 参数化表示，每个 Card 对应物体 OBB 的一个面。
+
+ ### 2.1 MeshCards（LumenMeshCards.h:29）
+
+ ```
+   FLumenMeshCards
+   ├── LocalToWorld          // 物体 Local→World 变换
+   ├── LocalBounds           // 物体局部空间 AABB
+   ├── PrimitiveGroupIndex   // 所属 PrimitiveGroup
+   ├── FirstCardIndex        // 第一个 Card 在 Cards[] 数组中的索引
+   ├── NumCards              // Card 数量
+   └── CardLookup[6]         // 6 个轴对齐方向(±X, ±Y, ±Z) → Card 索引
+                              //   用于快速根据射线方向查找 Card
+ ```
+
+ 一个 MeshCards 实例代表一个物体（或 LOD 实例），包含最多 6 个方向的 Card。
+
+ ### 2.2 FLumenCard（LumenSceneData.h:308）
+
+ ```
+   FLumenCard
+   ├── OBB 定义 (定义 Card 的 3D 空间位置)
+   │   ├── LocalOBBOrigin / Extent    // Card 在物体局部空间的 OBB
+   │   ├── LocalOBBAxisX/Y/Z          // Card 的三个朝向轴
+   │   └── WorldOBBAxisX/Y/Z + Origin // Card 在世界空间的 OBB
+   │
+   ├── 分辨率层级
+   │   ├── MinAllocatedResLevel       // 当前已分配的最低 ResLevel
+   │   ├── MaxAllocatedResLevel       // 当前已分配的最高 ResLevel
+   │   └── SurfaceMipMaps[NumResLevels] // 每个 ResLevel 的虚拟页分配信息
+   │
+   ├── 索引关系
+   │   ├── MeshCardsIndex             // 所属 MeshCards
+   │   └── AxisAlignedDirectionIndex  // 朝向 (0-5, 对应 ±XYZ)
+   │
+   └── CardSharingId                  // Card 共享 ID (相同 ID 的 card 可复用)
+ ```
+
+ ### 2.3 FLumenSurfaceMipMap（LumenSceneData.h:237）
+
+ 每个 ResLevel 的虚拟页分配信息：
+
+ ```
+   FLumenSurfaceMipMap
+   ├── bLocked              // 是否锁定 (低分辨率常驻页, 不可淘汰)
+   ├── SizeInPagesX/Y       // 该 ResLevel 下 Card 的虚拟页数量
+   │                          // ResLevel ≤ 7: 1x1 (子分配)
+   │                          // ResLevel > 7:  2^(ResLevel-7) × 2^(ResLevel-7)
+   ├── ResLevelX/Y          // 实际的 X/Y 分辨率层级
+   ├── PageTableSpanSize    // 该 MipMap 在 PageTable 中的连续条目数
+   └── PageTableSpanOffset  // 在 PageTable 中的起始偏移
+ ```
+
+ Card 与虚拟页的关系：
+
+ ```
+   Card ResLevel 3 (8x8 texel):
+     → 1 个虚拟页 (子分配在物理页内部)
+
+   Card ResLevel 7 (128x128 texel):
+     → 1 个虚拟页 = 1 个完整物理页
+
+   Card ResLevel 8 (256x256 texel):
+     → 2x2 = 4 个虚拟页, 每个 = 1 个物理页
+
+   Card ResLevel 11 (2048x2048 texel):
+     → 16x16 = 256 个虚拟页
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 三、虚拟层：PageTable
+
+ ### 3.1 FLumenPageTableEntry（LumenSceneData.h:566）
+
+ PageTable 是虚拟页到物理页的地址映射表：
+
+ ```
+   FLumenPageTableEntry  (每个虚拟页一个条目)
+   ├── 物理地址
+   │   ├── PhysicalPageCoord      // 物理页坐标 (页级)
+   │   └── PhysicalAtlasRect      // 在物理页内的精确矩形 (子分配用)
+   │
+   ├── 采样回退 (当物理页未分配时, 指向更粗的 mip)
+   │   ├── SamplePageIndex        // 实际采样使用的物理页索引
+   │   ├── SampleAtlasBiasX/Y     // 采样时的 Atlas 偏移
+   │   └── SampleCardResLevelX/Y  // 采样使用的 ResLevel
+   │
+   ├── 归属
+   │   ├── CardIndex              // 所属 Card
+   │   └── ResLevel               // 该页的 ResLevel
+   │
+   └── CardUVRect                 // 该页在 Card UV 空间的矩形
+ ```
+
+ ### 3.2 页表查找流程（GPU Shader 端, LumenSurfaceCacheSampling.ush:100）
+
+ ```
+   输入: CardIndex + CardUV + SampleRadius
+     │
+     ▼
+   ① 从 Card 数据读取 SizeInPages 和 PageTableOffset
+     │
+     ▼
+   ② PageCoord = CardUV × SizeInPages  (计算落在哪个虚拟页)
+     │
+     ▼
+   ③ LinearPageCoord = PageCoord.x + PageCoord.y × SizeInPages.x
+     │
+     ▼
+   ④ PageTableIndex = PageTableOffset + LinearPageCoord
+     │
+     ▼
+   ⑤ PageTableValue = PageTableBuffer.Load(8 × PageTableIndex)  // 读取 64bit
+     │  解码:
+     │   AtlasBias = ((val.x >> 0) & 0xFFF) × MIN_CARD_RESOLUTION
+     │   ResLevelXY = (val.x >> 24) & 0xF, (val.x >> 28) & 0xF
+     │   CardPageIndex = val.y
+     │
+     ▼
+   ⑥ 根据读取的 ResLevelXY 重新计算 AtlasScale
+     │   ResLevel ≤ 7: AtlasScale = 2^ResLevel (子分配大小)
+     │   ResLevel > 7: AtlasScale = PHYSICAL_PAGE_SIZE = 128
+     │
+     ▼
+   ⑦ PhysicalAtlasUV = (CoordInPage + AtlasBias) × InvPhysicalAtlasSize
+     │
+     ▼
+   输出: FLumenCardSample { PhysicalAtlasUV, CardPageIndex, ... }
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 四、物理层：PhysicalAtlas
+
+ ### 4.1 物理纹理 Atlas 清单（LumenSceneData.h:1181-1196）
+
+ ┌───────────────────────┬────────────────────────────┬─────────────────────┐
+ │ Atlas 纹理            │ 用途                       │ 产生阶段            │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ AlbedoAtlas           │ 反照率颜色                 │ Phase 2 (Card 捕获) │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ NormalAtlas           │ 世界空间法线               │ Phase 2 (Card 捕获) │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ EmissiveAtlas         │ 自发光                     │ Phase 2 (Card 捕获) │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ DepthAtlas            │ Card 空间深度              │ Phase 2 (Card 捕获) │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ DirectLightingAtlas   │ 直接光照                   │ Phase 3 (直接光照)  │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ IndirectLightingAtlas │ Radiosity 间接光照         │ Phase 3 (Radiosity) │
+ ├───────────────────────┼────────────────────────────┼─────────────────────┤
+ │ FinalLightingAtlas    │ 最终光照 (Direct+Indirect) │ Phase 3 (合并)      │
+ └───────────────────────┴────────────────────────────┴─────────────────────┘
+
+ 所有 Atlas 共享同一个 PageTable 地址空间——给定一个虚拟页,它在 Albedo/Normal/Emissive/Depth/Lighting Atlas 中的物理位置完全相同。
+
+ ### 4.2 物理 Atlas 尺寸
+
+ ```cpp
+   // FLumenSceneData 成员 (LumenSceneData.h:1335)
+   FIntPoint PhysicalAtlasSize;                    // 例如 2048x2048 或 4096x4096
+   ESurfaceCacheCompression PhysicalAtlasCompression;
+   FLumenSurfaceCacheAllocator SurfaceCacheAllocator;
+ ```
+
+ 物理 Atlas 大小动态调整：
+
+ ```
+   PhysicalAtlasSize / PhysicalPageSize = 物理页总数
+   例: 2048 / 128 = 16x16 = 256 个物理页
+   例: 4096 / 128 = 32x32 = 1024 个物理页
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 五、分配器：FLumenSurfaceCacheAllocator
+
+ ### 5.1 两级分配策略（LumenSceneData.h:667）
+
+ 这是 Surface Cache 最精巧的设计——物理页可以被子分配，支持不同大小的 Card。
+
+ ```
+   FLumenSurfaceCacheAllocator
+   │
+   ├── PhysicalPageList: TBitArray      // 物理页空闲/占用位图
+   ├── PageAtlasSizeInPages: FIntPoint  // Atlas 的页数 (如 16x16)
+   │
+   ├── PageBins: TArray<FPageBin>       // 子分配 Bin 列表
+   │   └── 每个 Bin 对应一种子分配大小 (8x8, 8x16, 8x32, ... 128x128)
+   │
+   └── PageBinLookup: FPageBinLookup    // 8x8 查找表
+       └── [log2(SizeX), log2(SizeY)] → BinIndex
+           示例:
+                    log2(SizeX) →
+                   0  1  2  3   4   5   6    7
+                   1  2  4  8  16  32  64  128
+            0 | 1
+            1 | 2
+   log2(SizeY) 2 | 4
+       ↓      3 | 8         X(8x8的Bin)
+            4 | 16
+            5 | 32      X(32x8的Bin)
+            6 | 64
+            7 | 128                 X(128x128的Bin)
+ ```
+
+ ### 5.2 子分配内部结构（LumenSceneData.h:694）
+
+ ```
+   FPageBinAllocation (单个物理页内的子分配跟踪)
+   ├── PageCoord            // 物理页坐标
+   ├── PageSizeInElements   // 该页可容纳多少个子分配元素
+   │                          // 例: 128/8 = 16, 所以 16x16 = 256 个 8x8 子分配
+   ├── SubPageList: TBitArray<256>  // 256 位位图, 标记每个子分配槽的占用状态
+   │                                   0 = 空闲, 1 = 占用
+   └── SubPageFreeCount     // 空闲槽计数
+ ```
+
+ ### 5.3 分配/释放流程
+
+ ```
+   分配一个虚拟页:
+   ① 根据 Card 的 ResLevel 计算需要的虚拟页大小
+      Size = 2^ResLevel (例: ResLevel=3 → 8x8)
+
+   ② 如果 Size == PhysicalPageSize (128x128):
+      → 从 PhysicalPageList 分配一整个物理页
+      → PhysicalPageCoord = 新分配的页坐标
+
+   ③ 如果 Size < PhysicalPageSize (子分配):
+      → 查找 PageBinLookup[log2(SizeX), log2(SizeY)] → Bin
+      → 在 Bin 中查找有空闲槽的 FPageBinAllocation
+      → SubPageList.FindAndSetFirstZeroBit() → 子分配坐标
+      → PhysicalAtlasRect = 物理页坐标 × PageSize + 子分配坐标 × ElementSize
+
+   ④ 填充 FLumenPageTableEntry:
+      → PhysicalPageCoord = 物理页坐标
+      → PhysicalAtlasRect = 精确的物理矩形
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 六、全景存储布局图
+
+ ```
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │                        FLumenSceneData (顶层管理器)                      │
+   │                                                                         │
+   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────┐  │
+   │  │  几何数据     │  │  虚拟页表     │  │        物理 Atlas            │  │
+   │  │              │  │              │  │                              │  │
+   │  │ MeshCards[]  │  │ PageTable[]  │  │  ┌──────────────────────┐   │  │
+   │  │  ├ Card[0]   │──┤  ├ Entry[0]  │──┼─→│ AlbedoAtlas (2048²)  │   │  │
+   │  │  ├ Card[1]   │  │  ├ Entry[1]  │  │  ├──────────────────────┤   │  │
+   │  │  └ Card[N]   │  │  ├ ...       │  │  │ NormalAtlas          │   │  │
+   │  │              │  │  └ Entry[M]  │  │  ├──────────────────────┤   │  │
+   │  │ PrimitiveGroup│ │              │  │  │ EmissiveAtlas        │   │  │
+   │  │ Heightfield[]│  │              │  │  ├──────────────────────┤   │  │
+   │  │              │  │              │  │  │ DepthAtlas           │   │  │
+   │  │              │  │              │  │  ├──────────────────────┤   │  │
+   │  │              │  │              │  │  │ DirectLightingAtlas  │   │  │
+   │  │              │  │              │  │  ├──────────────────────┤   │  │
+   │  │              │  │              │  │  │ IndirectLightingAtlas│   │  │
+   │  │              │  │              │  │  ├──────────────────────┤   │  │
+   │  │              │  │              │  │  │ FinalLightingAtlas   │   │  │
+   │  │              │  │              │  │  └──────────────────────┘   │  │
+   │  │              │  │              │  │                              │  │
+   │  │              │  │              │  │  FLumenSurfaceCacheAllocator │  │
+   │  │              │  │              │  │  ├ PhysicalPageList (BitArray)│  │
+   │  │              │  │              │  │  ├ PageBins[]                │  │
+   │  │              │  │              │  │  └ PageBinLookup[8×8]        │  │
+   │  └──────────────┘  └──────────────┘  └──────────────────────────────┘  │
+   │                                                                         │
+   │  GPU Buffers (上传到 GPU):                                               │
+   │  ├ CardBuffer          ← Cards[] 数据                                    │
+   │  ├ MeshCardsBuffer     ← MeshCards[] 数据                                │
+   │  ├ PageTableBuffer     ← PageTable[] 数据 (ByteAddressBuffer)            │
+   │  ├ CardPageBuffer      ← 单页信息 (用于 Atlas 更新操作)                   │
+   │  └ PrimitiveGroupBuffer ← PrimitiveGroup 数据                           │
+   └────────────────────────────────────────────────────────────────────────┘
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 七、具体分配示例
+
+ 场景：一个 2m × 2m 的墙壁,距离相机 5m
+
+ ### 7.1 Card 创建
+
+ ```
+   物体 (PrimitiveGroup) → 创建 MeshCards
+     MeshCards.CardLookup[+Z方向] = CardIndex 0
+     Card[0]:
+       OBB: Origin=(0,0,1), Extent=(1,1,0.1), Axis=+Z
+       根据距离选择 ResLevel: 7 (128x128 texel)
+       SurfaceMipMaps[ResLevel=7]:
+         SizeInPages = 1x1
+         PageTableSpanOffset = 100  (假设)
+ ```
+
+ ### 7.2 物理页分配
+
+ ```
+   ResLevel 7 = 128 texel = PhysicalPageSize
+   → 分配完整物理页
+
+   FLumenSurfaceCacheAllocator::Allocate():
+     PhysicalPageList 中找到空闲页 → PageCoord = (3, 5)
+     PageTable Entry:
+       PhysicalPageCoord = (3, 5)
+       PhysicalAtlasRect = (384, 640) - (512, 768)
+                          (3×128, 5×128) - ((3+1)×128, (5+1)×128)
+ ```
+
+ ### 7.3 物理 Atlas 中的布局
+
+ ```
+   PhysicalAtlas (2048x2048, 即 16x16 pages):
+   ┌─────────────────────────────────────────┐
+   │ P(0,0) P(1,0) P(2,0) P(3,0) ... P(15,0)│
+   │ P(0,1) P(1,1) P(2,1) P(3,1) ... P(15,1)│
+   │  ...                                    │
+   │ P(0,5) P(1,5) P(2,5) [P(3,5)] ...      │  ← 墙壁的 Card
+   │  ...                                    │  │
+   │ P(0,15) ........................ P(15,15)│
+   └─────────────────────────────────────────┘
+                   │
+                   ▼
+       AlbedoAtlas[384:512, 640:768] = 墙壁反照率
+       NormalAtlas[384:512, 640:768] = 墙壁法线
+       ...
+       FinalLightingAtlas[384:512, 640:768] = 墙壁最终光照
+ ```
+
+ ### 7.4 GPU 采样（Screen Probe 追踪时）
+
+ ```
+   射线命中墙壁 → CardIndex=0, CardUV=(0.3, 0.7)
+     │
+     ▼
+   PageCoord = (0.3, 0.7) × SizeInPages(1,1) = (0.3, 0.7) → 页(0,0)
+   LinearPageCoord = 0 + 0 × 1 = 0
+   PageTableIndex = 100 + 0 = 100
+     │
+     ▼
+   PageTableBuffer.Load(800) →
+     AtlasBias = (3×8, 5×8) × 8 = (384, 640)
+     ResLevelXY = (7, 7)
+     AtlasScale = 128
+     CoordInPage = frac(0.3, 0.7) × 128 = (38.4, 89.6)
+     │
+     ▼
+   PhysicalAtlasUV = ((38.4, 89.6) + (384, 640)) / 2048
+                   = (422.4, 729.6) / 2048
+                   = (0.206, 0.356)
+     │
+     ▼
+   采样 FinalLightingAtlas.Sample(0.206, 0.356) → 光照结果
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 八、核心设计洞察
+
+ ### 8.1 为什么用虚拟纹理而非直接 Atlas？
+
+ 1. 稀疏性：只有可见/重要的 Card 才分配物理页，远处的用低 ResLevel
+ 2. 动态加载：物体移动时只需更新 PageTable，不需要重新分配纹理
+ 3. 内存效率：一个 2048² 的 Atlas 可以服务成百上千个 Card
+
+ ### 8.2 子分配的价值
+
+ ```
+   没有子分配: 一个 8x8 texel 的 Card 也需要 128x128 物理页 → 93% 浪费
+   有子分配:   一个 8x8 texel 的 Card 只占 8x8 物理空间      → 0% 浪费
+
+   一个 128x128 物理页可容纳:
+     256 个 8x8 子分配
+     64  个 16x16 子分配
+     16  个 32x32 子分配
+     4   个 64x64 子分配
+     1   个 128x128 整页
+ ```
+
+ ### 8.3 0.5 texel 边框
+
+ ```
+   VirtualPageSize = 127 (而非 128)
+   → 每个虚拟页的四周预留 0.5 texel 边框
+   → 用于双边滤波时避免读取相邻页的数据
+   → 原始 128x128 物理页中, 有效采样区域是内部的 127x127
+ ```
+
+ ### 8.4 Locked Mip vs Unlocked Mip
+
+ ```
+   Locked Mip (低分辨率, 常驻):
+     - ResLevel 通常为 MinResLevel~5
+     - bLocked = true
+     - 永远分配, 不会被淘汰
+     - 用于 Card 远离相机时的最低质量保底
+
+   Unlocked Mip (高分辨率, 按需分配):
+     - ResLevel 6~11
+     - 根据反馈/GPU Driven 按需分配
+     - 有 LRU 淘汰机制 (UnlockedAllocationHeap)
+ ```
+
+ 这就是 Lumen Surface Cache 的完整存储布局。它的核心是一个带子分配的虚拟纹理系统，通过 MeshCards→Card→PageTable→PhysicalAtlas 的四级映射，实现了对场景表面光照数据的高效稀疏存储。
