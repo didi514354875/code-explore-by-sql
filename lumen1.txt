@@ -439,3 +439,250 @@
  ```
 
  这就是 Lumen Surface Cache 的完整存储布局。它的核心是一个带子分配的虚拟纹理系统，通过 MeshCards→Card→PageTable→PhysicalAtlas 的四级映射，实现了对场景表面光照数据的高效稀疏存储。
+
+
+
+ 一、本质：派生数据缓存键（Derived Data Cache Key）
+
+ DDCKey 是 MeshCards 派生数据在 Derived Data Cache（DDC） 中的唯一标识字符串。它决定：同一份网格内容 + 同一构建参数下，是否需要重新执行昂贵的离线 Embree 体素化+Surfel 聚类，还是直接从缓存命中反序列化。
+
+ FAsyncCardRepresentationTask（MeshCardBuild.h:233）中 FString DDCKey 字段贯穿整个生命周期：
+
+ ```
+   创建任务时生成 Key ──► 尝试 DDC 命中读取 ──► 未命中才异步构建 ──► 构建完成后用 Key 落盘
+ ```
+
+ 二、Key 的构造：BuildCardRepresentationDerivedDataKey
+
+ MeshCardRepresentation.cpp:219，调用链 BeginCacheMeshCardRepresentationInternal:262。
+
+ ```cpp
+   FString BuildCardRepresentationDerivedDataKey(const FString& InMeshKey, int32 MaxLumenMeshCards)
+   {
+       const float MinDensity     = MeshCardRepresentation::GetMinDensity();
+       const float NormalTreshold = MeshCardRepresentation::GetNormalTreshold();
+       const bool  bDebugMode     = MeshCardRepresentation::IsDebugMode();
+
+       return FDerivedDataCacheInterface::BuildCacheKey(
+           TEXT("CARD"),
+           *FString::Printf(TEXT("%s_%s%s%.3f_%.3f_%d"),
+               *InMeshKey,                              // 上游 DistanceField key（网格内容指纹）
+               CARDREPRESENTATION_DERIVEDDATA_VER,      // 算法/格式版本 GUID
+               bDebugMode ? TEXT("_DEBUG_") : TEXT(""), // 调试模式
+               MinDensity,                              // 聚类最小密度阈值
+               NormalTreshold,                          // 法线投影阈值
+               MaxLumenMeshCards),                      // 单网格最大卡片数
+           TEXT(""));
+   }
+ ```
+
+ ### Key 的五个输入因子
+
+ ┌────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ 因子                               │ 来源                                                                                    │ 作用                                                                                                                                                                                    │
+ ├────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ InMeshKey（上游 DistanceFieldKey） │ BuildDistanceFieldDerivedDataKey（DistanceFieldAtlas.cpp:163）                          │ 网格几何内容的指纹，包含 DISTANCEFIELD_DERIVEDDATA_VER、r.DistanceFields.MaxPerMeshResolution、r.DistanceFields.DefaultVoxelDensity 以及网格顶点/索引的                                 │
+ │                                    │                                                                                         │ hash。任何几何修改都会改变它，从而强制 MeshCards 重建。                                                                                                                                 │
+ ├────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ CARDREPRESENTATION_DERIVEDDATA_VER │ 硬编码 GUID BE3395EF-F023-4F1D-9827-1DD3C88E16DC（:195）                                │ 算法/数据格式版本。改 Embree 求交、Surfel 聚类逻辑、FMeshCardsBuildData 序列化格式时手动 bump，使全量缓存失效。                                                                         │
+ ├────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ MinDensity / NormalTreshold        │ MeshCardRepresentation::GetMinDensity() / GetNormalTreshold()（CVar                     │ 聚类有效性阈值与投影测试阈值。调整这些 CVar 会使旧缓存失效，触发按新参数重建。                                                                                                          │
+ │                                    │ r.MeshCardRepresentation.*）                                                            │                                                                                                                                                                                         │
+ ├────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ bDebugMode                         │ r.MeshCardRepresentation.Debug                                                          │ 调试模式生成额外 DebugData，用独立 key 避免污染正式缓存。                                                                                                                               │
+ ├────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ MaxLumenMeshCards                  │ SourceModel.BuildSettings.MaxLumenMeshCards（资产属性）                                 │ 每网格最大卡片数，影响 LimitClusters 裁剪。改资产设置会失效。                                                                                                                           │
+ └────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ ### 额外的版本因子（在 BeginCacheMeshCardRepresentationInternal:266 追加）
+
+ ```cpp
+   if (SourceModel.GetMeshDescriptionBulkData())
+   {
+       Key += SourceModel.GetMeshDescriptionBulkData()->GetUnversionedIdString();
+   }
+ ```
+
+ 如果源模型用 MeshDescription（而非原始三角网格），追加其 bulk data 的无版本 ID 字符串——这是对源模型内容变更的额外保险，确保编辑网格后 key 改变。
+
+ ### BuildCacheKey 的作用
+
+ FDerivedDataCacheInterface::BuildCacheKey("CARD", params, "") 将上述因子组装后做 hash，生成最终 key。第一个参数 "CARD" 是 缓存类型标识，让 MeshCards 缓存与 DistanceField（"DIST"）等其他派生数据隔离到独立命名空间。
+
+ 三、Key 的两大用途
+
+ ### 用途 1：构建前查询缓存（命中跳过构建）
+
+ CreateCardRepresentationTask（MeshCardRepresentation.cpp:305）：
+
+ ```cpp
+   if (!MeshCardRepresentation::IsDebugMode()
+       && GetDerivedDataCacheRef().GetSynchronous(*InDDCKey, DerivedData, Mesh->GetPathName()))
+   {
+       // DDC 命中：直接反序列化，不创建异步任务
+       FMemoryReader Ar(DerivedData, true);
+       Ar << OutRenderData;   // FCardRepresentationData
+   }
+   else
+   {
+       // 未命中：创建 FAsyncCardRepresentationTask，异步执行 Embree 构建
+       NewTask->DDCKey = InDDCKey;
+       ...
+   }
+ ```
+
+ 关键点：DDC 命中时直接同步反序列化，根本不创建 FAsyncCardRepresentationTask，不进入异步队列。只有未命中（或 debug 模式强制跳过缓存）时才创建任务并携带 DDCKey 供后续落盘。
+
+ ### 用途 2：构建后写入缓存（落盘供下次命中）
+
+ FinalizeAndDeleteTask（MeshCardRepresentation.cpp:1186），异步构建成功后在游戏线程：
+
+ ```cpp
+   if (!MeshCardRepresentation::IsDebugMode())
+   {
+       TArray<uint8> DerivedData;
+       FMemoryWriter Ar(DerivedData, true);
+       Ar << *(InTask->StaticMesh->GetRenderData()->LODResources[0].CardRepresentationData);
+       GetDerivedDataCacheRef().Put(*InTask->DDCKey, DerivedData, InTask->StaticMesh->GetPathName());
+   }
+ ```
+
+ 把刚构建的 FCardRepresentationData 序列化为字节流，以 DDCKey 存入 DDC。下次相同网格+参数组合时，用途 1 直接命中。
+
+ 四、完整缓存生命周期
+
+ ┌──────────────────────────────────────────┐
+ │                                          │
+ │                                          │
+ │ BeginCacheMeshCardRepresentationInternal │
+ │               构建 DDCKey                │
+ │                                          │
+ ┌──────────────────────────────────────────┐     ┌───────────────────────────────────┐
+ │                                          │     │                                   │
+ │                                          │     │                                   │
+ │ BeginCacheMeshCardRepresentationInternal │     │                Sto                │
+ │               构建 DDCKey                │     │                                   │
+ │                                          │     │                                   │
+ └─────────────────────┬────────────────────┘     └───────────────────────────────────┘
+                       │
+ ┌──────────────────────────────────────────┐
+ │                                          │
+ │                                          │
+ │ BeginCacheMeshCardRepresentationInternal │
+ │               构建 DDCKey                │
+ │                                          │
+ └─────────────────────┬────────────────────┘
+                       │
+                       │
+                       │
+                       │
+                       ▼
+ ◇──────────────────────────────────────────◇
+ │                                          │
+ │                                          │
+ │          GetDerivedDataCacheRef          ├───────────────────────┐
+ │         .GetSynchronous(DDCKey)          │                       │
+ │                                          │                    未命中
+ ◇─────────────────────┬────────────────────◇                       │
+                       │                                            │
+                     命中                                           │
+                       │                                            │
+                       │                                            │
+                       ▼                                            ▼
+ ┌──────────────────────────────────────────┐     ┌───────────────────────────────────┐
+ │                                          │     │                                   │
+ │                                          │     │                                   │
+ │     反序列化 FCardRepresentationData     │     │ 创建 FAsyncCardRepresentationTask │
+ │           不创建任务, 直接返回           │     │            携带 DDCKey            │
+ │                                          │     │                                   │
+ └─────────────────────┬────────────────────┘     └─────────────────┬─────────────────┘
+                       │                                            │
+                       │                                            │
+                       ├───────────────────────┐                    │
+                       │                       │                    │
+                       ▼                       │                    ▼
+ ┌──────────────────────────────────────────┐  │  ┌───────────────────────────────────┐
+ │                                          │  │  │                                   │
+ │        任务完成, 下次同 Key 命中         │  │  │         AddTask → 异步队列        │
+ │                                          │  │  │                                   │
+ └──────────────────────────────────────────┘  │  └─────────────────┬─────────────────┘
+                                               │                    │
+                                               │                    │
+                                               │                    │
+                                               │                    │
+                                               │                    │
+ ┌──────────────────────────────────────────┐  │                    │
+ │                                          │  │                    │
+ │                                          │  │                    │
+ │  Worker: GenerateCardRepresentationData  │◄─┼────────────────────┘
+ │       Embree 体素化 + Surfel 聚类        │  │
+ │                                          │  │
+ └─────────────────────┬────────────────────┘  │
+                       │                       │
+                       │                       │
+                       │                       │
+                       │                       │
+                       ▼                       │
+ ┌──────────────────────────────────────────┐  │
+ │                                          │  │
+ │                                          │  │
+ │          FinalizeAndDeleteTask           │  │
+ │                 游戏线程                 │  │
+ │                                          │  │
+ └─────────────────────┬────────────────────┘  │
+                       │                       │
+                       │                       │
+                       │                       │
+                       │                       │
+                       ▼                       │
+ ┌──────────────────────────────────────────┐  │
+ │                                          │  │
+ │        "RenderData.LODResources[0        │  │
+ │                                          │  │
+ └─────────────────────┬────────────────────┘  │
+                       │                       │
+                       │                       │
+                       │                       │
+                       │                       │
+                       ▼                       │
+ ┌──────────────────────────────────────────┐  │
+ │                                          │  │
+ │                                          │  │
+ │          GetDerivedDataCacheRef          │  │
+ │        .Put(DDCKey, DerivedData)         │  │
+ │                                          │  │
+ └─────────────────────┬────────────────────┘  │
+                       │                       │
+                       └───────────────────────┘
+
+ 五、关键设计要点
+
+ ┌───────────────────┬──────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────┐
+ │ 设计点            │ 实现                                                             │ 目的                                                       │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 几何内容指纹      │ InMeshKey 上溯到 DistanceField key，含网格顶点 hash              │ 编辑网格 → key 变 → 自动重建                               │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 算法版本化        │ CARDREPRESENTATION_DERIVEDDATA_VER GUID                          │ 改构建逻辑/序列化格式 → bump GUID → 全量失效               │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 参数敏感          │ MinDensity/NormalTreshold/MaxLumenMeshCards 入 key               │ 调 CVar/资产设置 → 旧缓存失效                              │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 调试隔离          │ bDebugMode 进 key + debug 模式跳过 Get/Put                       │ 调试数据不污染正式缓存                                     │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 缓存类型隔离      │ BuildCacheKey("CARD", ...)                                       │ 与 DistanceField "DIST" 命名空间分离                       │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ Class Schema 同步 │ AppendMeshCardConstantsToClassSchema（:202）                     │ 把同样常量写入 class schema，保证 DDC 版本升级时跨工程一致 │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ SourceModel 版本  │ GetMeshDescriptionBulkData()->GetUnversionedIdString()           │ MeshDescription 内容变更强制失效                           │
+ ├───────────────────┼──────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ 平台无关          │ CreateCardRepresentationTask 注释：用 GetRunningTargetPlatform() │ 数据平台无关，cook 各平台共用同一份缓存                    │
+ └───────────────────┴──────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────┘
+
+ ### AppendMeshCardConstantsToClassSchema 的补充作用
+
+ MeshCardRepresentation.cpp:202，把 MinDensity、NormalTreshold、bDebugMode、VersionString 写入资产的 class schema hash。这是 UE DDC 的全局失效层：当项目设置或引擎版本改变这些常量时，即便 InMeshKey 没变，class schema hash 变化也会使所有相关派生数据 key 失效，作为双保险。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 已确认事实：key 构造、查询命中、落盘写入、版本宏、上游 DistanceField key 构造均直接读取自 unreal.db 索引的 UE 源码（MeshCardRepresentation.cpp、DistanceFieldAtlas.cpp、MeshCardBuild.h）。
+
+ [INFERENCE]：InMeshKey（DistanceFieldKey）内部如何 hash 网格顶点/索引的具体算法在 FDerivedDataCacheInterface::BuildCacheKey 及上游 FStaticMeshDerivedDataKey 中，本轮未逐行读取，但其设计意图（内容指纹）由调用链和注释明确支撑。
