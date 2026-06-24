@@ -686,3 +686,750 @@
  已确认事实：key 构造、查询命中、落盘写入、版本宏、上游 DistanceField key 构造均直接读取自 unreal.db 索引的 UE 源码（MeshCardRepresentation.cpp、DistanceFieldAtlas.cpp、MeshCardBuild.h）。
 
  [INFERENCE]：InMeshKey（DistanceFieldKey）内部如何 hash 网格顶点/索引的具体算法在 FDerivedDataCacheInterface::BuildCacheKey 及上游 FStaticMeshDerivedDataKey 中，本轮未逐行读取，但其设计意图（内容指纹）由调用链和注释明确支撑。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+第一部分：FSurfelScene 完整数据心智模型                                                                                                                                          
+                                                                                                                                                                                  
+ ### 数据结构关系图                                                                                                                                                               
+                                                                                                                                                                                  
+ ┌──────────────────────────────────────────┐    ┌──────────────────────────────────────────────┐                                                                                 
+ │ FSurfelScene                             │    │ FClusteringParams                            │                                                                                 
+ ├──────────────────────────────────────────┤    ├──────────────────────────────────────────────┤                                                                                 
+ │ +Directions[6]: FSurfelScenePerDirection │    │ +VoxelSize: float                            │                                                                                 
+ │ +NumSurfels: int32                       │    │ +MinClusterCoverage: float                   │                                                                                 
+ └──────────────────────────────────────────┘    │ +MinOuterClusterCoverage: float              │                                                                                 
+                       ◆                         │ +MinDensityPerCluster: float                 │                                                                                 
+                       │                         │ +MaxLumenMeshCards: int32                    │                                                                                 
+                       │                         │ +bDebug: bool                                │                                                                                 
+                       │                         │ +bSingleThreadedBuild: bool                  │                                                                                 
+                6 个轴向方向                     │ +ClusterBasis[6]: FAxisAlignedDirectionBasis │                                                                                 
+                     │                           └──────────────────────────────────────────────┘                                                                                 
+                     │                                                   ◆                                                                                                        
+                     │                                        6 个轴向方向                                                                                                        
+                     │                                         │                                                                                                                  
+ ┌──────────────────────────────────────┐    ┌───────────────────────────────────┐                                                                                                
+ │ FSurfelScenePerDirection             │    │ FAxisAlignedDirectionBasis        │                                                                                                
+ ├──────────────────────────────────────┤    ├───────────────────────────────────┤                                                                                                
+ │ +Surfels: TArray~FSurfel~            │    │ +LocalToWorldRotation: FMatrix44f │                                                                                                
+ │ +DebugData: FLumenCardBuildDebugData │    │ +LocalToWorldOffset: FVector3f    │                                                                                                
+ ├──────────────────────────────────────┤    │ +VolumeSize: FIntVector           │                                                                                                
+ │ +Init                                │    │ +VoxelSize: float                 │                                                                                                
+ └──────────────────────────────────────┘    ├───────────────────────────────────┤                                                                                                
+                     ◆                       │ +TransformSurfel: FVector3f       │                                                                                                
+                     │                       └───────────────────────────────────┘                                                                                                
+              不定数量                                                                                                                                                            
+               │                                                                                                                                                                  
+               │                                                                                                                                                                  
+ ┌──────────────────────────┐                                                                                                                                                     
+ │ FSurfel                  │                                                                                                                                                     
+ ├──────────────────────────┤                                                                                                                                                     
+ │ +Coord: FIntVector       │                                                                                                                                                     
+ │ +MinRayZ: int32          │                                                                                                                                                     
+ │ +Coverage: float         │                                                                                                                                                     
+ │ +WeightedCoverage: float │                                                                                                                                                     
+ └──────────────────────────┘                                                                                                                                                     
+                                                                                                                                                                                  
+                                                                                                                                                                                  
+                                                                                                                                                                                  
+ ### 心智模型：6 个独立的体素世界                                                                                                                                                 
+                                                                                                                                                                                  
+ FSurfelScene 不是单一场景，而是 6 个独立的体素化世界叠加——每个轴对齐方向(±X/±Y/±Z)一个。这源于一个核心设计决定：每个方向都有自己的体素网格、自己的坐标系。                       
+                                                                                                                                                                                  
+ 为什么 6 个独立方向，而不是一个统一体素场？                                                                                                                                      
+                                                                                                                                                                                  
+ 因为 MeshCard 永远是轴对齐平面卡，捕获方向锁定 6 轴向之一。对每个方向独立体素化，让 surfel 的法线天然对齐该方向，省去法线聚类。一个表面的 surfel                                 
+ 只出现在"最匹配其法线"的那个方向里（由第一层 ray trace 的 NdotD >= NormalWeightTreshold 过滤保证）。                                                                             
+                                                                                                                                                                                  
+ ### 单个 surfel 的语义（FSurfel, :122）                                                                                                                                          
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   struct FSurfel {                                                                                                                                                               
+       FIntVector Coord;          // 该 surfel 在方向体素网格里的 (X, Y, Z) 整数坐标                                                                                              
+       int32 MinRayZ;             // 关键！卡片近平面到这个 surfel 的最小深度                                                                                                     
+       float Coverage;            // 该 cell 内有多少比例的采样光线命中了几何 (0~1)                                                                                               
+       float WeightedCoverage;    // Coverage × (Visibility + 1)，可见性加权后的重要性                                                                                            
+   };                                                                                                                                                                             
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ Coord 是整数体素坐标，不是世界坐标。 世界坐标由 FAxisAlignedDirectionBasis::TransformSurfel 还原：                                                                               
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   TransformSurfel(FIntVector SurfelCoord) {                                                                                                                                      
+       return LocalToWorldRotation.TransformPosition(                                                                                                                             
+           FVector3f(SurfelCoord.X + 0.5f, SurfelCoord.Y + 0.5f, SurfelCoord.Z)                                                                                                   
+       ) * VoxelSize + LocalToWorldOffset;                                                                                                                                        
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 注意 X+0.5f, Y+0.5f——surf‌el 在 cell 中心，Z 不加 0.5（Z 是深度层，整数层边界）。                                                                                                 
+                                                                                                                                                                                  
+ ### MinRayZ —— 整个系统最关键的字段                                                                                                                                              
+                                                                                                                                                                                  
+ MinRayZ 是 surfel 自身位置 Coord.Z 与"从网格表面沿捕获方向看，最近的可见深度层"的差值。它的作用在 FSurfelCluster::AddSurfel (:231) 揭示：                                        
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   void AddSurfel(...) {                                                                                                                                                          
+       const FSurfel& Surfel = SurfelScene.Surfels[SurfelIndex];                                                                                                                  
+       if (Surfel.Coord.Z >= NearPlane && Surfel.MinRayZ <= NearPlane) {  // 双向深度门控                                                                                         
+           SurfelIndices.Add(SurfelIndex);                                                                                                                                        
+           ...                                                                                                                                                                    
+       }                                                                                                                                                                          
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 双向深度门控——surf‌el 能否进入 NearPlane 层的 cluster，取决于：                                                                                                                   
+ - Coord.Z >= NearPlane：surf‌el 在近平面前方（离卡更远）；                                                                                                                        
+ - MinRayZ <= NearPlane：surf‌el 从近平面可见（卡放这层能看见它）。                                                                                                                
+                                                                                                                                                                                  
+ 这两个条件合起来定义"一张放在 NearPlane 深度的卡能看到哪些 surfel"。MinRayZ 是第二层 ray trace (visibility) 的产物——从 surfel 往外发射的穿透光线中，没有被遮挡的最浅深度层。     
+                                                                                                                                                                                  
+ ### 体素坐标系的构建（FAxisAlignedDirectionBasis）                                                                                                                               
+                                                                                                                                                                                  
+ 每个方向的 basis 把世界 → 局部体素空间：                                                                                                                                         
+ - LocalToWorldOffset：体素网格原点在世界空间的位置。对 +X 方向，原点在 mesh bounds 的 X 最大面；对 -X 方向，在 X 最小面。                                                        
+ - LocalToWorldRotation：3×3 矩阵，把局部 (X,Y,Z) 旋到世界。Z 轴 = 捕获方向（指向网格内部）。                                                                                     
+ - VolumeSize：该方向体素网格的 (宽, 高, 深)，从 mesh bounds / VoxelSize 算出。注意不同方向的 VolumeSize 维度会换算（如 X 方向的 width=Y, height=Z）。                            
+ - VoxelSize：体素边长，自适应缩放。                                                                                                                                              
+                                                                                                                                                                                  
+ ### Coverage 与 WeightedCoverage 的区别                                                                                                                                          
+                                                                                                                                                                                  
+ ┌──────────────────┬────────────────────────────────────────────────┬────────────────────────────────┐                                                                           
+ │ 字段             │ 含义                                           │ 来源                           │                                                                           
+ ├──────────────────┼────────────────────────────────────────────────┼────────────────────────────────┤                                                                           
+ │ Coverage         │ cell 内几何命中率：32 条光线里命中三角形的比例 │ 第一层 ray trace（体素化）     │                                                                           
+ ├──────────────────┼────────────────────────────────────────────────┼────────────────────────────────┤                                                                           
+ │ WeightedCoverage │ Coverage × (Visibility + 1)                    │ 第二层 ray trace（天空可见性） │                                                                           
+ └──────────────────┴────────────────────────────────────────────────┴────────────────────────────────┘                                                                           
+                                                                                                                                                                                  
+ +1 保证 WeightedCoverage ≥ Coverage，让即使可见性为 0 的 surfel 仍有基础权重。聚类时 LimitClusters 按 WeightedCoverage 排序——完全被遮挡的内部 surfel 权重最低，优先被裁掉。      
+                                                                                                                                                                                  
+ ### 从 FSurfelScene 到最终卡的映射                                                                                                                                               
+                                                                                                                                                                                  
+ ┌───────────────────────────────────────┐                                                                                                                                        
+ │  FSurfelScene (6 方向, 数千 surfel)   │                                                                                                                                        
+ │                                       │                                                                                                                                        
+ │                                       │                                                                                                                                        
+ │ ┌───────────────────────────────────┐ │   ┌──────────────────┐          ┌───────────────────────┐     ┌──────────────────────────────────────────┐                             
+ │ │                                   │ │   │                  │          │                       │     │                                          │                             
+ │ │                                   │ │   │                  │          │                       │     │                                          │                             
+ │ │ Dir 0 (+X): TArray&lt;FSurfel&gt; │ │   │ "FSurfelCluster[ ├几何封装─►│ "FLumenCardBuildData[ ├────►│           FMeshCardsBuildData            │                             
+ │ │                                   │ │   │                  │          │                       │     │ Bounds + bMostlyTwoSided + CardBuildData │                             
+ │ │                                   │ │   │                  │          │                       │     │                                          │                             
+ │ └───────────────────────────────────┘ │   └──────────────────┘          └───────────────────────┘     └──────────────────────────────────────────┘                             
+ │                                       │             ▲                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │ ┌───────────────────────────────────┐ │             │                                                                                                                          
+ │ │                                   │ │             │                                                                                                                          
+ │ │ Dir 1 (-X): TArray&lt;FSurfel&gt; │ │             │                                                                                                                          
+ │ │                                   │ │             │                                                                                                                          
+ │ └───────────────────────────────────┘ │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │ ┌───────────────────────────────────┐ │             │                                                                                                                          
+ │ │                                   │ │             │                                                                                                                          
+ │ │                ...                │ │             │                                                                                                                          
+ │ │                                   │ │             │                                                                                                                          
+ │ └───────────────────────────────────┘ │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ │ ┌───────────────────────────────────┐ │             │                                                                                                                          
+ │ │                                   │ │             │                                                                                                                          
+ │ │ Dir 5 (-Z): TArray&lt;FSurfel&gt; │ │      每方向独立聚类                                                                                                                    
+ │ │                                   │ │             │                                                                                                                          
+ │ └───────────────────────────────────┘ │             │                                                                                                                          
+ │                                       │             │                                                                                                                          
+ └───────────────────────────────────────┘             │                                                                                                                          
+                                                       │                                                                                                                          
+                                                       │                                                                                                                          
+                                                       │                                                                                                                          
+   ┌───────────────────────────────────┐               │                                                                                                                          
+   │                                   │               │                                                                                                                          
+   │                 SM                ├───────────────┘                                                                                                                          
+   │                                   │                                                                                                                                          
+   └───────────────────────────────────┘                                                                                                                                          
+                                                                                                                                                                                  
+ 关键洞察：方向是 surfel 的内在属性。 surfel 不存"我属于哪个方向"——它在 Directions[which] 数组的哪个槽里，就属于哪个方向。最终卡的 AxisAlignedDirectionIndex                      
+ 直接继承自产生它的方向索引。这就是为什么 6 方向要分开存——避免给每个 surfel 加方向标签，用数组位置编码方向。                                                                      
+                                                                                                                                                                                  
+ ────────────────────────────────────────────────────────────────────────────────                                                                                                 
+                                                                                                                                                                                  
+ 第二部分：InitSurfelScene 算法逻辑详细拆解                                                                                                                                       
+                                                                                                                                                                                  
+ InitSurfelScene (:675) 的职责：用 Embree ray trace 把网格体素化成 surfel，填满 FSurfelScene 的 6 个方向。它有自适应体素密度循环。                                                
+                                                                                                                                                                                  
+ ### 完整流程图                                                                                                                                                                   
+                                                                                                                                                                                  
+  (─────────────────────────────────)                                                                                                                                             
+  │                                 │                                                                                                                                             
+  │         InitSurfelScene         │                                                                                                                                             
+  │                                 │                                                                                                                                             
+  (────────────────┬────────────────)                                                                                                                                             
+                   │                                                                                                                                                              
+                   │                                                                                                                                                              
+                   │                                                                                                                                                              
+                   │                                                                                                                                                              
+                   ▼                                                                                                                                                              
+  ◇─────────────────────────────────◇                                                                                                                                             
+  │                                 │                                                                                                                                             
+  │     NumTrianglesTotal == 0?     ├────────────────────────────┐                                                                                                                
+  │                                 │                            │                                                                                                                
+  ◇────────────────┬────────────────◇                           否                                                                                                                
+                   │                                             │                                                                                                                
+                  是                                             │                                                                                                                
+                   │                                             │                                                                                                                
+                   │                                             │                                                                                                                
+                   ▼                                             ▼                                                                                                                
+  (─────────────────────────────────)     ┌────────────────────────────────────────────┐                                                                                          
+  │                                 │     │                                            │                                                                                          
+  │                                 │     │                                            │                                                                                          
+  (─────────────────────────────────────────)                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │             InitSurfelScene             │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  (────────────────────┬────────────────────)                                                                                                                                     
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ◇─────────────────────────────────────────◇                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │         NumTrianglesTotal == 0?         ├────────────────────────────┐                                                                                                        
+  │                                         │                            │                                                                                                        
+  ◇────────────────────┬────────────────────◇                           否                                                                                                        
+                       │                                                 │                                                                                                        
+                      是                                                 │                                                                                                        
+                       │                                                 │                                                                                                        
+                       │                                                 │                                                                                                        
+                       ▼                                                 ▼                                                                                                        
+  (─────────────────────────────────────────)     ┌────────────────────────────────────────────┐                                                                                  
+  │                                         │     │                                            │                                                                                  
+  │                                         │     │                                            │                                                                                  
+  │          return, 空 SurfelScene         │     │         生成 32 条半球随机光线方向         │                                                                                  
+  │                                         │     │ GenerateStratifiedUniformHemisphereSamples │                                                                                  
+  │                                         │     │                                            │                                                                                  
+  (─────────────────────────────────────────)     └──────────────────────┬─────────────────────┘                                                                                  
+                                                                         │                                                                                                        
+                                                                         │                                                                                                        
+                                                                         │                                                                                                        
+                                                                         │                                                                                                        
+                                                                         │                                                                                                        
+  ┌─────────────────────────────────────────┐                            │                                                                                                        
+  │                                         │                            │                                                                                                        
+  │                                         │                            │                                                                                                        
+  │      初始化: TargetNumSurfels=10000     │◄───────────────────────────┘                                                                                                        
+  │               MaxVoxels=64              │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  └────────────────────┬────────────────────┘                                                                                                                                     
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ◇─────────────────────────────────────────◇                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                自适应循环               │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  ◇────────────────────┬────────────────────◇                                                                                                                                     
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ┌─────────────────────────────────────────┐                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │           InitClusteringParams          │     ◄───────┐                                                                                                                       
+  │         按 MaxVoxels 算体素网格         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ┌─────────────────────────────────────────┐             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │            ParallelFor 6 方向           │             │                                                                                                                       
+  │  每方向独立 GenerateSurfelsForDirection │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ┌─────────────────────────────────────────┐             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │             统计 NumSurfels             │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ◇─────────────────────────────────────────◇             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │            NumSurfels > 10000           │   是,减半体素                                                                                                                       
+  │            且 MaxVoxels > 1?            │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  ◇────────────────────┬────────────────────◇                                                                                                                                     
+                       │                                                                                                                                                          
+                      否                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ◇─────────────────────────────────────────◇                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                 bDebug?                 │    ├───────────────────────────────────┐                                                                                            
+  │                                         │                                        │                                                                                            
+  ◇────────────────────┬────────────────────◇                                       否                                                                                            
+                       │                                                             │                                                                                            
+                      是                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       ▼                                                             ▼                                                                                            
+  ┌─────────────────────────────────────────┐                 (─────────────────────────────────────────────)                                                                     
+  │                                         │                 │                                             │                                                                     
+  │     合并 6 方向 DebugData 到 OutData    │    ├───────────►│            结束, SurfelScene 就绪           │                                                                     
+  │                                         │                 │                                             │                                                                     
+  └─────────────────────────────────────────┘                 (─────────────────────────────────────────────)                                                                     
+                                                                                                                                                                                  
+ ### 步骤 1：前置检查与随机方向准备                                                                                                                                               
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   if (Context.EmbreeScene.NumTrianglesTotal == 0) return;  // 空网格直接退出                                                                                                     
+                                                                                                                                                                                  
+   constexpr uint32 NumRayDirectionsOverHemisphere = 32;                                                                                                                          
+   MeshUtilities::GenerateStratifiedUniformHemisphereSamples(32, RandomStream(0), RayDirectionsOverHemisphere);                                                                   
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 32 条半球随机方向固定种子 0——保证可复现性，同网格永远产出相同 surfel。这些方向用于第二层 visibility ray trace（每个 surfel 沿其法线半球发射）。                                  
+                                                                                                                                                                                  
+ ### 步骤 2：自适应体素密度循环（核心）                                                                                                                                           
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   int32 TargetNumSufels = 10000;                                                                                                                                                 
+   float MaxVoxels = 64;   // 沿最长边的最大体素数                                                                                                                                
+                                                                                                                                                                                  
+   do {                                                                                                                                                                           
+       InitClusteringParams(ClusteringParams, MeshCardsBounds, MaxVoxels, MaxLumenMeshCards);                                                                                     
+       // ... ParallelFor 生成 surfel ...                                                                                                                                         
+       MaxVoxels = MaxVoxels / 2;   // 太密就减半体素数                                                                                                                           
+   } while (SurfelScene.NumSurfels > TargetNumSufels && MaxVoxels > 1);                                                                                                           
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 这是质量/性能的自适应平衡：                                                                                                                                                      
+ - 起始用最细体素（64³ 量级），力求精度；                                                                                                                                         
+ - 若生成 surfel 超过 10000（密集双面网格如植被会爆炸），减半体素数重来；                                                                                                         
+ - MaxVoxels > 1 防止退化成单个体素。                                                                                                                                             
+                                                                                                                                                                                  
+ 为什么 10000？ 性能约束。surf‌el 数量直接影响后续 BuildSurfelClusters 的 O(N²) 聚类代价。超过则牺牲精度换可接受耗时。                                                             
+                                                                                                                                                                                  
+ ### 步骤 3：InitClusteringParams —— 构建每方向的体素坐标系                                                                                                                       
+                                                                                                                                                                                  
+ InitClusteringParams (:580) 为 6 方向各算 FAxisAlignedDirectionBasis。以 +X 方向 (AxisAlignedDirectionIndex=0) 为例（InitClusteringParams 代码 :600）：                          
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   // VoxelSize = 最长边 / MaxVoxels                                                                                                                                              
+   // SizeInVoxels = bounds 各边 / VoxelSize                                                                                                                                      
+                                                                                                                                                                                  
+   for (AxisAlignedDirectionIndex in 0..6) {                                                                                                                                      
+       // 确定该方向的局部 X/Y/Z 如何映射世界轴                                                                                                                                   
+       switch (AxisAlignedDirectionIndex / 2) {                                                                                                                                   
+           case 0: // X 轴方向                                                                                                                                                    
+               XAxis = (0,1,0); YAxis = (0,0,1); break;  // 卡平面在 YZ                                                                                                           
+           case 1: // Y 轴方向                                                                                                                                                    
+               XAxis = (1,0,0); YAxis = (0,0,1); break;  // 卡平面在 XZ                                                                                                           
+           case 2: // Z 轴方向                                                                                                                                                    
+               XAxis = (1,0,0); YAxis = (0,1,0); break;  // 卡平面在 XY                                                                                                           
+       }                                                                                                                                                                          
+       ZAxis = AxisAlignedDirectionIndexToNormal(AxisAlignedDirectionIndex);  // ±某轴                                                                                            
+                                                                                                                                                                                  
+       ClusterBasis.LocalToWorldRotation = FMatrix44f(XAxis, YAxis, -ZAxis, Zero);                                                                                                
+       // -ZAxis: 光线从外向内射, Z 指向网格内部                                                                                                                                  
+                                                                                                                                                                                  
+       ClusterBasis.LocalToWorldOffset = VoxelBoundsMin;                                                                                                                          
+       if (AxisAlignedDirectionIndex & 1)  // 奇数=负方向                                                                                                                         
+           Offset[axisIdx] = VoxelBoundsMax[axisIdx];  // 负方向原点在对侧面                                                                                                      
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 关键设计：-ZAxis 让局部 Z 指向网格内部——光线从外面射入，Z 递增 = 深度递增。这让 Coord.Z 直接表示"距离卡片有多深"，与 meshcard                                                    
+ 捕获方向一致。负方向（-X/-Y/-Z）的原点偏移到对侧面，保证光线始终从外向内。                                                                                                       
+                                                                                                                                                                                  
+ VolumeSize 按方向换算维度（:636），因为不同方向的"卡平面宽高"对应不同的世界轴。                                                                                                  
+                                                                                                                                                                                  
+ ### 步骤 4：GenerateSurfelsForDirection —— 双层 ray trace 体素化（6 方向并行）                                                                                                   
+                                                                                                                                                                                  
+ 这是 InitSurfelScene 内 ParallelFor 调用的核心，上一轮已分析。核心逻辑（GenerateSurfelsForDirection :351）对每个方向：                                                           
+                                                                                                                                                                                  
+ 第一层：轴向穿透光线（体素化）——沿 Z 轴（捕获方向）发射 32 条抖动光线穿透网格：                                                                                                  
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   for (CoordX, CoordY in VolumeSize) {       // 遍历卡平面每个 cell                                                                                                              
+       for (SampleIndex in 32) {              // 每 cell 32 条抖动光线                                                                                                            
+           RayOrigin = 旋转到世界坐标 * VoxelSize + Offset;                                                                                                                       
+           RayOrigin -= RayDirection * NearPlaneOffset;  // 后退到网格外                                                                                                          
+                                                                                                                                                                                  
+           while (LastHitCoordZ + 1 < VolumeSize.Z) {    // 穿透循环                                                                                                              
+               rtcIntersect1(Scene, &EmbreeRay, ...);    // Embree 查相交                                                                                                         
+               if (命中) {                                                                                                                                                        
+                   HitCoordZ = (tfar - NearPlaneOffset) / VoxelSize;  // 命中哪层                                                                                                 
+                   NdotD = Dot(-RayDir, Normal);                                                                                                                                  
+                   if (NdotD >= NormalWeightTreshold      // 法线投影过滤背向面                                                                                                   
+                       && HitCoordZ > LastHitCoordZ + 1) {                                                                                                                        
+                       // 生成候选 SurfelSample                                                                                                                                   
+                       SurfelSample.CellZ = HitCoordZ;                                                                                                                            
+                       SurfelSample.MinRayZ = LastHitCoordZ + 1;  // 从上一层可见                                                                                                 
+                   }                                                                                                                                                              
+                   SkipPrimId = 命中三角形;      // 跳过已命中                                                                                                                    
+                   RayTNear = nextafter(下一层); // 前推光线                                                                                                                      
+               } else break;                                                                                                                                                      
+           }                                                                                                                                                                      
+       }                                                                                                                                                                          
+       // 排序 + 合并同 MinRayZ 的样本 → 实际 FSurfel                                                                                                                             
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 穿透循环的精妙：一条光线不只相交一次。while 循环里每次命中后，SkipPrimId 跳过该三角形、RayTNear                                                                                  
+ 把光线起点推到命中点之后，继续往前射。这实现了沿射线的深度切片——把网格沿捕获方向切成多层，每层若被法线测试认可就生成 surfel。HitCoordZ > LastHitCoordZ + 1 保证新 surfel         
+ 在更深的新层。                                                                                                                                                                   
+                                                                                                                                                                                  
+ 第二层：半球 visibility 光线——对每个候选 surfel 沿其法线半球发射 32 条方向光线 (ComputeSurfelVisibility :267)：                                                                  
+ - 未命中 → VisibilitySum += 1.0（逃逸天空=可见）；                                                                                                                               
+ - 命中 → += 0.0（被遮挡），背面命中计入 NumBackFaceHits；                                                                                                                        
+ - Visibility = VisibilitySum / 32；                                                                                                                                              
+ - 若命中率 > 0.8 且背面率 > 0.2 → bInsideGeometry，剔除该 surfel（几何内部点无意义）。                                                                                           
+                                                                                                                                                                                  
+ 最终：Surfel.WeightedCoverage = Coverage × (Visibility + 1)。                                                                                                                    
+                                                                                                                                                                                  
+ ### 步骤 5：surfel 合并（cell 内样本 → surfel）                                                                                                                                  
+                                                                                                                                                                                  
+ 第一层产出的是 FSurfelSample（每条光线每次命中一个），需要合并成 cell 级 FSurfel：                                                                                               
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   // 排序: 先按 CellZ, 再按 MinRayZ 降序                                                                                                                                         
+   SurfelSamples.Sort([](A, B){                                                                                                                                                   
+       if (A.CellZ != B.CellZ) return A.CellZ < B.CellZ;                                                                                                                          
+       return A.MinRayZ > B.MinRayZ;  // 同 cell 内, MinRayZ 大的优先                                                                                                             
+   });                                                                                                                                                                            
+                                                                                                                                                                                  
+   // 连续相同 MinRayZ 的样本 span → 一个 surfel                                                                                                                                  
+   while (SurfelSampleSpanBegin + 1 < CellNumSurfelSamples) {                                                                                                                     
+       // 找连续相同 MinRayZ 的 span                                                                                                                                              
+       for (...) if (MinRayZ 相同) ++spanSize; else break;                                                                                                                        
+                                                                                                                                                                                  
+       if (spanSize >= MinSurfelSamples) {                                                                                                                                        
+           FSurfelVisibility Vis = ComputeSurfelVisibility(...);  // 第二层 ray trace                                                                                             
+           float Coverage = spanSize / 32.0f;                                                                                                                                     
+                                                                                                                                                                                  
+           if (Vis.bValid) {                                                                                                                                                      
+  │         NumTrianglesTotal == 0?         │    ├───────────────────────────────────┐                                                                                            
+  │                                         │                                        │                                                                                            
+  ◇────────────────────┬────────────────────◇                                       否                                                                                            
+                       │                                                             │                                                                                            
+                      是                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       ▼                                                             ▼                                                                                            
+  (─────────────────────────────────────────)                 ┌─────────────────────────────────────────────┐                                                                     
+  │                                         │                 │                                             │                                                                     
+  │                                         │                 │                                             │                                                                     
+  │          return, 空 SurfelScene         │                 │          生成 32 条半球随机光线方向         │                                                                     
+  │                                         │                 │  GenerateStratifiedUniformHemisphereSamples │                                                                     
+  │                                         │                 │                                             │                                                                     
+  (─────────────────────────────────────────)                 └──────────────────────┬──────────────────────┘                                                                     
+                                                                                     │                                                                                            
+                                                                                     │                                                                                            
+                                                                                     │                                                                                            
+                                                                                     │                                                                                            
+                                                                                     │                                                                                            
+  ┌─────────────────────────────────────────┐                                        │                                                                                            
+  │                                         │                                        │                                                                                            
+  │                                         │                                        │                                                                                            
+  │      初始化: TargetNumSurfels=10000     │     ◄──────────────────────────────────┘                                                                                            
+  │               MaxVoxels=64              │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  └────────────────────┬────────────────────┘                                                                                                                                     
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ◇─────────────────────────────────────────◇                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                自适应循环               │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  ◇────────────────────┬────────────────────◇                                                                                                                                     
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ┌─────────────────────────────────────────┐                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │           InitClusteringParams          │     ◄───────┐                                                                                                                       
+  │         按 MaxVoxels 算体素网格         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ┌─────────────────────────────────────────┐             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │            ParallelFor 6 方向           │             │                                                                                                                       
+  │  每方向独立 GenerateSurfelsForDirection │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ┌─────────────────────────────────────────┐             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │             统计 NumSurfels             │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  └────────────────────┬────────────────────┘             │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       │                                  │                                                                                                                       
+                       ▼                                  │                                                                                                                       
+  ◇─────────────────────────────────────────◇             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │                                         │             │                                                                                                                       
+  │            NumSurfels > 10000           │   是,减半体素                                                                                                                       
+  │            且 MaxVoxels > 1?            │                                                                                                                                     
+  │                                         │                                                                                                                                     
+  ◇────────────────────┬────────────────────◇                                                                                                                                     
+                       │                                                                                                                                                          
+                      否                                                                                                                                                          
+                       │                                                                                                                                                          
+                       │                                                                                                                                                          
+                       ▼                                                                                                                                                          
+  ◇─────────────────────────────────────────◇                                                                                                                                     
+  │                                         │                                                                                                                                     
+  │                 bDebug?                 │    ├───────────────────────────────────┐                                                                                            
+  │                                         │                                        │                                                                                            
+  ◇────────────────────┬────────────────────◇                                       否                                                                                            
+                       │                                                             │                                                                                            
+                      是                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       │                                                             │                                                                                            
+                       ▼                                                             ▼                                                                                            
+  ┌─────────────────────────────────────────┐                 (─────────────────────────────────────────────)                                                                     
+  │                                         │                 │                                             │                                                                     
+  │     合并 6 方向 DebugData 到 OutData    │    ├───────────►│            结束, SurfelScene 就绪           │                                                                     
+  │                                         │                 │                                             │                                                                     
+  └─────────────────────────────────────────┘                 (─────────────────────────────────────────────)                                                                     
+                                                                                                                                                                                  
+ ### 步骤 1：前置检查与随机方向准备                                                                                                                                               
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   if (Context.EmbreeScene.NumTrianglesTotal == 0) return;  // 空网格直接退出                                                                                                     
+                                                                                                                                                                                  
+   constexpr uint32 NumRayDirectionsOverHemisphere = 32;                                                                                                                          
+   MeshUtilities::GenerateStratifiedUniformHemisphereSamples(32, RandomStream(0), RayDirectionsOverHemisphere);                                                                   
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 32 条半球随机方向固定种子 0——保证可复现性，同网格永远产出相同 surfel。这些方向用于第二层 visibility ray trace（每个 surfel 沿其法线半球发射）。                                  
+                                                                                                                                                                                  
+ ### 步骤 2：自适应体素密度循环（核心）                                                                                                                                           
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   int32 TargetNumSufels = 10000;                                                                                                                                                 
+   float MaxVoxels = 64;   // 沿最长边的最大体素数                                                                                                                                
+                                                                                                                                                                                  
+   do {                                                                                                                                                                           
+       InitClusteringParams(ClusteringParams, MeshCardsBounds, MaxVoxels, MaxLumenMeshCards);                                                                                     
+       // ... ParallelFor 生成 surfel ...                                                                                                                                         
+       MaxVoxels = MaxVoxels / 2;   // 太密就减半体素数                                                                                                                           
+   } while (SurfelScene.NumSurfels > TargetNumSufels && MaxVoxels > 1);                                                                                                           
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 这是质量/性能的自适应平衡：                                                                                                                                                      
+ - 起始用最细体素（64³ 量级），力求精度；                                                                                                                                         
+ - 若生成 surfel 超过 10000（密集双面网格如植被会爆炸），减半体素数重来；                                                                                                         
+ - MaxVoxels > 1 防止退化成单个体素。                                                                                                                                             
+                                                                                                                                                                                  
+ 为什么 10000？ 性能约束。surf‌el 数量直接影响后续 BuildSurfelClusters 的 O(N²) 聚类代价。超过则牺牲精度换可接受耗时。                                                             
+                                                                                                                                                                                  
+ ### 步骤 3：InitClusteringParams —— 构建每方向的体素坐标系                                                                                                                       
+                                                                                                                                                                                  
+ InitClusteringParams (:580) 为 6 方向各算 FAxisAlignedDirectionBasis。以 +X 方向 (AxisAlignedDirectionIndex=0) 为例（InitClusteringParams 代码 :600）：                          
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   // VoxelSize = 最长边 / MaxVoxels                                                                                                                                              
+   // SizeInVoxels = bounds 各边 / VoxelSize                                                                                                                                      
+                                                                                                                                                                                  
+   for (AxisAlignedDirectionIndex in 0..6) {                                                                                                                                      
+       // 确定该方向的局部 X/Y/Z 如何映射世界轴                                                                                                                                   
+       switch (AxisAlignedDirectionIndex / 2) {                                                                                                                                   
+           case 0: // X 轴方向                                                                                                                                                    
+               XAxis = (0,1,0); YAxis = (0,0,1); break;  // 卡平面在 YZ                                                                                                           
+           case 1: // Y 轴方向                                                                                                                                                    
+               XAxis = (1,0,0); YAxis = (0,0,1); break;  // 卡平面在 XZ                                                                                                           
+           case 2: // Z 轴方向                                                                                                                                                    
+               XAxis = (1,0,0); YAxis = (0,1,0); break;  // 卡平面在 XY                                                                                                           
+       }                                                                                                                                                                          
+       ZAxis = AxisAlignedDirectionIndexToNormal(AxisAlignedDirectionIndex);  // ±某轴                                                                                            
+                                                                                                                                                                                  
+       ClusterBasis.LocalToWorldRotation = FMatrix44f(XAxis, YAxis, -ZAxis, Zero);                                                                                                
+       // -ZAxis: 光线从外向内射, Z 指向网格内部                                                                                                                                  
+                                                                                                                                                                                  
+       ClusterBasis.LocalToWorldOffset = VoxelBoundsMin;                                                                                                                          
+       if (AxisAlignedDirectionIndex & 1)  // 奇数=负方向                                                                                                                         
+           Offset[axisIdx] = VoxelBoundsMax[axisIdx];  // 负方向原点在对侧面                                                                                                      
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 关键设计：-ZAxis 让局部 Z 指向网格内部——光线从外面射入，Z 递增 = 深度递增。这让 Coord.Z 直接表示"距离卡片有多深"，与 meshcard                                                    
+ 捕获方向一致。负方向（-X/-Y/-Z）的原点偏移到对侧面，保证光线始终从外向内。                                                                                                       
+                                                                                                                                                                                  
+ VolumeSize 按方向换算维度（:636），因为不同方向的"卡平面宽高"对应不同的世界轴。                                                                                                  
+                                                                                                                                                                                  
+ ### 步骤 4：GenerateSurfelsForDirection —— 双层 ray trace 体素化（6 方向并行）                                                                                                   
+                                                                                                                                                                                  
+ 这是 InitSurfelScene 内 ParallelFor 调用的核心，上一轮已分析。核心逻辑（GenerateSurfelsForDirection :351）对每个方向：                                                           
+                                                                                                                                                                                  
+ 第一层：轴向穿透光线（体素化）——沿 Z 轴（捕获方向）发射 32 条抖动光线穿透网格：                                                                                                  
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   for (CoordX, CoordY in VolumeSize) {       // 遍历卡平面每个 cell                                                                                                              
+       for (SampleIndex in 32) {              // 每 cell 32 条抖动光线                                                                                                            
+           RayOrigin = 旋转到世界坐标 * VoxelSize + Offset;                                                                                                                       
+           RayOrigin -= RayDirection * NearPlaneOffset;  // 后退到网格外                                                                                                          
+                                                                                                                                                                                  
+           while (LastHitCoordZ + 1 < VolumeSize.Z) {    // 穿透循环                                                                                                              
+               rtcIntersect1(Scene, &EmbreeRay, ...);    // Embree 查相交                                                                                                         
+               if (命中) {                                                                                                                                                        
+                   HitCoordZ = (tfar - NearPlaneOffset) / VoxelSize;  // 命中哪层                                                                                                 
+                   NdotD = Dot(-RayDir, Normal);                                                                                                                                  
+                   if (NdotD >= NormalWeightTreshold      // 法线投影过滤背向面                                                                                                   
+                       && HitCoordZ > LastHitCoordZ + 1) {                                                                                                                        
+                       // 生成候选 SurfelSample                                                                                                                                   
+                       SurfelSample.CellZ = HitCoordZ;                                                                                                                            
+                       SurfelSample.MinRayZ = LastHitCoordZ + 1;  // 从上一层可见                                                                                                 
+                   }                                                                                                                                                              
+                   SkipPrimId = 命中三角形;      // 跳过已命中                                                                                                                    
+                   RayTNear = nextafter(下一层); // 前推光线                                                                                                                      
+               } else break;                                                                                                                                                      
+           }                                                                                                                                                                      
+       }                                                                                                                                                                          
+       // 排序 + 合并同 MinRayZ 的样本 → 实际 FSurfel                                                                                                                             
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 穿透循环的精妙：一条光线不只相交一次。while 循环里每次命中后，SkipPrimId 跳过该三角形、RayTNear                                                                                  
+ 把光线起点推到命中点之后，继续往前射。这实现了沿射线的深度切片——把网格沿捕获方向切成多层，每层若被法线测试认可就生成 surfel。HitCoordZ > LastHitCoordZ + 1 保证新 surfel         
+ 在更深的新层。                                                                                                                                                                   
+                                                                                                                                                                                  
+ 第二层：半球 visibility 光线——对每个候选 surfel 沿其法线半球发射 32 条方向光线 (ComputeSurfelVisibility :267)：                                                                  
+ - 未命中 → VisibilitySum += 1.0（逃逸天空=可见）；                                                                                                                               
+ - 命中 → += 0.0（被遮挡），背面命中计入 NumBackFaceHits；                                                                                                                        
+ - Visibility = VisibilitySum / 32；                                                                                                                                              
+ - 若命中率 > 0.8 且背面率 > 0.2 → bInsideGeometry，剔除该 surfel（几何内部点无意义）。                                                                                           
+                                                                                                                                                                                  
+ 最终：Surfel.WeightedCoverage = Coverage × (Visibility + 1)。                                                                                                                    
+                                                                                                                                                                                  
+ ### 步骤 5：surfel 合并（cell 内样本 → surfel）                                                                                                                                  
+                                                                                                                                                                                  
+ 第一层产出的是 FSurfelSample（每条光线每次命中一个），需要合并成 cell 级 FSurfel：                                                                                               
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   // 排序: 先按 CellZ, 再按 MinRayZ 降序                                                                                                                                         
+   SurfelSamples.Sort([](A, B){                                                                                                                                                   
+       if (A.CellZ != B.CellZ) return A.CellZ < B.CellZ;                                                                                                                          
+       return A.MinRayZ > B.MinRayZ;  // 同 cell 内, MinRayZ 大的优先                                                                                                             
+   });                                                                                                                                                                            
+                                                                                                                                                                                  
+   // 连续相同 MinRayZ 的样本 span → 一个 surfel                                                                                                                                  
+   while (SurfelSampleSpanBegin + 1 < CellNumSurfelSamples) {                                                                                                                     
+       // 找连续相同 MinRayZ 的 span                                                                                                                                              
+       for (...) if (MinRayZ 相同) ++spanSize; else break;                                                                                                                        
+                                                                                                                                                                                  
+       if (spanSize >= MinSurfelSamples) {                                                                                                                                        
+           FSurfelVisibility Vis = ComputeSurfelVisibility(...);  // 第二层 ray trace                                                                                             
+           float Coverage = spanSize / 32.0f;                                                                                                                                     
+                                                                                                                                                                                  
+           if (Vis.bValid) {                                                                                                                                                      
+               FSurfel& Surfel = SurfelScenePerDirection.Surfels.AddDefaulted_GetRef();                                                                                           
+               Surfel.Coord = FIntVector(CoordX, CoordY, CoordZ);                                                                                                                 
+               Surfel.MinRayZ = MedianMinRayZ;                                                                                                                                    
+               Surfel.Coverage = Coverage;                                                                                                                                        
+               Surfel.WeightedCoverage = Coverage * (Vis.Visibility + 1.0f);                                                                                                      
+           }                                                                                                                                                                      
+       }                                                                                                                                                                          
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 合并规则：同一 cell 内，MinRayZ 相同的样本代表"从同一深度可见的同一片表面"，合并成一个 surfel。Coverage = spanSize / 32（32 条光线里命中该片的比例）。MinRayZ 取 span            
+ 内的中位值。                                                                                                                                                                     
+                                                                                                                                                                                  
+ ### 步骤 6：Debug 数据合并                                                                                                                                                       
+                                                                                                                                                                                  
+ ```cpp                                                                                                                                                                           
+   if (ClusteringParams.bDebug) {                                                                                                                                                 
+       for (AxisAlignedDirectionIndex in 6) {                                                                                                                                     
+           OutData.MeshCardsBuildData.DebugData.Surfels.Append(...);     // 合并 surfel                                                                                           
+           OutData.MeshCardsBuildData.DebugData.SurfelRays.Append(...);  // 合并光线                                                                                              
+           // 修正 SourceSurfelIndex 偏移                                                                                                                                         
+       }                                                                                                                                                                          
+   }                                                                                                                                                                              
+ ```                                                                                                                                                                              
+                                                                                                                                                                                  
+ 仅在 r.MeshCardRepresentation.Debug 开启时填充 FLumenCardBuildDebugData，用于编辑器可视化（surf‌el/光线/聚类），不序列化进 DDC。                                                  
+                                                                                                                                                                                  
+ ────────────────────────────────────────────────────────────────────────────────                                                                                                 
+                                                                                                                                                                                  
+ 总结：InitSurfelScene 做了什么                                                                                                                                                   
+                                                                                                                                                                                  
+ 输入：Embree 场景（网格三角形 BVH）+ 网格 bounds + MaxLumenMeshCards。                                                                                                           
+ 输出：FSurfelScene——6 个方向各一个 TArray<FSurfel>，每 surfel 带整数体素坐标、深度门控 MinRayZ、几何覆盖率 Coverage、可见性加权 WeightedCoverage。                               
+                                                                                                                                                                                  
+ 核心算子：双层 Embree ray trace：                                                                                                                                                
+ 1. 第一层（轴向穿透）：沿 6 方向各发射穿透光线，体素化网格，产出带法线过滤的 surfel 候选；                                                                                       
+ 2. 第二层（半球 visibility）：对每 surfel 沿法线半球发射光线，估算天空可见性并剔除内部点。                                                                                       
+                                                                                                                                                                                  
+ 自适应：体素密度从细到粗（64→1），直到 surfel 数 ≤ 10000，平衡精度与性能。                                                                                                       
+                                                                                                                                                                                  
+ 心智模型一句话：FSurfelScene 是网格沿 6 个轴向、用自适应体素网格、经两层 ray trace 萃取出的"表面元素场"——每个 surfel                                                             
+ 编码了"在哪层、从多浅可见、覆盖多少、有多暴露"，是后续聚类生成 MeshCard 的全部输入。聚类只需读这些预计算字段（Coverage/WeightedCoverage/MinRayZ），不再触碰几何——ray trace       
+ 的结果被"烘焙"进了 surfel 数据。                                                                                                                                                 
+                                                                                                                                                                                  
+ ────────────────────────────────────────────────────────────────────────────────                                                                                                 
+                                                                                                                                                                                  
+ 未深入（可续查）：FSurfelCluster::IsValid 的 MinClusterCoverage/MinOuterClusterCoverage/MinDensityPerCluster 阈值调参依据；FIntBox::GetAxisDistanceFromBox                       
+ 在聚类空间约束中的具体作用。需展开可继续查证。                          
