@@ -1,0 +1,266 @@
+ SectionNumTriangles / SectionNumTwoSidedTriangles 的作用
+
+ 源码定位：填充在 FEmbreeGeometryAsset（MeshRepresentationCommon.h:45-46），由 AddGeometryAsset 末尾统计（MeshRepresentationCommon.cpp:445-465），消费在 FEmbreeScene::Commit（MeshRepresentationCommon.cpp:573）。
+
+ 一句话结论
+
+ │ 这两个字段是 bMostlyTwoSided 标志的唯一数据来源。它们本身不被任何其他逻辑直接消费，唯一目的是让 Commit 在聚合所有几何后判断"该网格是否以双面三角面为主"。
+
+ 数据流全链
+
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                            烘焙期 (CPU)                              │
+ │                                                                      │
+ │                                                                      │
+ │ ┌──────────────────────────────────────────────────────────────────┐ │
+ │ │                                                                  │ │
+ │ │                                                                  │ │
+ │ │                         AddGeometryAsset                         │ │
+ │ │                          每 Asset 统计                           │ │
+ │ │           SectionNumTriangles += Section.NumTriangles            │ │
+ │ │   SectionNumTwoSidedTriangles += 双面 section 的 NumTriangles    │ │
+ │ │                                                                  │ │
+ │ └─────────────────────────────────┬────────────────────────────────┘ │
+ │                                   │                                  │
+ │                               字段累加                               │
+ │                                   │                                  │
+ │                                   │                                  │
+ │                                   ▼                                  │
+ │ ┌──────────────────────────────────────────────────────────────────┐ │
+ │ │                                                                  │ │
+ │ │                              Commit                              │ │
+ │ │                      跨所有 Geometry 聚合:                       │ │
+ │ │ bMostlyTwoSided = (TwoSided*4 >= Total) || bGenerateAsIfTwoSided │ │
+ │ │                                                                  │ │
+ │ └─────────────────────────────────┬────────────────────────────────┘ │
+ │                                   │                                  │
+ │                               字段读取                               │
+ │                                   │                                  │
+ │                                   │                                  │
+ │                                   ▼                                  │
+ │ ┌──────────────────────────────────────────────────────────────────┐ │
+ │ │                                                                  │ │
+ │ │                                                                  │ │
+ │ │                     BuildSignedDistanceField                     │ │
+ │ │                 读取 EmbreeScene.bMostlyTwoSided                 │ │
+ │ │                                                                  │ │
+ │ └─────────────────────────────────┬────────────────────────────────┘ │
+ │                                   │                                  │
+ │                                   │                                  │
+ │                                   │                                  │
+ │                                   │                                  │
+ │                                   ▼                                  │
+ │ ┌──────────────────────────────────────────────────────────────────┐ │
+ │ │                                                                  │ │
+ │ │                                                                  │ │
+ │ │      OutData.bMostlyTwoSided = EmbreeScene.bMostlyTwoSided       │ │
+ │ │               → 持久化到 FDistanceFieldVolumeData                │ │
+ │ │                                                                  │ │
+ │ └─────────────────────────────────┬────────────────────────────────┘ │
+ │                                   │                                  │
+ └───────────────────────────────────┼──────────────────────────────────┘
+                                     │
+                                     │
+                                     │
+ ┌───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                   │                                  运行时 (GPU)                                                                        │
+ │                                   │                                                                                                                      │
+ │                                   ▼                                                                                                                      │
+ │ ┌──────────────────────────────────────────────────────────────────┐                                                                                     │
+ │ │                                                                  │                                                                                     │
+ │ │                                                                  │                                                                                     │
+ │ │                  FDFObjectData.bMostlyTwoSided                   │                                                                                     │
+ │ │                        (GPU buffer 字段)                         │                                                                                     │
+ │ │                                                                  │                                                                                     │
+ │ └──────────────────────────────────────────────────────────────────┘                                                                                     │
+ │                                   │                                                                                                                      │
+ │                                   │                                                                                                                      │
+ │                                   ├─────────────────────────────────────────────────────┬─────────────────────────────────────────┐                      │
+ │                                   │                                                     │                                         │                      │
+ │                                   ▼                                                     ▼                                         ▼                      │
+ │ ┌──────────────────────────────────────────────────────────────────┐     ┌─────────────────────────────┐     ┌─────────────────────────────────────────┐ │
+ │ │                                                                  │     │                             │     │                                         │ │
+ │ │                                                                  │     │                             │     │                                         │ │
+ │ │                 DistanceFieldShadowingShared.ush                 │     │ LumenSoftwareRayTracing.ush │     │ GlobalDistanceFieldCompositeObjects.usf │ │
+ │ │                ShadowRayTraceThroughCulledObjects                │     │    RayTraceSingleMeshSDF    │     │             CompositeMeshSDF            │ │
+ │ │                                                                  │     │                             │     │                                         │ │
+ │ └──────────────────────────────────────────────────────────────────┘     └─────────────────────────────┘     └─────────────────────────────────────────┘ │
+ │                                                                                                                                                          │
+ └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ 生产侧：两个字段如何被统计
+
+ AddGeometryAsset 末尾（MeshRepresentationCommon.cpp:445-465）逐 section 累加：
+
+ ```cpp
+   GeometryAsset.SectionNumTriangles = 0;
+   GeometryAsset.SectionNumTwoSidedTriangles = 0;
+   for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); SectionIndex++) {
+       const FStaticMeshSection& Section = Sections[SectionIndex];
+       if (SectionData.IsValidIndex(SectionIndex)) {
+           GeometryAsset.SectionNumTriangles += Section.NumTriangles;
+           if (SectionData[SectionIndex].bTwoSided)
+               GeometryAsset.SectionNumTwoSidedTriangles += Section.NumTriangles;
+       }
+   }
+ ```
+
+ 关键区分：
+ - SectionNumTriangles —— 所有 section 的三角面数之和（来自 FStaticMeshSection::NumTriangles）。
+ - SectionNumTwoSidedTriangles —— 仅 SectionData[i].bTwoSided == true 的 section 的三角面数之和。
+
+ 注意：这里的统计基于原始 section 三角面数，与 AddGeometryAsset 前半段的过滤（退化剔除/半透明剔除）完全独立。NumTriangles（Asset 实际进入 Embree 的过滤后三角面数）可能小于 SectionNumTriangles（原始 section 三角面总数）。两个字段统计的是 section 层面的"材质意图"，不是实际几何数据量。
+
+ 聚合侧：Commit 如何用它们
+
+ ```cpp
+   // FEmbreeScene::Commit (MeshRepresentationCommon.cpp:569-573)
+   uint32 SectionNumTwoSidedTriangles = 0;
+   uint32 SectionNumTriangles = 0;
+   for (FEmbreeGeometry& Geometry : Geometries) {
+       NumTrianglesTotal += Geometry.Asset->NumTriangles;
+       SectionNumTwoSidedTriangles += Geometry.Asset->SectionNumTwoSidedTriangles;
+       SectionNumTriangles += Geometry.Asset->SectionNumTriangles;
+   }
+   bMostlyTwoSided = SectionNumTwoSidedTriangles * 4 >= SectionNumTriangles || bGenerateAsIfTwoSided;
+ ```
+
+ 判定阈值：TwoSided * 4 >= Total，即双面三角面占比 ≥ 25% 即判为"以双面为主"。阈值选择 25% 而非 50%，意味着只要四分之一以上的三角面是双面材质就触发——这是个保守判定，偏向把更多网格归类为双面。
+
+ 两个触发源：
+ 1. 统计判定：TwoSided * 4 >= Total。
+ 2. 强制覆盖：bGenerateAsIfTwoSided（由调用方 GenerateSignedDistanceFieldVolumeData 传入，通常对应"强制双面烘焙"选项）。
+
+ 两者是 || 关系，任一为真即整体为真。
+
+ 消费侧：bMostlyTwoSided 影响什么
+
+ bMostlyTwoSided 一旦确定，会在烘焙期与运行期各产生具体影响。
+
+ ### 烘焙期影响（SDF 构建）
+
+ BuildSignedDistanceField（MeshDistanceFieldUtilities.cpp:407-420）—— 扩展网格包围盒
+
+ ```cpp
+   if (EmbreeScene.bMostlyTwoSided)
+   {
+       // We sample on voxel corners and use central differencing for gradients, so a box mesh using two-sided materials
+       // whose vertices lie on LocalSpaceMeshBounds produces a zero gradient on intersection.
+       // Expand the mesh bounds by a fraction of a voxel to allow room for a pullback on the hit location for computing the gradient.
+       const float CentralDifferencingExpandInVoxels = .25f;
+       const FVector3f TexelObjectSpaceSize = LocalSpaceMeshBounds.GetSize() /
+           FVector3f(Mip0IndirectionDimensions * DistanceField::UniqueDataBrickSize - FInt32Vector(2 * CentralDifferencingExpandInVoxels));
+       LocalSpaceMeshBounds = LocalSpaceMeshBounds.ExpandBy(TexelObjectSpaceSize);
+   }
+ ```
+
+ 作用：当网格以双面为主时，把用于 SDF 采样的包围盒向外扩展约 0.25 体素。
+
+ 原因（注释直译）：SDF 在 voxel 角点采样、用中心差分计算梯度。双面材质的盒子网格，其顶点恰好落在包围盒边界上，会在交点处产生零梯度——梯度为零就无法确定 SDF 的"向外方向"。扩展包围盒留出 pullback 空间，让 hit 点可以后撤以计算梯度。
+
+ 代价：注释明确说"Only expand for two sided meshes as this adds significant Mesh SDF tracing cost"——扩展包围盒会显著增加 SDF 追踪成本，所以仅在双面网格才做。
+
+ 持久化：结果存入 FDistanceFieldVolumeData::bMostlyTwoSided（MeshDistanceFieldUtilities.cpp:581）：
+
+ ```cpp
+   OutData.bMostlyTwoSided = EmbreeScene.bMostlyTwoSided;
+ ```
+
+ 这是字段跨越烘焙期→运行期的桥梁。
+
+ ### 运行期影响（GPU shader 消费）
+
+ bMostlyTwoSided 被序列化进 FDFObjectData（GPU buffer 字段，DistanceFieldShadowingShared.ush:241），被三个 shader 系统消费：
+
+ #### 1. 距离场阴影（DistanceFieldShadowingShared.ush:135-168）
+
+ ```hlsl
+   const float ExpandSurfaceDistance = DFObjectData.VolumeSurfaceBias *
+       (exp2(DF_MAX_NUM_MIPS - NumMips) + (DFObjectData.bMostlyTwoSided ? TwoSidedMeshDistanceBiasScale - 1 : 0));
+   ...
+   if (bExpandSurface || DFObjectData.bMostlyTwoSided) {
+       MaxEncodedDistance -= ExpandSurfaceDistance;
+   }
+   ...
+   if (bExpandSurface || DFObjectData.bMostlyTwoSided) {
+       // Expand the surface to find thin features, but only away from the start of the trace
+       const float ExpandSurfaceAmount = ExpandSurfaceDistance * saturate(SampleRayTime / ExpandSurfaceFalloff);
+       DistanceField -= ExpandSurfaceAmount;
+   }
+ ```
+
+ 作用：双面网格在阴影 SDF 追踪时扩展表面距离偏置（TwoSidedMeshDistanceBiasScale）并收缩有效距离范围（MaxEncodedDistance -= ExpandSurfaceDistance）。目的是补偿双面网格在 SDF 表示上的固有误差——双面网格用单层 SDF 表示时，薄壳结构会产生错误的内部/外部判定，扩展表面偏置是对这种误差的运行时补偿。
+
+ #### 2. Lumen 软件光线追踪（LumenSoftwareRayTracing.ush:143, 176）
+
+ ```hlsl
+   if (!bDitheredTransparency || !DFObjectData.bMostlyTwoSided) {
+       // Trace up to the current hit point
+       MaxTraceDistance = min(MaxTraceDistance, TraceResult.HitDistance + DFObjectData.VolumeSurfaceBias);
+   }
+   ...
+   float Coverage = DFObjectData.bMostlyTwoSided && bDitheredTransparency ? 0.0f : 1.0f;
+   float ExpandSurfaceScale = lerp(MeshSDFNotCoveredExpandSurfaceScale, 1.0f, Coverage);
+ ```
+
+ 作用：
+ - 追踪距离调整：仅当不是 dithered 透明 或 不是双面时，才用 hit 距离收紧最大追踪距离。双面 + dithered 透明组合跳过这个优化收紧（避免薄壳被过早剪裁）。
+ - Coverage=0 → 更大扩展：双面 + dithered 透明时 Coverage 设为 0，ExpandSurfaceScale 走 MeshSDFNotCoveredExpandSurfaceScale（更大扩展），与阴影路径同理——对 SDF 表示不准的双面薄壳提供更大的表面扩展补偿。
+
+ #### 3. 全局距离场合成（GlobalDistanceFieldCompositeObjects.usf:64）
+
+ 也被消费（直读确认存在），逻辑类似——双面网格在合成时用扩展表面处理薄壳问题。
+
+ 设计意图：为什么用 25% 阈值
+
+ 双面材质网格的核心问题是：SDF 本质上表示"实体体积"，无法正确表示零厚度薄壳。一个双面材质的平面/盒子的 SDF 会把薄壳当成实心体，导致阴影和光线追踪出错。
+
+ Unreal 的工程取舍：
+ 1. 不试图修复 SDF 对双面网格的根本性不准——代价太高。
+ 2. 改用启发式标志 + 运行时偏置补偿：只要网格"足够多地"使用双面材质（≥25%），就标记为双面网格，在所有 SDF 消费点（阴影、Lumen、GDF）统一施加表面扩展偏置，掩盖 SDF 薄壳不准问题。
+ 3. 烘焙期：扩展包围盒，避免零梯度陷阱。
+ 4. 运行时：扩展表面距离，补偿薄壳 SDF 误差。
+
+ SectionNumTriangles / SectionNumTwoSidedTriangles 就是这个启发式标志的统计原料——它们把"section 层面的材质意图"聚合成一个 25% 阈值判定，驱动整条链路的补偿行为。
+
+ 已确认事实 vs 推断
+
+ 已确认（源码直读）：
+ - 两字段在 AddGeometryAsset 的统计逻辑（MeshRepresentationCommon.cpp:445-465）。
+ - Commit 的 25% 阈值聚合（MeshRepresentationCommon.cpp:573）。
+ - 烘焙期 BuildSignedDistanceField 的包围盒扩展（MeshDistanceFieldUtilities.cpp:407-420）。
+ - 持久化到 FDistanceFieldVolumeData::bMostlyTwoSided（MeshDistanceFieldUtilities.cpp:581）。
+ - 阴影/Lumen/GDF 三处 GPU shader 消费点。
+
+ [INFERENCE]：
+ - 字段统计基于原始 section 三角面数、与过滤后实际几何数据量独立的推断——基于字段语义与过滤逻辑分离的代码结构。
+ - 25% 阈值是经验值，源码无注释说明选取依据，推断为保守判定偏向双面归类。
+ - 字段除了驱动 bMostlyTwoSided 外无其他消费点——检索未发现其他读取处，但数据库可能不含所有读取点（如通过反射或序列化间接读取）。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 数据流总结表：
+
+ ┌───────────────┬─────────────────────────────────────────────────┬────────────────────────────────────────────┐
+ │ 阶段          │ 位置                                            │ 数据                                       │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 生产          │ AddGeometryAsset (cpp:445)                      │ 每 Asset 按 section 累加两字段             │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 聚合          │ Commit (cpp:573)                                │ 跨 Asset 聚合 → 25% 阈值 → bMostlyTwoSided │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 烘焙期消费    │ BuildSignedDistanceField (cpp:407)              │ 双面 → 扩展采样包围盒 0.25 voxel           │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 持久化        │ GenerateSignedDistanceFieldVolumeData (cpp:581) │ OutData.bMostlyTwoSided                    │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 运行时传输    │ FDFObjectData GPU buffer                        │ 序列化到 GPU                               │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 运行时消费 1  │ 阴影 shader                                     │ 表面距离偏置 + 收缩有效距离                │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 运行时-消费 2 │ Lumen 软件光追                                  │ 追踪距离 + Coverage 扩展                   │
+ ├───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ 迷雾消费 3    │ 全局距离场合成                                  │ 表面扩展（薄壳补偿）                       │
+ └───────────────┴─────────────────────────────────────────────────┴────────────────────────────────────────────┘
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 这两个字段是 Unreal 用材质双面性作为 SDF 误差启发式标志的统计基础，驱动从烘焙包围盒扩展到运行时三套 shader 的统一补偿策略。它们本身不被直接查询，价值完全通过 bMostlyTwoSided 间接实现。
