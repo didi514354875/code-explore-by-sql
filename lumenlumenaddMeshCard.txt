@@ -1,0 +1,646 @@
+ FLumenSceneData::AddMeshCardsFromBuildData 详细解析这个函数
+ 全部代码到手。下面是 AddMeshCardsFromBuildData 的逐段精读。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 函数定位与职责
+
+ Source/Runtime/Renderer/Private/Lumen/LumenMeshCards.cpp:996-1085
+
+ 它是三条数据来源分支（Heightfield / MergedInstances / SingleMesh）的唯一汇合点。输入是抽象的 FMeshCardsBuildData（卡片布局描述），输出是
+ FLumenSceneData 内部 6 张存储表里分配好的、已标记脏的实体卡片 + MeshCards + (可选)Heightfield，以及回写给 PrimitiveGroup
+ 的索引。职责：把离线/运行时构建的卡片布局"物化"进场景状态机。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 结构总览
+
+ ```
+   AddMeshCardsFromBuildData
+   ├─ Phase 0  重置宿主索引（幂等）
+   ├─ Phase 1  全局守卫：面积阈值 + 正交矩阵
+   ├─ Phase 2  计数通过剔除的卡片（NumCards）
+   ├─ Phase 3  Span 分配：Cards / CardCullingInfos / MeshCards
+   ├─ Phase 4  MeshCardsInstance.Initialize + Heightfield 附挂
+   ├─ Phase 5  逐卡片物化（重跑剔除 → Card.Initialize + CullingInfo）
+   ├─ Phase 6  UpdateLookup 方向位掩码表
+   └─ Phase 7  标脏 PrimitiveGroup
+ ```
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ Phase 0 · 幂等重置
+
+ ```cpp
+   PrimitiveGroup.MeshCardsIndex  = -1;
+   PrimitiveGroup.HeightfieldIndex = -1;
+ ```
+
+ 把宿主索引清成"未分配"。关键不变量：整个函数若提前 return（守卫失败），MeshCardsIndex 必然保持 -1，这正是上层
+ AddMeshCards（:950）判断"分配失败→降级为无卡图元"的依据。两处 Initialize 索引 → 退路契约。
+
+ Phase 1 · 全局守卫（两道门槛）
+
+ ### 门槛 A · 包围盒最大面面积
+
+ ```cpp
+   const FVector3f LocalToWorldScale = (FVector3f)LocalToWorld.GetScaleVector();
+   const FVector3f ScaledBoundSize = (FVector3f)MeshCardsBuildData.Bounds.GetSize() * LocalToWorldScale;
+   const FVector3f FaceSurfaceArea(Y*Z, X*Z, Y*X);   // 三对轴面的世界面积
+   const float LargestFaceArea = FaceSurfaceArea.GetMax();
+   const float MinFaceSurfaceArea = LumenMeshCards::GetCardMinSurfaceArea(IsEmissiveLightSource);
+
+   if (LargestFaceArea > MinFaceSurfaceArea) { ... }
+ ```
+
+ GetCardMinSurfaceArea（:129）：
+
+ ```cpp
+   const float MeshCardsMinSize = CVarLumenMeshCardsMinSize;   // 尺寸阈值（米）
+   return MeshCardsMinSize² * (bEmissiveLightSource ? 0.2f : 1.0f);
+ ```
+
+ 语义：整簇包围盒的最大轴面若小于 MinSize²，连最大的卡片都喂不饱 atlas，直接放弃。自发光光源阈值放宽 5
+ 倍（×0.2）——发光体再小也要采样，因为它对场景是光源而非纯接收器。这是远场剔除：远处的小物体不进 surface cache。
+
+ 注意用的是 LocalToWorldScale（缩放向量，非完整矩阵）——面积计算是缩放后的世界空间，所以一个被放大 10 倍的小资产仍会通过。
+
+ ### 门槛 B · 正交矩阵
+
+ ```cpp
+   && IsMatrixOrthogonal(LocalToWorld)   // #lumen_todo: implement card capture for non orthogonal transforms
+ ```
+
+ IsMatrixOrthogonal（:960）：三轴单位向量两两点积 < KINDA_SMALL_NUMBER。非正交变换（剪切/非均匀投影）直接拒收，因为卡片的轴对齐 OBB
+ 假设建立在正交基上——注释明示这是未实现的限制，不是设计意图。
+
+ Phase 2 · 计数存活卡片
+
+ ```cpp
+   uint32 NumCards = 0;
+   for (CardIndexInBuildData : ...) {
+       if (MeshCardCullTest(CardBuildData, LocalToWorldScale, MinFaceSurfaceArea, CardIndexInBuildData))
+           ++NumCards;
+   }
+ ```
+
+ 为什么先计数再分配：span 分配需要知道 NumCards 才能 AddSpan(NumCards) 一次到位（span 不可扩张）。所以分两遍遍历：先计数，再物化。
+
+ MeshCardCullTest（:979）做的是单卡片粒度剔除，比 Phase 1 的整簇门槛更细：
+
+ ```cpp
+   const FVector3f CardSpaceScale = CardBuildData.OBB.RotateLocalToCard(LocalToWorldScale).GetAbs();
+   const FVector3f ScaledBoundsSize = 2.0f * OBB.Extent * CardSpaceScale;
+   const float SurfaceArea = ScaledBoundsSize.X * ScaledBoundsSize.Y;   // 卡片正面世界面积
+   return (!GLumenMeshCardsCullFaces || SurfaceArea > MinFaceSurfaceArea);
+ ```
+
+ - 卡片 OBB 的 Extent 经 RotateLocalToCard 变到卡片本地系，乘世界缩放，取 X×Y（卡片正面）面积。
+ - GLumenMeshCardsCullFaces 是总开关；关闭则全部通过（调试用）。
+ - Debug 路径 GLumenMeshCardsDebugSingleCard 可强制只留指定卡片——单卡片隔离调试。
+
+ 含义：6 方向卡片里朝下/朝背面的细面会被单独剔除，只留"看得见"的几张。这是 Phase 1 之后的二次 LOD 精化。
+
+ Phase 3 · Span 分配（核心存储操作）
+
+ ```cpp
+   if (NumCards > 0) {
+       const int32 FirstCardIndex          = Cards.AddSpan(NumCards);
+       const int32 FirstCardCullingInfoIdx = CardCullingInfos.AddSpan(NumCards);
+       check(FirstCardIndex == FirstCardCullingInfoIndex);        // ← 关键不变量
+
+       const int32 MeshCardsIndex = MeshCards.AddSpan(1);
+       PrimitiveGroup.MeshCardsIndex = MeshCardsIndex;            // 回写宿主
+       ...
+ ```
+
+ 三个 TSparseSpanArray（LumenSparseSpanArray.h:16）。它的 AddSpan(N) 行为：
+
+ 1. FSpanAllocator::Allocate(N) 在内部位图里找一段连续 N 个空槽，返回起始索引——支持空洞复用（删除后留下的空位可被后续 Allocate 填回）。
+ 2. AllocatedElementsBitArray.SetRange(Insert, N, true) 标记占用。
+ 3. 返回的索引在数组生命周期内稳定（不因别处增删而移动）——这是 GPU buffer 索引能跨帧有效的根因。
+
+ check(FirstCardIndex == FirstCardCullingInfoIndex) 的分量：Cards 和 CardCullingInfos
+ 是两张独立表，但要求同一卡片的两个副本落在相同下标。这依赖两者用同一个 FSpanAllocator
+ 状态机同步推进——若某次释放使两表空洞分布不一致，check 会爆。所以 Remove 路径必须成对删除两张表的同一 span。该不变量让 GPU
+ 端能用一个下标同时取 Cards[i] 和 CardCullingInfos[i]，省一次间接寻址。
+
+ MeshCards.AddSpan(1) 分配单个槽（一个 PrimitiveGroup 恰好一个 MeshCards 实例），回写
+ PrimitiveGroup.MeshCardsIndex——这是上下行链路的锚点：上层 AddMeshCards 的成败判断、SceneInstanceIndexToMeshCardsIndexBuffer 的 GPU
+ 映射、RemoveMeshCards 的回收，全靠这个索引。
+
+ Phase 4 · MeshCards 实例初始化 + Heightfield 附挂
+
+ ```cpp
+   FLumenMeshCards& MeshCardsInstance = MeshCards[MeshCardsIndex];
+   MeshCardsInstance.Initialize(LocalToWorld, PrimitiveGroupIndex, FirstCardIndex, NumCards, MeshCardsBuildData, PrimitiveGroup);
+
+   MeshCardsIndicesToUpdateInBuffer.Add(MeshCardsIndex);     // 脏标记①
+
+   if (PrimitiveGroup.IsHeightfield()) {
+       const int32 HeightfieldIndex = Heightfields.AddSpan(1);
+       PrimitiveGroup.HeightfieldIndex = HeightfieldIndex;
+       Heightfields[HeightfieldIndex].Initialize(MeshCardsIndex);  // 只存 MeshCardsIndex 反查
+       HeightfieldIndicesToUpdateInBuffer.Add(HeightfieldIndex);   // 脏标记②
+   }
+ ```
+
+ FLumenMeshCards::Initialize（:1570）：拷贝 LocalBounds/bMostlyTwoSided/ResolutionScale/FirstCardIndex/NumCards，设
+ bHeightfield/bFarField/bEmissiveLightSource 标志位，最后 SetTransform 算世界 OBB。不存卡片内容——卡片是 Cards[] 表的实体，MeshCards 只存
+ [FirstCardIndex, FirstCardIndex+NumCards) 这个范围句柄。
+
+ Heightfield 是可选的并行表：只有 Landscape 图元才挂。FLumenHeightfield::Initialize(MeshCardsIndex) 极简——只记反查索引，因为 heightfield
+ 的几何/光照都通过其 MeshCards 的单张顶向卡片承载（见前述 heightfield ray tracing 分析）。
+
+ Phase 5 · 逐卡片物化（第二遍遍历）
+
+ ```cpp
+   int32 LocalCardIndex = 0;
+   for (CardIndexInBuildData : ...) {
+       if (MeshCardCullTest(...)) {                              // ← 第二次跑同样的剔除
+           const int32 CardInsertIndex = FirstCardIndex + LocalCardIndex;
+           FLumenCard& Card = Cards[CardInsertIndex];
+           FLumenCardCullingInfo& CardCullingInfo = CardCullingInfos[CardInsertIndex];
+
+           Card.Initialize(CustomId, LocalToWorld, MeshCardsInstance, CardBuildData,
+                           LocalCardIndex, MeshCardsIndex, CardIndexInBuildData);
+           CardCullingInfo.Initialize(Card);
+           CardIndicesToUpdateInBuffer.Add(CardInsertIndex);    // 脏标记③
+           ++LocalCardIndex;
+       }
+   }
+ ```
+
+ 为什么重跑剔除而不是缓存 Phase 2 的结果：Phase 2 只是为了拿 NumCards。这里若改成缓存存活下标数组，要额外分配一个
+ TArray<int32>；重跑代价是 N 次 MeshCardCullTest（纯算术，无内存访问），对 N≤6 的卡片集合比缓存更便宜——典型的"算力换内存带宽"取舍。
+
+ 两个下标的区别（容易混淆）：
+ - LocalCardIndex：物化后的连续下标（0..NumCards-1），存进 Card.IndexInMeshCards，用于 32-bit 位掩码（check(InIndexInMeshCards < 32)）。
+ - CardIndexInBuildData：构建数据里的原始下标，存进 Card.IndexInBuildData，用于回溯到 DDC 源（调试/去重）。
+
+ FLumenCard::Initialize（:1281）做的事：
+
+ ```cpp
+   SetLocalOBB(CardBuildData.OBB);                    // 卡片几何
+   IndexInMeshCards = InIndexInMeshCards;             // 局部位
+   AxisAlignedDirectionIndex = CardBuildData.AxisAlignedDirectionIndex;  // 6方向之一
+   bHeightfield / bFarField / DilationMode            // 继承自 MeshCards
+   SetTransform(LocalToWorld, MeshCardsInstance);     // 世界 OBB + LocalToWorldScale
+
+   const float CardAspect = WorldOBBExtent.X / WorldOBBExtent.Y;
+   ComputeAndSetResLevelXYBias(CardAspect);           // 宽高比分辨率补偿
+   if (CustomId != UINT32_MAX)
+       CardSharingId = FLumenCardId(CustomId, AxisAlignedDirectionIndex, ResLevelX, ResLevelY);  // DDC 去重键
+ ```
+
+ ComputeAndSetResLevelXYBias（:1349）做的事：长宽比 ≥1 时给 Y 方向降分辨率（BiasY = FloorLog2(aspect)），<1 时给 X 降。意义：一张 4:1
+ 的长条卡片不必给正方形分辨率，省 atlas 纹素。打包进 PackedResLevelXYBias = (BiasY<<4)|BiasX。
+
+ CardSharingId 是 DDC 共享键——相同 CustomId+方向+分辨率级别的卡片跨图元共享同一 atlas 页（用于植被等大量同资产实例），CustomId==UINT32_MAX
+ 表示不参与共享。
+
+ SetTransform（:1308）做了双向一致性 check：卡片世界 OBB 经 MeshCards.WorldToLocalRotation 变回应等于
+ GetMeshCardsOBB()。这保证卡片↔MeshCards 的坐标系互逆，是后续 GPU 采样的前提。
+
+ Phase 6 · 方向查找表
+
+ ```cpp
+   MeshCardsInstance.UpdateLookup(Cards);
+ ```
+
+ UpdateLookup（:1588）：
+
+ ```cpp
+   for (dir : 6方向) CardLookup[dir] = 0;
+   for (LocalCardIndex : 0..NumCards) {
+       const FLumenCard& Card = Cards[FirstCardIndex + LocalCardIndex];
+       CardLookup[Card.AxisAlignedDirectionIndex] |= (1 << LocalCardIndex);   // 位掩码
+   }
+ ```
+
+ 这是一张方向→卡片位掩码表：给定一个轴方向（如 "+Z"），CardLookup[5] 的 bit 位告诉你这个 MeshCards 在该方向有几张卡、它们的 LocalCardIndex
+ 是几。
+
+ 用途：GPU
+ 光线追踪时，根据射线主方向快速选出对应方向的卡片集合，避免遍历所有卡片。位掩码形式让"该方向卡片数"=countbits(CardLookup[dir])，紧凑高效。
+ 这也是 LocalCardIndex < 32 那个 check 的来源——uint32 位掩码最多 32 张卡，而单 MeshCards 实际 ≤6 张，绰绰有余。
+
+ Phase 7 · 标脏 PrimitiveGroup
+
+ ```cpp
+   UpdatePrimitiveGroupGPUBufferEntry(PrimitiveGroupIndex);
+ ```
+
+ UpdatePrimitiveGroupGPUBufferEntry（:619）：
+
+ ```cpp
+   if (LumenScene::UseGPUDrivenUpdate())
+       PrimitiveGroupIndicesToUpdateInBuffer.Add(PrimitiveGroupIndex);
+ ```
+
+ 把 group 加入脏列表，下帧 UpdateLumenMeshCards 会通过 FLumenPrimitiveGroupGPUData::FillData 把它的可见性/有效性/MeshCardsIndex 状态上传到
+ PrimitiveGroupBuffer。GPU-driven 模式专属——非 GPU-driven 时 PrimitiveGroup 不上 GPU，由 CPU 侧管理。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 脏标记汇总（本函数共写 4 条）
+
+ ┌───────────────────────────────────────┬─────────────────────────────┬────────────────────────────────────────┐
+ │ 脏列表                                │ 触发点                      │ 下游消费                               │
+ ├───────────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────┤
+ │ MeshCardsIndicesToUpdateInBuffer      │ Phase 4                     │ UpdateLumenMeshCards → MeshCardsBuffer │
+ ├───────────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────┤
+ │ HeightfieldIndicesToUpdateInBuffer    │ Phase 4（Heightfield 分支） │ → HeightfieldBuffer                    │
+ ├───────────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────┤
+ │ CardIndicesToUpdateInBuffer           │ Phase 5（每张卡）           │ → Cards atlas/page 分配                │
+ ├───────────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────┤
+ │ PrimitiveGroupIndicesToUpdateInBuffer │ Phase 7                     │ → PrimitiveGroupBuffer                 │
+ └───────────────────────────────────────┴─────────────────────────────┴────────────────────────────────────────┘
+
+ 注意：没标 PrimitivesToUpdateMeshCards——那是 AddMeshCards（上层）回填 ScenePrimitiveIndices
+ 时才写的。职责切分干净：物化（本函数）只标"内容变了"，映射（上层）才标"instance→MeshCards 索引变了"。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 关键设计决策小结
+
+ 1. 两阶段剔除（整簇面积 → 单卡面积）：远场粗筛 + 近场精筛，分层控制 atlas 预算。
+ 2. Span 分配 + 索引稳定：TSparseSpanArray 支持空洞复用，索引跨帧有效，GPU buffer 无需重排。
+ 3. 双表同步下标（FirstCardIndex == FirstCardCullingInfoIndex）：省一次 GPU 间接寻址，代价是 Remove 必须成对。
+ 4. 计数-分配-物化三遍：避免中间缓存数组，用算力换内存（N≤6 时划算）。
+ 5. LocalCardIndex vs IndexInBuildData：运行时位（位掩码用）与离线源位（去重/调试用）分离。
+ 6. 宽高比分辨率补偿：非正方形卡片自动降采样长边，省 atlas。
+ 7. 正交矩阵硬门槛：未实现非正交支持，明示是技术债（#lumen_todo）。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ ### 引用（全部来自 DB 实读代码）
+
+ - LumenMeshCards.cpp:996 — AddMeshCardsFromBuildData（主体）
+ - LumenMeshCards.cpp:960 — IsMatrixOrthogonal
+ - LumenMeshCards.cpp:979 — MeshCardCullTest
+ - LumenMeshCards.cpp:129 — GetCardMinSurfaceArea（自发光 ×0.2）
+ - LumenSparseSpanArray.h:16 — TSparseSpanArray::AddSpan（FSpanAllocator + 位图）
+ - LumenMeshCards.cpp:1570 — FLumenMeshCards::Initialize
+ - LumenMeshCards.cpp:1281 — FLumenCard::Initialize
+ - LumenMeshCards.cpp:1349 — ComputeAndSetResLevelXYBias（宽高比降采样）
+ - LumenMeshCards.cpp:1308 — FLumenCard::SetTransform（双向 check）
+ - LumenMeshCards.cpp:1588 — UpdateLookup（方向位掩码表）
+ - LumenMeshCards.cpp:619 — UpdatePrimitiveGroupGPUBufferEntry
+
+ [推理]：FLumenCardId 的 DDC 共享语义（"相同 CustomId+方向+ResLevel 跨图元共享 atlas 页"）是从字段命名与 CardSharingId 命名推断，未展开
+ FLumenCardId 的比较/哈希实现；如需确认共享判定逻辑可继续追。
+
+ 是否要我继续展开 RemoveMeshCards 的回收路径（span 释放如何与 GPU buffer 同步、空洞如何被后续 AddSpan
+ 复用）？那是这个分配器的另一半生命周期。
+全部回收链代码到手。下面是完整解析。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 回收路径全景
+
+ RemoveMeshCards 是 AddMeshCardsFromBuildData 的镜像——但顺序相反，且多了一层 atlas 资源释放（卡片纹理）与 延迟空洞合并。
+
+ ┌────────────────────────────────────────────────────────┐
+ │                                                        │
+ │                                                        │
+ │              UpdateSurfaceCachePrimitives              │
+ │              LumenSceneRendering.cpp:1455              │
+ │                                                        │
+ └────────────────────────────┬───────────────────────────┘
+                              │
+                    收集 FMeshCardsRemove
+              限流 MaxMeshCardsRemovesPerFrame
+                              │
+                              ▼
+ ┌────────────────────────────────────────────────────────┐
+ │                                                        │
+ │                                                        │
+ │                    RemoveMeshCards                     │
+ │                LumenMeshCards.cpp:1088                 │
+ │                                                        │
+ └────────────────────────────────────────────────────────┘
+                              │
+                              │
+                              ├───────────────────────────────────────────────┬────────────────────────────────────┬─────────────────────────────────────────┬─────────────────────────────────────┐
+                              │                                               │                                    │                                         │                                     │
+                              ▼                                               ▼                                    ▼                                         ▼                                     ▼
+ ┌────────────────────────────────────────────────────────┐     ┌──────────────────────────┐     ┌──────────────────────────────────┐     ┌────────────────────────────────────┐     ┌───────────────────────────┐
+ │                                                        │     │                          │     │                                  │     │                                    │     │                           │
+ │                                                        │     │                          │     │                                  │     │                                    │     │                           │
+ │                   ① 逐卡片释放 atlas                   │     │ ② 释放 Heightfield span  │     │   ③ 重映射 instance→MeshCards    │     │ ④ Cards/CardCullingInfos/MeshCards │     │ ⑤ 清宿主索引 + 标脏 group │
+ │                  RemoveCardFromAtlas                   │     │                          │     │ 标脏 PrimitivesToUpdateMeshCards │     │          三个 RemoveSpan           │     │                           │
+ │                                                        │     │                          │     │                                  │     │                                    │     │                           │
+ └────────────────────────────┬───────────────────────────┘     └──────────────────────────┘     └──────────────────────────────────┘     └──────────────────┬─────────────────┘     └───────────────────────────┘
+                              │                                                                                                                              │
+                              │                                                                                                                              │
+                              │                                                                                                                              │
+                              │                                                                                                                              │
+                              ▼                                                                                                                              │
+ ┌────────────────────────────────────────────────────────┐     ┌──────────────────────────┐                                                                 │
+ │                                                        │     │                          │                                                                 │
+ │                                                        │     │                          │                                                                 │
+ │                   FreeVirtualSurface                   │     │   FSpanAllocator::Free   │◄────────────────────────────────────────────────────────────────┘
+ │                  LumenScene.cpp:1850                   │     │ 进 PendingFreeSpans 延迟 │
+ │                                                        │     │                          │
+ └────────────────────────────┬───────────────────────────┘     └─────────────┬────────────┘
+                              │                                               │
+                              │                                      下次 AddSpan 找不到
+                              │                                               │
+                              │                                               │
+                              ▼                                               ▼
+ ┌────────────────────────────────────────────────────────┐     ┌──────────────────────────┐
+ │                                                        │     │                          │
+ │                                                        │     │                          │
+ │                 UnmapSurfaceCachePage                  │     │       Consolidate        │
+ │                  PageTable.RemoveSpan                  │     │    排序+合并相邻空洞     │
+ │                                                        │     │                          │
+ └────────────────────────────────────────────────────────┘     └──────────────────────────┘
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 调用方与限流
+
+ UpdateSurfaceCachePrimitives（LumenSceneRendering.cpp:1339）有两个独立的 remove 收集循环——primitive 任务和 instance 任务各产出 Task.MeshCardsRemoves：
+
+ ```cpp
+   const int32 MaxMeshCardsRemoves = LumenScene::GetMaxMeshCardsRemovesPerFrame();
+
+   for (const FMeshCardsRemove& MeshCardsRemove : Task.MeshCardsRemoves) {
+       if (NumMeshCardsRemoves >= MaxMeshCardsRemoves)
+           break;                              // ← 帧预算限流
+       ++NumMeshCardsRemoves;
+       LumenSceneData.RemoveMeshCards(MeshCardsRemove.PrimitiveGroupIndex);
+   }
+ ```
+
+ 与 Add 对称的限流：GetMaxMeshCardsToAddPerFrame / GetMaxMeshCardsRemovesPerFrame 成对存在。注释点明原因：
+
+ │ // #lumen_todo: Temporary workaround until we optimized FLumenSurfaceCacheAllocator::Free to use fast batched removes
+
+ 释放是已知瓶颈——atlas page 解映射开销大（见下 FreeVirtualSurface），所以每帧硬限流。注意 Add 是先排序后限流（保最近的），Remove 是先到先服务（无排序）——因为 remove 的紧迫性不依赖距离，而 add 的优先级依赖距离。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ RemoveMeshCards 逐段拆解（LumenMeshCards.cpp:1088-1131）
+
+ ### 守卫：幂等 + 只处理已分配
+
+ ```cpp
+   if (PrimitiveGroup.MeshCardsIndex >= 0) { ... }
+ ```
+
+ MeshCardsIndex < 0 直接返回——和 AddMeshCards 的守卫对称。重复 remove 安全。
+
+ ### ① 逐卡片释放 atlas（RemoveCardFromAtlas，:1193）
+
+ ```cpp
+   for (CardIndex : [FirstCardIndex, FirstCardIndex+NumCards))
+       RemoveCardFromAtlas(CardIndex);
+ ```
+
+ 这是回收与分配的关键不对称：分配时只动 Cards[] 表的 span；回收时必须先释放每张卡片关联的 atlas 纹理资源。RemoveCardFromAtlas（:1193）：
+
+ ```cpp
+   NumDesiredSurfaceCacheTexels += CardCullingInfo.SetDesiredLockedResLevel(0, Card);  // 锁定分辨率归零
+   CardCullingInfo.DesiredLockedResLevelOnLastAlloc = 0;
+   FreeVirtualSurface(Card, Card.MinAllocatedResLevel, Card.MaxAllocatedResLevel);     // 释放虚拟纹理
+   CardIndicesToUpdateInBuffer.Add(CardIndex);                                          // 脏标记
+ ```
+
+ FreeVirtualSurface（LumenScene.cpp:1850）是回收的真正重头戏——遍历卡片的每个 mipmap level，对每个 page 调 UnmapSurfaceCachePage 解除物理页映射，再 PageTable.RemoveSpan 释放页表
+ span。这就是限流的根因：一张高分辨率卡片可能关联几十个物理 atlas page，解映射涉及 page table 重写。
+
+ ### ② Heightfield span 释放
+
+ ```cpp
+   if (PrimitiveGroup.HeightfieldIndex >= 0) {
+       Heightfields.RemoveSpan(PrimitiveGroup.HeightfieldIndex, 1);
+       HeightfieldIndicesToUpdateInBuffer.Add(PrimitiveGroup.HeightfieldIndex);   // 脏标记
+   }
+ ```
+
+ Heightfield 是 MeshCards 的可选附挂，释放也要标脏（GPU buffer 该槽要清零）。
+
+ ### ③ instance→MeshCards 重映射标脏（关键）
+
+ ```cpp
+   for (int32 ScenePrimitiveIndex : MeshCardsInstance.ScenePrimitiveIndices) {
+       PrimitivesToUpdateMeshCards.Add(ScenePrimitiveIndex);
+   }
+   MeshCardsInstance.ScenePrimitiveIndices.Reset();
+ ```
+
+ 对称镜像：AddMeshCards 回填 ScenePrimitiveIndices 时把这些 primitive 加入 PrimitivesToUpdateMeshCards；remove 时再次加入同一脏列表。因为 SceneInstanceIndexToMeshCardsIndexBuffer 必须把这些 instance
+ 的映射重写为"无卡片"（GetMeshCardsIndex 会返回 -1）。删一个图元的卡片，它所有实例的 GPU 查找表都要更新——这是 Lumen 能动态装卸场景图元 GI 的核心。
+
+ ### ④ 三表 span 释放（严格配对）
+
+ ```cpp
+   Cards.RemoveSpan(MeshCardsInstance.FirstCardIndex, MeshCardsInstance.NumCards);
+   CardCullingInfos.RemoveSpan(MeshCardsInstance.FirstCardIndex, MeshCardsInstance.NumCards);
+   MeshCards.RemoveSpan(PrimitiveGroup.MeshCardsIndex, 1);
+ ```
+
+ 与分配的 Phase 3 严格配对：Add 时 Cards.AddSpan(NumCards) + CardCullingInfos.AddSpan(NumCards) 同起始索引；Remove 时必须用同一个 FirstCardIndex 和 NumCards 释放。任一不配对会破坏 FirstCardIndex ==
+ FirstCardCullingInfoIndex 不变量（下次 Add 的 check 会爆）。
+
+ MeshCards.RemoveSpan(idx, 1) 释放那单个槽。
+
+ ### ⑤ 宿主索引清零 + group 标脏
+
+ ```cpp
+   MeshCardsIndicesToUpdateInBuffer.Add(PrimitiveGroup.MeshCardsIndex);   // 脏标记（在清零前！）
+
+   PrimitiveGroup.MeshCardsIndex  = -1;
+   PrimitiveGroup.HeightfieldIndex = -1;
+
+   UpdatePrimitiveGroupGPUBufferEntry(PrimitiveGroupIndex);               // group 脏标记
+
+   if (bUpdateCullingInfo) {
+       check(CullingInfo.bVisible && CullingInfo.bValidMeshCards);
+       CullingInfo.bVisible = false;
+   }
+ ```
+
+ 顺序细节：MeshCardsIndicesToUpdateInBuffer.Add 必须在 MeshCardsIndex = -1 之前——用旧索引标脏，让 UpdateLumenMeshCards 能把该槽上传为 NullMeshCards（空卡片，GPU 端安全默认值）。清零后 group 重新进入"可分配"状态。
+
+ bUpdateCullingInfo 是可选的可见性翻转——check 断言"曾经可见才允许翻成不可见"，对称性保证。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 脏标记汇总（本函数共写 5 条）
+
+ ┌───────────────────────────────────────┬─────────────────────┬──────────────────────────────────────────────────┐
+ │ 脏列表                                │ 触发点              │ 下游消费                                         │
+ ├───────────────────────────────────────┼─────────────────────┼──────────────────────────────────────────────────┤
+ │ CardIndicesToUpdateInBuffer           │ ① 逐卡片 atlas 释放 │ UpdateLumenMeshCards → 卡片 atlas 重新分配       │
+ ├───────────────────────────────────────┼─────────────────────┼──────────────────────────────────────────────────┤
+ │ HeightfieldIndicesToUpdateInBuffer    │ ② Heightfield 释放  │ → HeightfieldBuffer 清零                         │
+ ├───────────────────────────────────────┼─────────────────────┼──────────────────────────────────────────────────┤
+ │ PrimitivesToUpdateMeshCards           │ ③ instance 重映射   │ → SceneInstanceIndexToMeshCardsIndexBuffer 写 -1 │
+ ├───────────────────────────────────────┼─────────────────────┼──────────────────────────────────────────────────┤
+ │ MeshCardsIndicesToUpdateInBuffer      │ ⑤ 清零前            │ → MeshCardsBuffer 写 NullMeshCards               │
+ ├───────────────────────────────────────┼─────────────────────┼──────────────────────────────────────────────────┤
+ │ PrimitiveGroupIndicesToUpdateInBuffer │ ⑤ group 标脏        │ → PrimitiveGroupBuffer 翻 bVisible=false         │
+ └───────────────────────────────────────┴─────────────────────┴──────────────────────────────────────────────────┘
+
+ 对比 Add 的 4 条脏标记：Remove 多了 CardIndicesToUpdateInBuffer（atlas 释放）和 HeightfieldIndicesToUpdateInBuffer（Add 也有，但在 Heightfield 分支内）。本质是资源释放的额外清理。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ FSpanAllocator 的延迟合并机制（空洞复用的核心）
+
+ TSparseSpanArray::RemoveSpan 调 FSpanAllocator::Free，但 Free 不立即合并：
+
+ ### Free（SpanAllocator.h:73）—— O(1) 延迟
+
+ ```cpp
+   inline void Free(int32 BaseOffset, int32 Num = 1) {
+       PendingFreeSpans.Add(FLinearAllocation{ BaseOffset, Num });   // 仅追加
+       CurrentSize -= Num;
+   }
+ ```
+
+ 释放只是往 PendingFreeSpans（无序数组）追加一条记录。O(1)，不排序，不合并不查重。这就是注释里"临时 workaround"的优化目标——延迟释放让批量 remove 快，但代价是 Allocate 时可能找不到本可用的空洞。
+
+ ### Allocate 的双段查找（SpanAllocator.h:24）
+
+ ```cpp
+   int32 Allocate(int32 Num = 1) {
+       int32 FoundIndex = SearchFreeList(Num, FirstNonEmptySpan);      // 先查已合并的 FreeSpans
+
+       if (FoundIndex == INDEX_NONE && !PendingFreeSpans.IsEmpty()) {
+           Consolidate();                                              // 查不到 → 触发合并
+           FoundIndex = SearchFreeList(Num, FirstNonEmptySpan);        // 再查
+       }
+       ...
+   }
+ ```
+
+ 惰性合并：只有当已合并的 FreeSpans 找不到足够空间、且 PendingFreeSpans 非空时，才触发 Consolidate。这把合并成本摊到"真正需要复用空洞"的时刻。
+
+ ### Consolidate（SpanAllocator.cpp:59）—— 归并排序式合并
+
+ ```cpp
+   // 1. 排序新释放的（旧 FreeSpans 已有序）
+   PendingFreeSpans.Sort();
+
+   // 2. 双指针归并：FreeSpans + PendingFreeSpans，相邻则融合
+   for (...) {
+       if (PrevEndOffset == Alloc.StartOffset)
+           FreeSpansTmp.Last().Num += Alloc.Num;    // 相邻 → 融合
+       else
+           FreeSpansTmp.Add(Alloc);                 // 不相邻 → 新条目
+   }
+
+   // 3. 尾部裁剪：若末端空洞接 CurrentMaxSize，缩容
+   if (last.StartOffset + last.Num == CurrentMaxSize) {
+       CurrentMaxSize -= last.Num;
+       FreeSpansTmp.Pop();
+   }
+ ```
+
+ 三步：排序 pending → 归并融合相邻 → 尾部缩容。复杂度 O((F+P) log P)（P=pending 数，F=已合并数）。合并后 CurrentMaxSize 可能缩小——这就是 TSparseSpanArray::Consolidate 里 Elements.SetNum(GetMaxSize()) 能缩容数组的前提。
+
+ 为什么用两个数组（FreeSpans 有序 + PendingFreeSpans 无序）：让高频的 Free 保持 O(1)，把 O(n log n) 的排序合并推迟到 Consolidate。这是经典的"批量延迟"模式。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ TSparseSpanArray::Consolidate 的联动
+
+ ```cpp
+   void Consolidate() {
+       SpanAllocator.Consolidate();                    // 先合并底层 span
+       if (Elements.Num() > SpanAllocator.GetMaxSize() * ShrinkThreshold) {  // ShrinkThreshold=2
+           Elements.SetNum(SpanAllocator.GetMaxSize());        // 物理数组缩容
+           AllocatedElementsBitArray.SetNumUninitialized(...);
+       }
+   }
+ ```
+
+ 只在"已分配内存 > 实际使用的 2 倍"时才缩 Elements 数组。避免频繁 realloc——只有空洞率超 50% 才物理收缩。GPU buffer 端则完全不收缩（见下）。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ GPU buffer 的对称处理（UpdateLumenMeshCards）
+
+ 回看前述 UpdateLumenMeshCards（:297）的 upload pass：
+
+ ```cpp
+   for (int32 Index : LumenSceneData.MeshCardsIndicesToUpdateInBuffer) {
+       if (Index < LumenSceneData.MeshCards.Num()) {
+           const FLumenMeshCards& MeshCards = LumenSceneData.MeshCards.IsAllocated(Index)
+               ? LumenSceneData.MeshCards[Index] : NullMeshCards;   // ← 释放的槽用 Null 填充
+           FLumenMeshCardsGPUData::FillData(MeshCards, Data);
+       }
+   }
+ ```
+
+ 关键：IsAllocated(Index) 为 false（已 RemoveSpan）时，用栈上的 NullMeshCards 填充该 GPU 槽。所以 GPU buffer 不缩容、不重排——释放的槽位被写成安全默认值，下次 Add 复用同索引时直接覆盖。这是"索引稳定 + 写空值"策略，避免 GPU
+ 端的 buffer 重分配和指针失效。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ Add/Remove 的完整对称性
+
+ ┌───────────────┬────────────────────────────────────┬───────────────────────────┐
+ │ 维度          │ Add                                │ Remove                    │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ 守卫          │ MeshCardsIndex < 0                 │ MeshCardsIndex >= 0       │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ atlas         │ —                                  │ RemoveCardFromAtlas（重） │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ span          │ AddSpan ×3                         │ RemoveSpan ×3（同索引）   │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ 宿主索引      │ 写入 MeshCardsIndex                │ 清 -1（标脏后）           │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ instance 映射 │ 回填 + 标脏                        │ 清空 + 再次标脏           │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ culling       │ bVisible=true                      │ bVisible=false            │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ group 标脏    │ UpdatePrimitiveGroupGPUBufferEntry │ 同                        │
+ ├───────────────┼────────────────────────────────────┼───────────────────────────┤
+ │ GPU buffer    │ FillData(实际值)                   │ FillData(NullXxx)         │
+ └───────────────┴────────────────────────────────────┴───────────────────────────┘
+
+ 唯一不对称：Remove 多了 atlas 纹理释放（Add 时 atlas 分配在另一条路径 ProcessLumenSurfaceCacheRequests，不在 AddMeshCardsFromBuildData 内）。这是因为 atlas
+ 分配是按需的（卡片要被捕获时才分配物理页），而回收必须立即（防显存泄漏）。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 一个隐蔽的竞态保护
+
+ RemoveMeshCards 里 ScenePrimitiveIndices 用 GetIndex()（int32）而非指针——和 AddMeshCards 的设计一致。注释（:941）点明：
+
+ │ "Copy ScenePrimitive->GetIndex() in order to prevent from deferencing possibly deleted ScenePrimitive*"
+
+ remove 标脏 PrimitivesToUpdateMeshCards 后，到 UpdateLumenMeshCards 实际上传之间，该 primitive 可能已被场景删除。用索引 + Scene.Primitives[PrimitiveIndex] 边界检查（:495 if (PrimitiveIndex <
+ Scene.Primitives.Num())）保证安全——deleted primitive 的索引会越界被跳过。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ 结论
+
+ 回收路径是分配路径的镜像，外加两层资源释放：
+
+ 1. atlas 资源层（FreeVirtualSurface）：逐 page 解映射 + 页表 span 释放——这是性能瓶颈，限流的根因。
+ 2. 结构 span 层（RemoveSpan）：延迟进 PendingFreeSpans，惰性 Consolidate 合并相邻空洞复用。
+ 3. GPU buffer 层：不缩容不重排，写 NullXxx 安全默认值，索引稳定。
+
+ 三者通过 5 条脏列表解耦，由 UpdateLumenMeshCards 统一消费上传。延迟合并 + 批量限流是让动态装卸场景 GI 可承受的两个关键工程决策。
+
+ ────────────────────────────────────────────────────────────────────────────────
+
+ ### 引用（全部来自 DB 实读代码）
+
+ - LumenMeshCards.cpp:1088 — FLumenSceneData::RemoveMeshCards
+ - LumenMeshCards.cpp:1193 — RemoveCardFromAtlas
+ - LumenScene.cpp:1850 — FreeVirtualSurface（page 解映射 + 页表 span 释放）
+ - LumenSceneRendering.cpp:1455-1485 — UpdateSurfaceCachePrimitives 的 remove 限流循环
+ - SpanAllocator.h:24 — FSpanAllocator::Allocate（惰性 Consolidate）
+ - SpanAllocator.h:73 — FSpanAllocator::Free（O(1) 延迟）
+ - SpanAllocator.cpp:59 — FSpanAllocator::Consolidate（归并 + 尾部缩容）
+ - LumenSparseSpanArray.h:79 — TSparseSpanArray::Consolidate（ShrinkThreshold=2）
+
+ [推理]：UnmapSurfaceCachePage 的内部实现（物理 atlas page 如何回收到 page pool）未展开——如需追物理页回收与 atlas 虚拟/物理两层管理的完整机制，可继续深入 LumenSurfaceCache.cpp。
