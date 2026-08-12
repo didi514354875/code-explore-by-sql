@@ -1,0 +1,270 @@
+// LianCapsuleAO.compute — pass 7:1/2 分辨率 capsule AO。
+// dump 线 2168-2526(unreal ShadowConeTraceAgainstCulledCapsuleShapes):
+// 共享内存 min/max/近远组深度(原子)→ tile 无效只写打包深度 →
+// 视空间 AABB 两包围球(近/远)→ 世界 → 逐 probe 锥体追踪(acos/atan AMD 近似、
+// smoothstep 混合、距离衰减)→ 累乘 → pow(_20._m7) → 输出 _LianCapsuleAOTex。
+#pragma kernel CapsuleAO
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+#include "LianShared.hlsl"
+
+StructuredBuffer<float4> _LianCapsuleShapes;   // _20._m5[64]: 偶槽 center+radius, 奇槽 dir+length
+RWTexture2D<float4> _LianCapsuleAOTex;         // _28: x=occlusion, yz=打包深度, w=1
+
+TEXTURE2D(_LianNormalTex);                     // 球面编码法线(全分辨率)
+
+uint  _LianCapsuleAOCount;      // _20._m0
+float _LianCapsuleAOErrorRadius; // _20._m2
+float _LianCapsuleAONormDist;   // _20._m4: 深度打包归一化距离
+float _LianCapsuleAOPow;        // _20._m7
+float _LianCapsuleAOConeAngle;  // _20._m9
+float _LianCapsuleAOUvScale;    // _20._m1: 全分辨率像素缩放(2)
+float2 _LianCapsuleAONormalY;   // _20._m6.xy: 法线 y 因子 offset/scale
+float _LianCapsuleAONormalYFactor; // _20._m8
+float2 _LianCapsuleAOTexelSize; // _20._m10.zw: 1/全分辨率尺寸
+
+// 共享:tile 深度统计 + 探针列表(近 32 / 远 32)
+groupshared uint s_GroupMinDepth;      // _109
+groupshared uint s_GroupMaxDepth;      // _110
+groupshared uint s_GroupFarMinDepth;   // _111
+groupshared uint s_GroupNearMaxDepth;  // _112
+groupshared uint s_NearCount;          // _103
+groupshared uint s_FarCount;           // _104
+groupshared uint s_ProbeIndices[64];   // _108
+
+float AcosApprox(float x)
+{
+    // AMD GCN acos 近似(dump 线 2455-2463)
+    float absX = abs(x);
+    float y = absX * (-0.15658299624919891357421875) + 1.57079637050628662109375;
+    float s = sqrt(1.0 - absX);
+    float r = s * y;
+    return (x >= 0.0) ? r : 3.1415927410125732421875 - y * s;
+}
+
+float AtanApprox(float x)
+{
+    // AMD GCN atan 近似(dump 线 2464-2470)
+    float inv = 1.0 / x;
+    float t = (x < 1.0) ? x : inv;
+    float t2 = t * t;
+    float p = t2 * 0.087292902171611785888671875 + (-0.3018949925899505615234375);
+    float q = p * t2 + 1.0;
+    float a = t * q;
+    float b = 1.57079637050628662109375 - q * t;
+    return (x < 1.0) ? a : b;
+}
+
+// 由轴构建正交基(dump 线 2360-2376):选择与轴夹角大的分量做切向
+void BuildProbeBasis(float3 axis, out float3 someDir, out float3 crossDir)
+{
+    bool useXZ = abs(axis.y) < abs(axis.x);
+    float3 t0 = float3(-axis.z, 0.0, axis.x);   // xz 切向
+    float3 t1 = float3(0.0, axis.z, -axis.y);   // yz 切向
+    someDir = useXZ ? t0 : t1;
+    float len = dot(axis, axis);
+    someDir = len > 1e-8 ? someDir * rsqrt(len) : float3(1, 0, 0);
+    crossDir = cross(axis, someDir);
+}
+
+[numthreads(8, 8, 1)]
+void CapsuleAO(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint localIndex : SV_GroupIndex)
+{
+    uint2 fullResPixel = id.xy * uint2(_LianCapsuleAOUvScale, _LianCapsuleAOUvScale);   // _40.xy
+
+    // 线性深度(dump 线 2196-2200)
+    float rawDepth = LOAD_TEXTURE2D(_CameraDepthTexture, fullResPixel);
+    float linearDepth = rcp(_ZBufferParams.z * rawDepth + _ZBufferParams.w);
+
+    if (localIndex == 0u)
+    {
+        s_GroupMinDepth = 2139095039u;   // +inf
+        s_GroupMaxDepth = 0u;
+        s_GroupFarMinDepth = 2139095039u;
+        s_GroupNearMaxDepth = 0u;
+        s_NearCount = 0u;
+        s_FarCount = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    bool depthValid = linearDepth < 200.0;   // _90
+    if (depthValid)
+    {
+        InterlockedMin(s_GroupMinDepth, asuint(linearDepth));
+        InterlockedMax(s_GroupMaxDepth, asuint(linearDepth));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float groupMinDepth = asfloat(s_GroupMinDepth);
+    float groupMaxDepth = asfloat(s_GroupMaxDepth);
+    float groupMidDepth = (groupMaxDepth + groupMinDepth) * 0.5;
+
+    if (depthValid)
+    {
+        if (linearDepth >= groupMidDepth)
+            InterlockedMin(s_GroupFarMinDepth, asuint(linearDepth));
+        if (groupMidDepth >= linearDepth)
+            InterlockedMax(s_GroupNearMaxDepth, asuint(linearDepth));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float groupFarMinDepth = asfloat(s_GroupFarMinDepth);
+    float groupNearMaxDepth = asfloat(s_GroupNearMaxDepth);
+    bool tileAllInvalid = (groupMinDepth == 2139095039u) && (groupMaxDepth == 0u);   // _50
+
+    // 打包深度(low8/high8,×1/255)先写入(dump 线 2210-2220)
+    float packed = clamp(linearDepth / max(_LianCapsuleAONormDist, 1e-4), 0.0, 1.0);
+    packed = packed * 65535.0 + 0.5;
+    uint packedU = uint(packed);
+    uint high8 = packedU >> 8u;
+    uint low8 = packedU & 255u;
+    float2 packedDepth = float2(float(high8), float(low8)) * 0.0039215688593685626983642578125;
+
+    if (tileAllInvalid)
+    {
+        _LianCapsuleAOTex[id.xy] = float4(1.0, packedDepth.x, packedDepth.y, 1.0);
+        return;
+    }
+
+    // ---- 世界位置(dump 线 2224-2236)----
+    float2 uv = (float2(fullResPixel) + 0.5) * _LianCapsuleAOTexelSize;
+    float3 worldPos = ComputeWorldSpacePosition(uv, rawDepth, unity_MatrixInvVP);
+
+    // ---- 视空间 tile 角点 → AABB → 近/远包围球(dump 线 2237-2310)----
+    float2 tileMinPx = float2(groupId.xy) * 16.0;           // 8×8 组 × 半分辨率 → 16×16 全分辨率像素
+    float2 tileMaxPx = tileMinPx + 16.0;
+    float2 invScreen = _LianCapsuleAOTexelSize;
+    float2 uvMin = tileMinPx * invScreen;
+    float2 uvMax = tileMaxPx * invScreen;
+
+    float3 cTLmin = ComputeViewSpacePosition(uvMin, groupMinDepth, unity_MatrixInvP);
+    float3 cBRmin = ComputeViewSpacePosition(uvMax, groupMinDepth, unity_MatrixInvP);
+    float3 cTLnear = ComputeViewSpacePosition(uvMin, groupNearMaxDepth, unity_MatrixInvP);
+    float3 cBRnear = ComputeViewSpacePosition(uvMax, groupNearMaxDepth, unity_MatrixInvP);
+    float3 nearBoxMin = min(min(cTLmin, cBRmin), min(cTLnear, cBRnear));
+    float3 nearBoxMax = max(max(cTLmin, cBRmin), max(cTLnear, cBRnear));
+    nearBoxMin.z = -groupMinDepth;
+    nearBoxMax.z = -groupNearMaxDepth;
+
+    float3 cTLfar = ComputeViewSpacePosition(uvMin, groupFarMinDepth, unity_MatrixInvP);
+    float3 cBRfar = ComputeViewSpacePosition(uvMax, groupFarMinDepth, unity_MatrixInvP);
+    float3 cTLmax = ComputeViewSpacePosition(uvMin, groupMaxDepth, unity_MatrixInvP);
+    float3 cBRmax = ComputeViewSpacePosition(uvMax, groupMaxDepth, unity_MatrixInvP);
+    float3 farBoxMin = min(min(cTLfar, cBRfar), min(cTLmax, cBRmax));
+    float3 farBoxMax = max(max(cTLfar, cBRfar), max(cTLmax, cBRmax));
+    farBoxMin.z = -groupFarMinDepth;
+    farBoxMax.z = -groupMaxDepth;
+
+    // 视空间 → 世界(球心用 unity_CameraToWorld;球半径取 AABB 半对角线)
+    float3 nearCenterWS = mul(unity_CameraToWorld, float4((nearBoxMin + nearBoxMax) * 0.5, 1.0)).xyz;
+    float3 nearExtents = (nearBoxMax - nearBoxMin) * 0.5;
+    float nearRadiusSq = dot(nearExtents, nearExtents);
+    float3 farCenterWS = mul(unity_CameraToWorld, float4((farBoxMin + farBoxMax) * 0.5, 1.0)).xyz;
+    float3 farExtents = (farBoxMax - farBoxMin) * 0.5;
+    float farRadiusSq = dot(farExtents, farExtents);
+
+    bool isFar = linearDepth >= groupMidDepth;   // _76
+
+    // 解码法线(球面,世界空间)(dump 线 2312-2330)
+    float4 normalEncoded = _LianNormalTex.Load(int3(fullResPixel, 0));
+    float3 normalWS = LianDecodeNormalSpheremap(normalEncoded.xyz);
+    // 法线 y 因子(dump 线 2438-2442):默认 1
+    float normalYFactor = (-normalWS.y) + (-_LianCapsuleAONormalY.x);
+    normalYFactor = saturate(_LianCapsuleAONormalY.y * normalYFactor);
+    normalYFactor = max(0.00999999977648258209228515625, 1.0 + _LianCapsuleAONormalYFactor * (-normalYFactor));
+
+    // ---- 探针列表剔除(dump 线 2331-2434)----
+    for (uint probe = localIndex; probe < _LianCapsuleAOCount; probe += 64u)
+    {
+        int slot = int(probe) << 1;
+        float4 centerRadius = _LianCapsuleShapes[slot];
+        float4 dirLength = _LianCapsuleShapes[slot + 1];
+        float3 axis = dirLength.xyz;
+        float axisLen = dirLength.w;
+        float3 someDir, crossDir;
+        BuildProbeBasis(axis, someDir, crossDir);
+        float axisScale = centerRadius.w / (axisLen * 0.5 + centerRadius.w);
+        float3 localZ = axisScale * axis;
+
+        // 近盒中心 → probe 局部
+        float3 toNear = nearCenterWS - centerRadius.xyz;
+        float3 nearLocal = float3(dot(toNear, someDir), dot(toNear, crossDir), dot(toNear, localZ));
+        float3 toFar = farCenterWS - centerRadius.xyz;
+        float3 farLocal = float3(dot(toFar, someDir), dot(toFar, crossDir), dot(toFar, localZ));
+
+        float errRadius = _LianCapsuleAOErrorRadius + centerRadius.w;
+        float nearSq = nearRadiusSq + errRadius;
+        nearSq *= nearSq;
+        if (dot(-nearLocal, -nearLocal) < nearSq)
+        {
+            uint idx = 0;
+            InterlockedAdd(s_NearCount, 1u, idx);
+            s_ProbeIndices[min(idx, 31u)] = probe;
+        }
+        float farSq = farRadiusSq + errRadius;
+        farSq *= farSq;
+        if (dot(-farLocal, -farLocal) < farSq)
+        {
+            uint idx = 0;
+            InterlockedAdd(s_FarCount, 1u, idx);
+            s_ProbeIndices[min(idx, 31u) + 32u] = probe;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint probeCount = min(isFar ? s_FarCount : s_NearCount, 32u);
+    uint listOffset = isFar ? 32u : 0u;
+    float normConst = 6.283185482025146484375 - cos(_LianCapsuleAOConeAngle) * 6.283185482025146484375;
+    float invError = 1.0 / max(_LianCapsuleAOErrorRadius, 1e-4);
+
+    float accumulated = 1.0;
+    for (uint i = 0u; i < probeCount; ++i)
+    {
+        uint probeIndex = s_ProbeIndices[listOffset + i];
+        int slot = int(probeIndex) << 1;
+        float4 centerRadius = _LianCapsuleShapes[slot];
+        float4 dirLength = _LianCapsuleShapes[slot + 1];
+        float effectiveRadius = normalYFactor * centerRadius.w;
+
+        float3 someDir, crossDir;
+        BuildProbeBasis(dirLength.xyz, someDir, crossDir);
+        float axisScale = effectiveRadius / (dirLength.w * 0.5 + effectiveRadius);
+        float3 localZ = axisScale * dirLength.xyz;
+
+        float3 toPixel = worldPos - centerRadius.xyz;
+        float3 pLocal = float3(dot(toPixel, someDir), dot(toPixel, crossDir), dot(toPixel, localZ));
+        float3 nLocal = float3(dot(normalWS, someDir), dot(normalWS, crossDir), dot(normalWS, localZ));
+
+        float dist = length(pLocal);
+        float3 dirToPixel = -pLocal / dist;
+        nLocal = normalize(nLocal);
+        float cosA = dot(dirToPixel, nLocal);
+        float pixelAngle = AcosApprox(cosA);
+
+        float horizonAngle = AtanApprox(effectiveRadius / dist);
+        float upperBound = max(horizonAngle, _LianCapsuleAOConeAngle);
+        float lowerBound = min(horizonAngle, _LianCapsuleAOConeAngle);
+        float angularDiff = upperBound - lowerBound;
+
+        bool fullyLit = pixelAngle >= horizonAngle + _LianCapsuleAOConeAngle;
+        float fullyOccludedVal = 6.283185482025146484375 - cos(lowerBound) * 6.283185482025146484375;
+        float blend = saturate((pixelAngle - abs(_LianCapsuleAOConeAngle - horizonAngle))
+                             / ((horizonAngle + _LianCapsuleAOConeAngle) - abs(_LianCapsuleAOConeAngle - horizonAngle)));
+        blend = 1.0 - blend;
+        blend = blend * blend * (3.0 - 2.0 * blend);   // smoothstep
+
+        float occ = fullyOccludedVal * blend;
+        occ = fullyLit ? 0.0 : occ;
+        occ = (angularDiff >= pixelAngle) ? fullyOccludedVal : occ;
+        occ = min(occ / normConst, 1.0);
+        float occlusion = 1.0 - occ;
+
+        float falloff = saturate(dist * invError * 3.0 - 2.0);
+        occlusion = lerp(occlusion, 1.0, falloff);
+        accumulated *= occlusion;
+    }
+
+    float finalOcc = exp2(log2(accumulated) * _LianCapsuleAOPow);
+    _LianCapsuleAOTex[id.xy] = float4(finalOcc, packedDepth.x, packedDepth.y, 1.0);
+}

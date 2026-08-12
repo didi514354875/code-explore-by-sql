@@ -1,0 +1,65 @@
+// LianTileLightCulling.compute — pass 2:世界空间 XZ 网格 tile 灯光剔除。
+// dump 线 50-166:每 tile 遍历 _LianLightRects[50](世界空间矩形,xy=min zw=max),
+// AABB 相交 → 保留 4 个最近(距离²×1073.7418 打包 + 槽位低位)→ 输出 4 索引×1/255,
+// 无光填 255(1.0);皮肤/角色 pass 以世界 xz 采样。
+#pragma kernel TileLightCulling
+
+StructuredBuffer<float4> _LianLightRects;      // [50]: xy = rectMin, zw = rectMax(tile 坐标)
+RWTexture2D<float4> _LianTileLightIndexTex;    // gridSize², R32G32B32A32F
+float4 _LianTileScaleBias;                     // xy = 网格原点(世界), zw = tile 世界尺寸
+uint _LianLightCount;
+
+[numthreads(8, 8, 1)]
+void TileLightCulling(uint3 id : SV_DispatchThreadID)
+{
+    float2 tileMin = _LianTileScaleBias.zw * id.xy + _LianTileScaleBias.xy;
+    float2 tileMax = tileMin + _LianTileScaleBias.zw;
+    float2 tileCenter = (tileMin + tileMax) * 0.5;
+
+    float4 indices = float4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0);
+    uint4 packed = uint4(0xFFFFFFFCu, 0xFFFFFFFDu, 0xFFFFFFFEu, 0xFFFFFFFFu);   // NaN 初始
+    uint count = 0u;
+
+    for (uint i = 0u; i < _LianLightCount; ++i)
+    {
+        float4 rect = _LianLightRects[i];
+        bool inRange = all(tileMin < rect.zw) && all(rect.xy < tileMax);
+        if (!inRange)
+            continue;
+
+        float2 d = (rect.xy + rect.zw) * 0.5 - tileCenter;
+        uint distU = uint(dot(d, d) * 1073.7418212890625);   // ×2^30/1e6 打包
+
+        if (count > 3u)
+        {
+            uint maxPacked = max(max(packed.x, packed.y), max(packed.z, packed.w));
+            uint slot = maxPacked & 3u;
+            uint newPacked = distU << 2u;
+            if (newPacked < maxPacked)
+            {
+                indices[slot] = float(i) / 255.0;
+                packed[slot] = newPacked | slot;
+            }
+            count = 4u;
+        }
+        else
+        {
+            indices[count] = float(i) / 255.0;
+            packed[count] = (distU << 2u) | count;
+            count++;
+        }
+    }
+
+    float4 outIdx;
+    if (count == 0u)
+        outIdx = float4(1.0, 1.0, 1.0, 1.0);
+    else if (count == 1u)
+        outIdx = float4(indices.x, 1.0, 1.0, 1.0);
+    else if (count == 2u)
+        outIdx = float4(indices.x, indices.y, 1.0, 1.0);
+    else if (count == 3u)
+        outIdx = indices;   // w 保持初始 1/255(dump 原样)
+    else
+        outIdx = indices;
+    _LianTileLightIndexTex[id.xy] = outIdx;
+}
